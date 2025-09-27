@@ -435,8 +435,14 @@ app.get('/api/dev/seed', async (_req, res) => {
 
 const PORT = process.env.PORT || 4000;
 
+// ---- Frontend base URL for all public links (articles, sitemap, rss) ----
+const FRONTEND_BASE_URL =
+  process.env.FRONTEND_BASE_URL || 'https://news-site-frontend-sigma.vercel.app';
+
 // -------- RSS & Sitemap --------
-const SITE_URL = process.env.SITE_URL || 'http://localhost:5173';
+// -------- RSS & Sitemap --------
+const SITE_URL = FRONTEND_BASE_URL; // keep old name for the rest of the code
+
 
 function xmlEscape(s = '') {
   return String(s)
@@ -484,8 +490,9 @@ app.get('/article/:slug', async (req, res) => {
     if (!allowed) return res.status(404).send('Not found');
 
     // Build absolute URL using current host (ngrok) unless SITE_URL is given
-    const origin = process.env.SITE_URL || `${req.protocol}://${req.get('host')}`;
-    const pageUrl = `${origin}/article/${encodeURIComponent(slug)}`;
+    // Always use the public frontend domain for canonical URLs
+    const pageUrl = `${SITE_URL}/article/${encodeURIComponent(slug)}`;
+
 
     const title = doc.title || 'Article';
     const description = doc.summary || (doc.body ? String(doc.body).slice(0, 160) : '');
