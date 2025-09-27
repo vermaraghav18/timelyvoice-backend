@@ -453,6 +453,18 @@ function xmlEscape(s = '') {
     .replaceAll("'", '&apos;');
 }
 
+// --- Meta description helpers ---
+function stripHtml(s = '') {
+  return String(s).replace(/<[^>]*>/g, '');
+}
+function buildDescription(doc) {
+  const raw = (doc?.summary && doc.summary.trim())
+    || stripHtml(doc?.body || '').slice(0, 200);  // fallback to body
+  // collapse whitespace and cap ~160 chars (good SERP length)
+  return String(raw).replace(/\s+/g, ' ').slice(0, 160);
+}
+
+
 // ====== SEO additions (helpers) ======
 const HREFLANGS = [
   { lang: 'x-default', code: 'x-default' },
@@ -493,9 +505,9 @@ app.get('/article/:slug', async (req, res) => {
     // Always use the public frontend domain for canonical URLs
     const pageUrl = `${SITE_URL}/article/${encodeURIComponent(slug)}`;
 
+const title = doc.title || 'Article';
+const description = buildDescription(doc);
 
-    const title = doc.title || 'Article';
-    const description = doc.summary || (doc.body ? String(doc.body).slice(0, 160) : '');
     const ogImage = doc.imageUrl || '';
     const published = doc.publishedAt || doc.publishAt || doc.createdAt || new Date();
     const modified = doc.updatedAt || published;
