@@ -739,5 +739,7 @@ ${urlItems}
     res.status(500).send('news sitemap generation failed');
   }
 });
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('API listening on', PORT);
+});
 
-app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
