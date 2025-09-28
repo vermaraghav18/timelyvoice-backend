@@ -1,15 +1,51 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const analyticsBotFilter = require('./middleware/analyticsBotFilter'); // <-- add this
+const analyticsRouter = require('./routes/analytics');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const cloudinary = require('cloudinary').v2;
 const geoMiddleware = require('./middleware/geo');
 
 const app = express();
-app.use(geoMiddleware()); // <-- GEO middleware
-app.use(cors());
-app.use(express.json());
+// Trust reverse proxy headers (Render etc.)
+app.set('trust proxy', 1);
+
+// JSON parser (needed for POST /analytics/collect)
+app.use(express.json({ limit: '200kb' }));
+
+// CORS allowlist
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+if (allowedOrigins.length === 0) {
+  allowedOrigins.push(
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'https://news-site-frontend-sigma.vercel.app'
+  );
+}
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // allow curl/postman
+    const ok = allowedOrigins.includes(origin);
+    callback(ok ? null : new Error('Not allowed by CORS'), ok);
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400,
+}));
+
+// Bot/Admin flags for analytics (used to exclude)
+app.use(analyticsBotFilter());
+
+// GEO middleware (enriches req.geo for feeds/sitemaps/SSR)
+app.use(geoMiddleware());
+
 
 // Country-aware caching: make caches keep separate copies per geo + auth
 app.use((req, res, next) => {
@@ -31,6 +67,10 @@ app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
+
+// ---- Analytics endpoints (health + collector stub) ----
+app.use('/analytics', analyticsRouter);
+
 
 const {
   ADMIN_PASSWORD, JWT_SECRET, MONGO_URI,
