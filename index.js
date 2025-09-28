@@ -16,6 +16,7 @@ app.set('trust proxy', 1);
 app.use(express.json({ limit: '200kb' }));
 
 // CORS allowlist
+// CORS allowlist
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -29,16 +30,27 @@ if (allowedOrigins.length === 0) {
   );
 }
 
-app.use(cors({
-  origin: function (origin, callback) {
+// Shared CORS options (used for middleware and preflight)
+const corsOptions = {
+  origin(origin, callback) {
     if (!origin) return callback(null, true); // allow curl/postman
     const ok = allowedOrigins.includes(origin);
     callback(ok ? null : new Error('Not allowed by CORS'), ok);
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Geo-Preview-Country', // <-- allow the custom header your frontend sends
+  ],
+  credentials: true,          // <-- required when frontend requests include credentials
   maxAge: 86400,
-}));
+};
+
+app.use(cors(corsOptions));
+// Ensure preflight OPTIONS succeeds for all routes
+app.options('*', cors(corsOptions));
+
 
 // Bot/Admin flags for analytics (used to exclude)
 app.use(analyticsBotFilter());
