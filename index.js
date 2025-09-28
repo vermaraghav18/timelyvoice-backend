@@ -440,9 +440,7 @@ const FRONTEND_BASE_URL =
   process.env.FRONTEND_BASE_URL || 'https://news-site-frontend-sigma.vercel.app';
 
 // -------- RSS & Sitemap --------
-// -------- RSS & Sitemap --------
 const SITE_URL = FRONTEND_BASE_URL; // keep old name for the rest of the code
-
 
 function xmlEscape(s = '') {
   return String(s)
@@ -463,7 +461,6 @@ function buildDescription(doc) {
   // collapse whitespace and cap ~160 chars (good SERP length)
   return String(raw).replace(/\s+/g, ' ').slice(0, 160);
 }
-
 
 // ====== SEO additions (helpers) ======
 const HREFLANGS = [
@@ -488,6 +485,10 @@ function htmlEscape(s = '') {
     .replaceAll("'", '&#39;');
 }
 
+/**
+ * EXISTING validator/helper page at backend /article/:slug
+ * (left unchanged)
+ */
 app.get('/article/:slug', async (req, res) => {
   try {
     const slug = req.params.slug;
@@ -501,12 +502,10 @@ app.get('/article/:slug', async (req, res) => {
     const allowed = (new Article(doc)).isAllowedForGeo(req.geo || {});
     if (!allowed) return res.status(404).send('Not found');
 
-    // Build absolute URL using current host (ngrok) unless SITE_URL is given
-    // Always use the public frontend domain for canonical URLs
     const pageUrl = `${SITE_URL}/article/${encodeURIComponent(slug)}`;
 
-const title = doc.title || 'Article';
-const description = buildDescription(doc);
+    const title = doc.title || 'Article';
+    const description = buildDescription(doc);
 
     const ogImage = doc.imageUrl || '';
     const published = doc.publishedAt || doc.publishAt || doc.createdAt || new Date();
@@ -528,7 +527,6 @@ const description = buildDescription(doc);
       }
     };
 
-    // Hreflang (static examples for now)
     const hrefLangs = [
       { lang: 'x-default', url: pageUrl },
       { lang: 'en-US',    url: pageUrl },
@@ -572,12 +570,112 @@ const description = buildDescription(doc);
 </body>
 </html>`;
 
-    // Public cache headers
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
     res.type('html').send(html);
   } catch (e) {
     console.error('SSR article error:', e);
     res.status(500).send('server render failed');
+  }
+});
+
+/* =========================
+   NEW: Crawler-friendly SSR
+   =========================
+   /ssr/article/:slug -> plain HTML + NewsArticle JSON-LD
+   Canonical points to FRONTEND_BASE_URL/article/:slug (your SPA)
+*/
+function buildNewsArticleJSONLD(a, url) {
+  return {
+    "@context": "https://schema.org",
+    "@type": "NewsArticle",
+    "headline": a.title,
+    "datePublished": new Date(a.publishedAt || a.createdAt || Date.now()).toISOString(),
+    "dateModified": new Date(a.updatedAt || a.publishedAt || a.createdAt || Date.now()).toISOString(),
+    "author": a.author ? [{ "@type": "Person", "name": a.author }] : undefined,
+    "articleSection": a.category || "General",
+    "image": a.imageUrl ? [a.imageUrl] : undefined,
+    "mainEntityOfPage": { "@type": "WebPage", "@id": url },
+    "url": url,
+    "description": a.summary || ""
+  };
+}
+
+app.get('/ssr/article/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    // Enforce public visibility + GEO (same as API)
+    const filter = { slug, status: 'published', publishAt: { $lte: new Date() } };
+    const a = await Article.findOne(filter).lean();
+    if (!a) return res.status(404).send('Not found');
+
+    if (!(new Article(a)).isAllowedForGeo(req.geo || {})) {
+      return res.status(404).send('Not found');
+    }
+
+    // Canonical = SPA article URL
+    const canonicalUrl = `${FRONTEND_BASE_URL}/article/${encodeURIComponent(slug)}`;
+    // Self URL = this backend SSR page
+    const selfUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+
+    const desc = buildDescription(a);
+    const jsonLd = buildNewsArticleJSONLD(a, selfUrl);
+
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>${htmlEscape(a.title)} – My News</title>
+
+  <!-- Canonical to SPA -->
+  <link rel="canonical" href="${htmlEscape(canonicalUrl)}"/>
+
+  <!-- Basic SEO & social -->
+  <meta name="description" content="${htmlEscape(desc)}"/>
+  <meta property="og:type" content="article"/>
+  <meta property="og:title" content="${htmlEscape(a.title)}"/>
+  <meta property="og:description" content="${htmlEscape(desc)}"/>
+  <meta property="og:url" content="${htmlEscape(selfUrl)}"/>
+  ${a.imageUrl ? `<meta property="og:image" content="${htmlEscape(a.imageUrl)}"/>` : ''}
+
+  <meta name="twitter:card" content="${a.imageUrl ? 'summary_large_image' : 'summary'}"/>
+  <meta name="twitter:title" content="${htmlEscape(a.title)}"/>
+  <meta name="twitter:description" content="${htmlEscape(desc)}"/>
+  ${a.imageUrl ? `<meta name="twitter:image" content="${htmlEscape(a.imageUrl)}"/>` : ''}
+
+  <!-- JSON-LD -->
+  <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
+
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f8fafc;margin:0}
+    .wrap{max-width:980px;margin:0 auto;padding:24px}
+    .card{background:#fff;border:1px solid #eee;border-radius:12px;padding:16px}
+    img.hero{width:100%;max-height:420px;object-fit:cover;border-radius:12px;margin:0 0 12px}
+    small.muted{color:#666}
+    hr{border:0;height:1px;background:#f0f0f0;margin:12px 0}
+    a.back{color:#1B4965;text-decoration:none}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <p><a class="back" href="${htmlEscape(canonicalUrl)}">← View on site</a></p>
+    <article class="card">
+      ${a.imageUrl ? `<img class="hero" src="${htmlEscape(a.imageUrl)}" alt=""/>` : ''}
+      <h1 style="margin-top:0">${htmlEscape(a.title)}</h1>
+      <small class="muted">${new Date(a.publishedAt).toLocaleString()} • ${htmlEscape(a.author || '')} • ${htmlEscape(a.category || 'General')}</small>
+      <hr/>
+      <div style="line-height:1.7;white-space:pre-wrap">${htmlEscape(a.body || '')}</div>
+    </article>
+  </div>
+</body>
+</html>`;
+
+    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+    res.set('Content-Type', 'text/html; charset=utf-8').status(200).send(html);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('Server error');
   }
 });
 
@@ -624,7 +722,6 @@ app.get('/rss.xml', async (req, res) => {
   </channel>
 </rss>`;
 
-    // Public cache headers
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
     res.set('Content-Type', 'application/rss+xml; charset=utf-8').send(xml);
   } catch (e) {
@@ -690,7 +787,6 @@ ${coreUrlEntries}
 ${articleUrlEntries}
 </urlset>`;
 
-    // Public cache headers (longer OK for sitemap)
     res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600');
     res.set('Content-Type', 'application/xml; charset=utf-8').send(xml);
   } catch (e) {
@@ -751,7 +847,7 @@ ${urlItems}
     res.status(500).send('news sitemap generation failed');
   }
 });
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log('API listening on', PORT);
 });
-
