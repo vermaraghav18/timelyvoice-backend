@@ -50,8 +50,9 @@ const corsOptions = {
 app.use(cors(corsOptions));
 // Ensure preflight OPTIONS succeeds for all routes
 // Preflight for specific paths (Express 5 / path-to-regexp safe)
-app.options('/analytics/collect', cors(corsOptions));
-app.options('/api/:path(*)', cors(corsOptions));
+// Ensure preflight OPTIONS succeeds for all routes (Express 5 safe)
+app.options(/.*/, cors(corsOptions));
+
 
 
 
