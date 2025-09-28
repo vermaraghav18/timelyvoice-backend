@@ -496,11 +496,18 @@ app.get('/article/:slug', async (req, res) => {
     // Public visibility rules (same as your API)
     const filter = { slug, status: 'published', publishAt: { $lte: new Date() } };
     const doc = await Article.findOne(filter).lean();
-    if (!doc) return res.status(404).send('Not found');
+if (!doc) return res.status(404).send('Not found');
 
-    // GEO enforcement (public)
-    const allowed = (new Article(doc)).isAllowedForGeo(req.geo || {});
-    if (!allowed) return res.status(404).send('Not found');
+// 🆕 allow trusted crawlers to bypass GEO on the SSR page
+const ua = String(req.headers['user-agent'] || '');
+const isTrustedBot = /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i.test(ua);
+
+// GEO enforcement (public) — skip for trusted bots
+if (!isTrustedBot) {
+  const allowed = (new Article(doc)).isAllowedForGeo(req.geo || {});
+  if (!allowed) return res.status(404).send('Not found');
+}
+
 
     const pageUrl = `${SITE_URL}/article/${encodeURIComponent(slug)}`;
 
