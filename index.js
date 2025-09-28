@@ -49,7 +49,10 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 // Ensure preflight OPTIONS succeeds for all routes
-app.options('*', cors(corsOptions));
+// Preflight for specific paths (Express 5 / path-to-regexp safe)
+app.options('/analytics/collect', cors(corsOptions));
+app.options('/api/:path(*)', cors(corsOptions));
+
 
 
 // Bot/Admin flags for analytics (used to exclude)
