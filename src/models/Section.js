@@ -36,7 +36,8 @@ const DEFAULT_CAP = {
   rail_v8: 1,
 
   // NEW: composite top section
-  top_v1: 12,
+  top_v1: 20,
+  top_v2: 20,
 };
 
 const MAX_CAP = {
@@ -70,7 +71,8 @@ const MAX_CAP = {
   dark_v1: 8,
 
   // NEW: composite top section
-  top_v1: 36,
+  top_v1: 50,
+  top_v2: 50,
 };
 
 /* ------------------------------------------------------------------

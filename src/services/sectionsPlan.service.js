@@ -170,6 +170,47 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
       continue;
     }
 
+    // ---- Composite section: top_v2 ----
+    if (s.template === "top_v2") {
+      const cfg = s.custom || {};
+      const dedupe = !!cfg.dedupeAcrossZones;
+      const used = new Set();
+
+      const take = async (zone = {}, fallbackLimit = 0) => {
+        if (zone?.enable === false) return [];
+        const lim = Number(zone?.limit ?? fallbackLimit);
+        const list = await runQuery({
+          query: zone?.query || {},
+          limit: lim,
+          excludeIds: dedupe ? Array.from(used) : [],
+        });
+        if (dedupe) list.forEach((a) => used.add(String(a.id || a._id)));
+        return list;
+      };
+
+      const zoneItems = {
+        hero: (await take({ ...(cfg.hero || {}), limit: 1 }, 1)).slice(0, 1),
+        sideStack: await take(cfg.sideStack, 3),
+        belowGrid: await take(cfg.belowGrid, 6),
+        trending: await take(cfg.trending, 10),
+      };
+
+      out.push({
+        id: String(s._id),
+        title: s.title,
+        slug: s.slug,
+        template: s.template,
+        side: "", // center/main
+        placementIndex: s.placementIndex || 0,
+        target: s.target,
+        capacity: 0,
+        moreLink: s.moreLink || "",
+        custom: s.custom || {},
+        items: zoneItems, // NOTE: composite payload for top_v2
+      });
+      continue;
+    }
+
     // ---- Feed/pinned sections (existing behavior) ----
     const activePins = (s.pins || []).filter(
       (p) => (!p.startAt || p.startAt <= now) && (!p.endAt || p.endAt >= now)

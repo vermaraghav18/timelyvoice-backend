@@ -11,6 +11,7 @@ const ALLOWED_TEMPLATES = [
   "head_v1",
   "head_v2",
   "top_v1",
+  "top_v2",
   "grid_v1",
   "carousel_v1",
   "list_v1",
@@ -74,54 +75,79 @@ const CustomV8Schema = z.object({
   linkUrl: z.string().url().optional(),
 });
 
-const BaseSectionSchema = z.object({
-  title: z.string().min(1),
-  slug: z.string().min(1),
-
-  template: z
-    .string()
-    .default("head_v1")
-    .refine((v) => ALLOWED_TEMPLATES.includes(v), {
-      message: `Invalid template. Expected one of: ${ALLOWED_TEMPLATES.join(", ")}`,
-    }),
-
-  capacity: z.coerce.number().int().positive().max(100).optional(),
-
-  // keep side (used for rails)
-  side: z.enum(["left", "right", ""]).optional(),
-
-  target: z.object({
-    type: z.enum(["homepage", "path", "category"]),
-    value: z.string(),
-  }),
-
-  feed: z
+/* ====== INSERTED: top_v2 composite schemas (right after CustomV8Schema) ====== */
+const ZoneSchema = z.object({
+  enable: z.boolean().optional(),
+  limit: z.number().int().min(0).optional(),
+  query: z
     .object({
-      mode: z.enum(["auto", "manual", "mixed"]).default("auto"),
-      categories: z.array(z.string()).default([]),
-      tags: z.array(z.string()).default([]),
-      sortBy: z.enum(["publishedAt", "priority"]).default("publishedAt"),
-      timeWindowHours: z.coerce.number().int().min(0).default(0),
+      categories: z.array(z.string()).optional(),
+      tags: z.array(z.string()).optional(),
+      includeIds: z.array(z.string()).optional(),
+      sinceDays: z.number().int().min(0).optional(),
     })
     .optional(),
+});
 
-  pins: z
-    .array(
-      z.object({
-        articleId: z.string(),
-        startAt: z.coerce.date().optional(),
-        endAt: z.coerce.date().optional(),
+const TopV2CustomSchema = z.object({
+  dedupeAcrossZones: z.boolean().optional(),
+  hero: ZoneSchema.optional(),
+  sideStack: ZoneSchema.optional(),
+  belowGrid: ZoneSchema.optional(),
+  trending: ZoneSchema.optional(),
+});
+/* ====== /INSERTED ====== */
+
+const BaseSectionSchema = z
+  .object({
+    title: z.string().min(1),
+    slug: z.string().min(1),
+
+    template: z
+      .string()
+      .default("head_v1")
+      .refine((v) => ALLOWED_TEMPLATES.includes(v), {
+        message: `Invalid template. Expected one of: ${ALLOWED_TEMPLATES.join(", ")}`,
+      }),
+
+    capacity: z.coerce.number().int().positive().max(100).optional(),
+
+    // keep side (used for rails)
+    side: z.enum(["left", "right", ""]).optional(),
+
+    target: z.object({
+      type: z.enum(["homepage", "path", "category"]),
+      value: z.string(),
+    }),
+
+    feed: z
+      .object({
+        mode: z.enum(["auto", "manual", "mixed"]).default("auto"),
+        categories: z.array(z.string()).default([]),
+        tags: z.array(z.string()).default([]),
+        sortBy: z.enum(["publishedAt", "priority"]).default("publishedAt"),
+        timeWindowHours: z.coerce.number().int().min(0).default(0),
       })
-    )
-    .optional(),
+      .optional(),
 
-  moreLink: z.string().optional(),
-  placementIndex: z.coerce.number().int().default(0).optional(),
-  enabled: z.boolean().default(true).optional(),
+    pins: z
+      .array(
+        z.object({
+          articleId: z.string(),
+          startAt: z.coerce.date().optional(),
+          endAt: z.coerce.date().optional(),
+        })
+      )
+      .optional(),
 
-  // we'll validate the shape based on template in superRefine
-  custom: z.unknown().optional(),
-}).passthrough(); // don’t drop unlisted keys accidentally
+    moreLink: z.string().optional(),
+    placementIndex: z.coerce.number().int().default(0).optional(),
+    enabled: z.boolean().default(true).optional(),
+
+    // we'll validate the shape based on template in superRefine
+    custom: z.unknown().optional(),
+  })
+  .passthrough(); // don’t drop unlisted keys accidentally
 
 const SectionCreateSchema = BaseSectionSchema.superRefine((val, ctx) => {
   if (val.template === "rail_v7") {
@@ -144,6 +170,20 @@ const SectionCreateSchema = BaseSectionSchema.superRefine((val, ctx) => {
       });
     }
   }
+
+  /* ====== INSERTED: Validate top_v2 on CREATE ====== */
+  if (val.template === "top_v2") {
+    const parsed = TopV2CustomSchema.safeParse(val.custom ?? {});
+    if (!parsed.success) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "custom for top_v2 must match { dedupeAcrossZones?, hero?, sideStack?, belowGrid?, trending? }",
+        path: ["custom"],
+      });
+    }
+  }
+  /* ====== /INSERTED ====== */
 });
 
 // PATCH allows partial updates but keeps the same template-specific checks
@@ -172,6 +212,20 @@ const SectionUpdateSchema = BaseSectionSchema.partial().superRefine((val, ctx) =
       });
     }
   }
+
+  /* ====== INSERTED: Validate top_v2 on UPDATE ====== */
+  if (tpl === "top_v2" && val.custom !== undefined) {
+    const parsed = TopV2CustomSchema.safeParse(val.custom);
+    if (!parsed.success) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "custom for top_v2 must match { dedupeAcrossZones?, hero?, sideStack?, belowGrid?, trending? }",
+        path: ["custom"],
+      });
+    }
+  }
+  /* ====== /INSERTED ====== */
 });
 
 /* ============== Normalize body (capacity per template) ============== */
@@ -208,9 +262,14 @@ router.get("/:id", ctrl.read);
 
 router.post("/", withValidation(SectionCreateSchema), normalizeSectionBody, ctrl.create);
 router.patch("/:id", withValidation(SectionUpdateSchema), normalizeSectionBody, ctrl.update);
+
+// (kept your debug variants as-is; remove if you don't want duplicates)
 router.post(
   "/",
-  (req, _res, next) => { console.log("DEBUG CREATE /api/sections body:", req.body); next(); },
+  (req, _res, next) => {
+    console.log("DEBUG CREATE /api/sections body:", req.body);
+    next();
+  },
   withValidation(SectionCreateSchema),
   normalizeSectionBody,
   ctrl.create
@@ -218,8 +277,11 @@ router.post(
 
 router.patch(
   "/:id",
-  (req, _res, next) => { console.log("DEBUG UPDATE /api/sections body:", req.body); next(); },
-  withValidation(SectionUpdateSchema),   // or your current schema
+  (req, _res, next) => {
+    console.log("DEBUG UPDATE /api/sections body:", req.body);
+    next();
+  },
+  withValidation(SectionUpdateSchema), // or your current schema
   normalizeSectionBody,
   ctrl.update
 );
