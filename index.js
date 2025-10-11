@@ -87,6 +87,8 @@ app.use('/api/breaking', breakingRoutes);
 app.use('/api/ticker', tickerRoutes);
 app.use('/api/sections', sectionsRouter);
 app.use("/api", sectionsV2);
+app.use("/api/top-news", require("./src/routes/topnews"));
+
 // Return a clean message if an origin is not allowed by CORS
 app.use((err, req, res, next) => {
   if (err && err.message && err.message.includes('CORS')) {
