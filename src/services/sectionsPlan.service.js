@@ -40,7 +40,7 @@ const ARTICLE_FIELDS =
   "title slug summary imageUrl imageAlt cover publishedAt author category";
 
 /* ------------------------------------------------------------------
- * Helper: run a flexible query for composite sections (e.g., top_v1)
+ * Helper: run a flexible query for composite sections (e.g., top_v1/top_v2)
  * ------------------------------------------------------------------ */
 async function runQuery({ query = {}, limit = 4, excludeIds = [] } = {}) {
   const q = { publishedAt: { $ne: null } };
@@ -73,7 +73,7 @@ async function runQuery({ query = {}, limit = 4, excludeIds = [] } = {}) {
 
 /**
  * Build the homepage plan
- * NOTE: now passes through slug/side/custom/placementIndex/target for all rows.
+ * NOTE: passes through slug/side/custom/placementIndex/target for all rows.
  * rail_v7 is image/promo only (no items), so it’s always included if enabled.
  */
 exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) => {
@@ -188,12 +188,81 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
         return list;
       };
 
-      const zoneItems = {
-        hero: (await take({ ...(cfg.hero || {}), limit: 1 }, 1)).slice(0, 1),
-        sideStack: await take(cfg.sideStack, 3),
-        belowGrid: await take(cfg.belowGrid, 6),
-        trending: await take(cfg.trending, 10),
-      };
+      // helper to convert Article docs to FE shape
+      const shape = (rows) => rows.map(stripArticleFields);
+
+      // Build from pins if requested
+      const mode = s.feed?.mode || "auto";
+      let zoneItems = { hero: [], sideStack: [], belowGrid: [], trending: [] };
+
+      if (mode === "manual" || mode === "mixed") {
+        // collect ordered, active pins
+        const activePins = (s.pins || []).filter(
+          (p) => (!p.startAt || p.startAt <= now) && (!p.endAt || p.endAt >= now)
+        );
+        const pinIds = activePins.map((p) => p.articleId);
+
+        let pins = [];
+        if (pinIds.length) {
+          const pinDocs = await Article.find({
+            _id: { $in: pinIds },
+            status: "published",
+          })
+            .select(ARTICLE_FIELDS)
+            .lean();
+          const map = new Map(pinDocs.map((a) => [String(a._id), a]));
+          pins = activePins.map((p) => map.get(String(p.articleId))).filter(Boolean);
+        }
+
+        // Map pins to zones: 1 / 3 / 6 / 10
+        const heroPins = pins.slice(0, 1);
+        const sidePins = pins.slice(1, 1 + 3);
+        const belowPins = pins.slice(1 + 3, 1 + 3 + 6);
+        const trendPins = pins.slice(1 + 3 + 6, 1 + 3 + 6 + 10);
+
+        zoneItems.hero = shape(heroPins);
+        zoneItems.sideStack = shape(sidePins);
+        zoneItems.belowGrid = shape(belowPins);
+        zoneItems.trending = shape(trendPins);
+
+        if (dedupe) {
+          [...zoneItems.hero, ...zoneItems.sideStack, ...zoneItems.belowGrid, ...zoneItems.trending]
+            .forEach((a) => used.add(String(a.id)));
+        }
+
+        if (mode === "mixed") {
+          // top-up each zone to its limit using runQuery (excluding used)
+          const heroNeed = Math.max(0, Number(cfg.hero?.limit ?? 1) - zoneItems.hero.length);
+          const sideNeed = Math.max(0, Number(cfg.sideStack?.limit ?? 3) - zoneItems.sideStack.length);
+          const belowNeed = Math.max(0, Number(cfg.belowGrid?.limit ?? 6) - zoneItems.belowGrid.length);
+          const trendNeed = Math.max(0, Number(cfg.trending?.limit ?? 10) - zoneItems.trending.length);
+
+          if (heroNeed > 0) {
+            const extra = await take({ ...(cfg.hero || {}), limit: heroNeed }, heroNeed);
+            zoneItems.hero = [...zoneItems.hero, ...extra].slice(0, cfg.hero?.limit ?? 1);
+          }
+          if (sideNeed > 0) {
+            const extra = await take({ ...(cfg.sideStack || {}), limit: sideNeed }, sideNeed);
+            zoneItems.sideStack = [...zoneItems.sideStack, ...extra].slice(0, cfg.sideStack?.limit ?? 3);
+          }
+          if (belowNeed > 0) {
+            const extra = await take({ ...(cfg.belowGrid || {}), limit: belowNeed }, belowNeed);
+            zoneItems.belowGrid = [...zoneItems.belowGrid, ...extra].slice(0, cfg.belowGrid?.limit ?? 6);
+          }
+          if (trendNeed > 0) {
+            const extra = await take({ ...(cfg.trending || {}), limit: trendNeed }, trendNeed);
+            zoneItems.trending = [...zoneItems.trending, ...extra].slice(0, cfg.trending?.limit ?? 10);
+          }
+        }
+      } else {
+        // AUTO (default): previous behavior
+        zoneItems = {
+          hero: (await take({ ...(cfg.hero || {}), limit: 1 }, 1)).slice(0, 1),
+          sideStack: await take(cfg.sideStack, 3),
+          belowGrid: await take(cfg.belowGrid, 6),
+          trending: await take(cfg.trending, 10),
+        };
+      }
 
       out.push({
         id: String(s._id),
@@ -206,7 +275,7 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
         capacity: 0,
         moreLink: s.moreLink || "",
         custom: s.custom || {},
-        items: zoneItems, // NOTE: composite payload for top_v2
+        items: zoneItems, // composite payload for top_v2
       });
       continue;
     }
@@ -240,7 +309,7 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
       if (s.feed?.tags?.length) q.tags = { $in: s.feed.tags };
       if (s.feed?.timeWindowHours > 0) {
         q.publishedAt = {
-          $gte: new Date(Date.now() - s.feed.timeWindowHours * 3600 * 1000),
+          $gte: new Date(Date.now() - s.feed?.timeWindowHours * 3600 * 1000),
         };
       }
 
