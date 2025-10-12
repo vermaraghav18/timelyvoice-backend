@@ -8,6 +8,7 @@ const { DEFAULT_CAP, MAX_CAP } = require("../models/Section");
 
 /* ================= Allowed templates ================= */
 const ALLOWED_TEMPLATES = [
+  // Head / blocks
   "head_v1",
   "head_v2",
   "top_v1",
@@ -59,7 +60,7 @@ const ImageUrlSchema = z
     message: "imageUrl must be http(s) URL or site-relative path (starts with /)",
   });
 
-// rail_v7 custom payload
+// rail_v7 custom payload (promo image)
 const CustomV7Schema = z.object({
   imageUrl: ImageUrlSchema,
   alt: z.string().optional(),
@@ -67,7 +68,7 @@ const CustomV7Schema = z.object({
   aspect: z.string().optional(),
 });
 
-// rail_v8 custom payload (news card)
+// rail_v8 custom payload (news promo card)
 const CustomV8Schema = z.object({
   imageUrl: ImageUrlSchema,
   title: z.string().min(1, "title is required"),
@@ -75,7 +76,7 @@ const CustomV8Schema = z.object({
   linkUrl: z.string().url().optional(),
 });
 
-/* ====== INSERTED: top_v2 composite schemas (right after CustomV8Schema) ====== */
+/* ====== top_v2 composite schemas ====== */
 const ZoneSchema = z.object({
   enable: z.boolean().optional(),
   limit: z.number().int().min(0).optional(),
@@ -96,7 +97,7 @@ const TopV2CustomSchema = z.object({
   belowGrid: ZoneSchema.optional(),
   trending: ZoneSchema.optional(),
 });
-/* ====== /INSERTED ====== */
+/* ====== /top_v2 ====== */
 
 const BaseSectionSchema = z
   .object({
@@ -112,7 +113,7 @@ const BaseSectionSchema = z
 
     capacity: z.coerce.number().int().positive().max(100).optional(),
 
-    // keep side (used for rails)
+    // side (used for rails)
     side: z.enum(["left", "right", ""]).optional(),
 
     target: z.object({
@@ -144,10 +145,10 @@ const BaseSectionSchema = z
     placementIndex: z.coerce.number().int().default(0).optional(),
     enabled: z.boolean().default(true).optional(),
 
-    // we'll validate the shape based on template in superRefine
+    // template-specific payload; validated in superRefine
     custom: z.unknown().optional(),
   })
-  .passthrough(); // don’t drop unlisted keys accidentally
+  .passthrough(); // keep unknown keys if present
 
 const SectionCreateSchema = BaseSectionSchema.superRefine((val, ctx) => {
   if (val.template === "rail_v7") {
@@ -170,8 +171,6 @@ const SectionCreateSchema = BaseSectionSchema.superRefine((val, ctx) => {
       });
     }
   }
-
-  /* ====== INSERTED: Validate top_v2 on CREATE ====== */
   if (val.template === "top_v2") {
     const parsed = TopV2CustomSchema.safeParse(val.custom ?? {});
     if (!parsed.success) {
@@ -183,14 +182,10 @@ const SectionCreateSchema = BaseSectionSchema.superRefine((val, ctx) => {
       });
     }
   }
-  /* ====== /INSERTED ====== */
 });
 
-// PATCH allows partial updates but keeps the same template-specific checks
+// PATCH allows partial updates but keeps template-specific checks
 const SectionUpdateSchema = BaseSectionSchema.partial().superRefine((val, ctx) => {
-  // We need the effective template to know what to validate.
-  // If template not supplied in PATCH body, look up existing template.
-  // (Handled in normalizeSectionBody for capacity; here, only validate if we have enough info.)
   const tpl = val.template;
   if (tpl === "rail_v7" && val.custom !== undefined) {
     const parsed = CustomV7Schema.safeParse(val.custom);
@@ -212,8 +207,6 @@ const SectionUpdateSchema = BaseSectionSchema.partial().superRefine((val, ctx) =
       });
     }
   }
-
-  /* ====== INSERTED: Validate top_v2 on UPDATE ====== */
   if (tpl === "top_v2" && val.custom !== undefined) {
     const parsed = TopV2CustomSchema.safeParse(val.custom);
     if (!parsed.success) {
@@ -225,32 +218,59 @@ const SectionUpdateSchema = BaseSectionSchema.partial().superRefine((val, ctx) =
       });
     }
   }
-  /* ====== /INSERTED ====== */
 });
 
-/* ============== Normalize body (capacity per template) ============== */
+/* ============== Normalize body (capacity per template + target cleanup) ============== */
 async function normalizeSectionBody(req, _res, next) {
-  let t = req.body?.template;
-  if (!t && req.params?.id) {
-    const existing = await Section.findById(req.params.id).select("template").lean();
-    t = existing?.template || "head_v1";
+  // Ensure target exists
+  if (!req.body.target) req.body.target = {};
+  const t = req.body.target?.type;
+  let v = req.body.target?.value;
+
+  if (typeof v === "string") v = v.trim();
+
+  if (t === "category") {
+    // categories are plain slugs: no leading slash, lowercase
+    v = (v || "").replace(/^\/+/, "").toLowerCase();
+  } else if (t === "path") {
+    // paths must start with a single slash
+    v = "/" + String(v || "/").replace(/^\/+/, "");
+  } else if (t === "homepage") {
+    v = "/";
   }
-  req.body.capacity = clampCapacity(t, req.body.capacity);
+
+  req.body.target = { type: t, value: v };
+
+  // capacity clamp (needs template, falls back to existing if patching)
+  let tpl = req.body?.template;
+  if (!tpl && req.params?.id) {
+    const existing = await Section.findById(req.params.id).select("template").lean();
+    tpl = existing?.template || "head_v1";
+  }
+  req.body.capacity = clampCapacity(tpl, req.body.capacity);
+
   next();
 }
 
 /* =============================== Routes ============================== */
 
 /**
- * Plan — normalize query so both styles work:
+ * Plan — normalize query so both styles work and fix category slashes:
  * - ?targetType=homepage&targetValue=/
  * - ?target=homepage&value=/
- * Then delegate to controller (which merges fields for rails like rail_v7/v8).
+ * - category values like "/General" → "general"
  */
 router.get("/plan", async (req, res, next) => {
   try {
-    req.query.targetType = req.query.targetType || req.query.target || "homepage";
-    req.query.targetValue = req.query.targetValue || req.query.value || "/";
+    const t = req.query.targetType || req.query.target || "homepage";
+    let v = req.query.targetValue || req.query.value || "/";
+
+    if (t === "category" && typeof v === "string") {
+      v = v.replace(/^\/+/, "").toLowerCase();
+    }
+
+    req.query.targetType = t;
+    req.query.targetValue = v;
     return ctrl.plan(req, res);
   } catch (err) {
     next(err);
@@ -260,10 +280,7 @@ router.get("/plan", async (req, res, next) => {
 router.get("/", ctrl.list);
 router.get("/:id", ctrl.read);
 
-router.post("/", withValidation(SectionCreateSchema), normalizeSectionBody, ctrl.create);
-router.patch("/:id", withValidation(SectionUpdateSchema), normalizeSectionBody, ctrl.update);
-
-// (kept your debug variants as-is; remove if you don't want duplicates)
+// Single POST and PATCH definitions (no duplicates)
 router.post(
   "/",
   (req, _res, next) => {
@@ -281,7 +298,7 @@ router.patch(
     console.log("DEBUG UPDATE /api/sections body:", req.body);
     next();
   },
-  withValidation(SectionUpdateSchema), // or your current schema
+  withValidation(SectionUpdateSchema),
   normalizeSectionBody,
   ctrl.update
 );
