@@ -41,7 +41,7 @@ if (String(process.env.TRUST_PROXY || 'true') === 'true') {
 }
 
 // JSON parser (needed for POST /analytics/collect and others)
-app.use(express.json({ limit: '200kb' }));
+app.use(express.json({ limit: '5mb' }));
 /* -------------------- CORS -------------------- */
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
