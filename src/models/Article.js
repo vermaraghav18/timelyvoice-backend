@@ -36,4 +36,15 @@ const ArticleSchema = new mongoose.Schema({
   geoAreas:  { type: [String], default: [] },
 }, { timestamps: true });
 
+// Fast lists by category/tag sorted by newest first
+ArticleSchema.index({ category: 1, publishedAt: -1 });
+ArticleSchema.index({ tags: 1, publishedAt: -1 });
+
+// General newest-first listing
+ArticleSchema.index({ publishedAt: -1 });
+
+// For slug lookup (if not already unique)
+ArticleSchema.index({ slug: 1 }, { unique: true });
+
+
 module.exports = mongoose.models.Article || mongoose.model('Article', ArticleSchema);

@@ -63,12 +63,26 @@ async function runQuery({ query = {}, limit = 4, excludeIds = [] } = {}) {
     q.publishedAt = { ...(q.publishedAt || {}), $gte: d };
   }
 
-  let sort = { publishedAt: -1 };
-  // Hook for future: views_7d / trending if you add fields
-  if (query.sort === "publishedAt_asc") sort = { publishedAt: 1 };
+    // Clamp limit and exclude heavy fields for list feeds
+  const hardLimit = Math.min(Number(limit || 12), 12);
 
-  const rows = await Article.find(q).sort(sort).limit(limit).lean();
+  const PROJECTION_LIST = {
+    body: 0,
+    bodyHtml: 0,
+  };
+
+  const SORT = query.sort === "publishedAt_asc"
+    ? { publishedAt: 1, _id: 1 }
+    : { publishedAt: -1, _id: -1 };
+
+  const rows = await Article.find(q, PROJECTION_LIST)
+    .sort(SORT)
+    .limit(hardLimit)
+    .lean({ getters: true })
+    .maxTimeMS(5000);
+
   return rows.map(stripArticleFields);
+
 }
 
 /**
@@ -288,12 +302,13 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
     let orderedPins = [];
 
     if (pinIds.length) {
-      const pinDocs = await Article.find({
-        _id: { $in: pinIds },
-        status: "published",
-      })
+          const pinDocs = await Article.find(
+        { _id: { $in: pinIds }, status: "published" }
+      )
         .select(ARTICLE_FIELDS)
-        .lean();
+        .lean({ getters: true })
+        .maxTimeMS(5000);
+
 
       const map = new Map(pinDocs.map((a) => [String(a._id), a]));
       orderedPins = activePins
@@ -302,7 +317,7 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
     }
 
     // Auto-fill remaining slots unless feed is manual
-    let autoItems = [];
+        let autoItems = [];
     if (s.feed?.mode !== "manual") {
       const q = { status: "published" };
       if (s.feed?.categories?.length) q.category = { $in: s.feed.categories };
@@ -313,21 +328,29 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
         };
       }
 
-      const sort =
+      const SORT =
         s.feed?.sortBy === "priority"
-          ? { priority: -1, publishedAt: -1 }
-          : { publishedAt: -1 };
+          ? { priority: -1, publishedAt: -1, _id: -1 }
+          : { publishedAt: -1, _id: -1 };
+
+      // Hard-cap capacity so sections never over-fetch
+      const hardCapacity = Math.min(Number(s.capacity || 0), 12);
+      const need = Math.max(0, hardCapacity - orderedPins.length);
 
       autoItems = await Article.find(q)
         .select(ARTICLE_FIELDS)
-        .sort(sort)
-        .limit(Math.max(0, (s.capacity || 0) - orderedPins.length))
-        .lean();
+        .sort(SORT)
+        .limit(need)
+        .lean({ getters: true })
+        .maxTimeMS(5000);
     }
 
+    // Final clamp on the outgoing items
+    const hardCapacity = Math.min(Number(s.capacity || 0), 12);
     const items = [...orderedPins, ...autoItems]
-      .slice(0, s.capacity || 0)
+      .slice(0, hardCapacity)
       .map(stripArticleFields);
+
 
     out.push({
       id: String(s._id),

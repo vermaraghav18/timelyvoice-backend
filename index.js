@@ -1,6 +1,8 @@
 // index.js (backend server)
 require('dotenv').config();
 const express = require('express');
+const compression = require('compression');
+
 const cors = require('cors');
 const analyticsBotFilter = require('./middleware/analyticsBotFilter');
 const analyticsRouter = require('./routes/analytics');
@@ -34,6 +36,53 @@ const multer = require('multer');
 const stream = require('stream');
 
 const app = express();
+
+// Compress all responses (JSON, HTML, etc.)
+app.use(compression({ threshold: 0 }));
+
+// Strong ETags let browsers/CDNs validate cached JSON quickly
+app.set('etag', 'strong');
+
+// Cache public GET endpoints so repeat visits are instant
+app.use((req, res, next) => {
+  // Only cache safe GET requests
+  if (req.method !== 'GET') return next();
+
+  // Do NOT cache anything under admin/auth/uploads/etc.
+  const noCachePrefixes = [
+    '/api/admin',
+    '/api/auth',
+    '/api/upload',
+    '/api/media/upload',
+  ];
+  if (noCachePrefixes.some(p => req.path.startsWith(p))) {
+    // Explicitly prevent caching for these
+    res.set('Cache-Control', 'no-store');
+    return next();
+  }
+
+   // ✅ Apply caching to ALL other /api/* GETs
+  const isApi = req.path.startsWith('/api/');
+  if (isApi) {
+    // Default for lists/sections
+    let header = 'public, max-age=60, s-maxage=300, stale-while-revalidate=30';
+
+    // Slightly longer for single-article reads
+    const isSingleArticle =
+      /^\/api\/(public\/articles\/|articles\/)/.test(req.path) && !req.query.q;
+
+    if (isSingleArticle) {
+      header = 'public, max-age=300, s-maxage=1200, stale-while-revalidate=60';
+    }
+
+    res.set('Cache-Control', header);
+  }
+
+
+  next();
+});
+
+
 
 // Trust reverse proxy headers only when behind a proxy/CDN
 if (String(process.env.TRUST_PROXY || 'true') === 'true') {
