@@ -64,12 +64,19 @@ async function buildAllUrls(origin) {
     .lean();
 
   // Articles (only published + visible by schedule)
-  const articles = await Models.Article
-    .find(
-      { status: 'published', publishAt: { $lte: new Date() } },
-      { slug: 1, updatedAt: 1, publishAt: 1 }
-    )
-    .lean();
+  const now = new Date();
+const articles = await Models.Article.find(
+  {
+    status: 'published',
+    $or: [
+      { publishAt: { $lte: now } },
+      { publishAt: { $exists: false } },
+      { publishAt: null }
+    ]
+  },
+  { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
+).lean();
+
 
   // Core urls
   const core = [

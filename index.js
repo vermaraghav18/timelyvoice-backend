@@ -1222,6 +1222,8 @@ const FRONTEND_BASE_URL =
   process.env.FRONTEND_BASE_URL || 'https://www.timelyvoice.com';
 
 const SITE_URL = FRONTEND_BASE_URL; // keep old name for rest of code
+// Fallback image for RSS when an article has no image set
+const SITE_LOGO = process.env.SITE_LOGO || `${SITE_URL.replace(/\/$/, '')}/logo-512x512.png`;
 
 function xmlEscape(s = '') {
   return String(s)
@@ -1517,11 +1519,17 @@ app.get('/ssr/article/:slug', async (req, res) => {
 
 /* -------------------- RSS & Sitemaps -------------------- */
 // RSS 2.0 feed
+// RSS 2.0 feed (rich)
+// requires: SITE_URL, xmlEscape(), stripHtml(), buildDescription(), isAllowedForGeoDoc()
 app.get('/rss.xml', async (req, res) => {
   try {
     const docs = await Article.find({
-      status: 'published',
-      publishAt: { $lte: new Date() }
+      status: 'published',      
+       $or: [
+    { publishAt: { $lte: now } },
+    { publishAt: { $exists: false } },
+    { publishAt: null }
+  ]
     })
       .sort({ publishedAt: -1 })
       .limit(100)
@@ -1531,35 +1539,71 @@ app.get('/rss.xml', async (req, res) => {
     const items = docs.filter(d => isAllowedForGeoDoc(d, geo));
 
     const feedItems = items.map(a => {
-      const link = `${SITE_URL}/article/${encodeURIComponent(a.slug)}`;
-      const pubDate = new Date(a.publishedAt || a.createdAt || Date.now()).toUTCString();
-      const enclosure = a.imageUrl
-        ? `<enclosure url="${xmlEscape(a.imageUrl)}" type="image/jpeg" />`
-        : '';
-      return `
-        <item>
-          <title>${xmlEscape(a.title)}</title>
-          <link>${xmlEscape(link)}</link>
-          <guid isPermaLink="false">${xmlEscape(String(a._id))}</guid>
-          <pubDate>${pubDate}</pubDate>
-          <description><![CDATA[${a.summary || ''}]]></description>
-          ${enclosure}
-        </item>`;
-    }).join('');
+  const slug = encodeURIComponent(a.slug);
+  const link = `${SITE_URL}/article/${slug}`;
+  const pubDate = new Date(a.publishedAt || a.createdAt || Date.now()).toUTCString();
 
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
+  const title    = a.title || 'Article';
+  const author   = (a.author && a.author.trim()) || 'Timely Voice Staff';
+  const category = a.category || 'General';
+
+  // Prefer article image; fallback to site logo (so media:content is always present)
+  const image = (a.ogImage && a.ogImage.trim()) || (a.imageUrl && a.imageUrl.trim()) || SITE_LOGO;
+
+  const summary =
+    (a.summary && a.summary.trim()) ||
+    buildDescription(a) ||
+    '';
+
+  const contentHtml = `
+    ${image ? `<p><img src="${xmlEscape(image)}" alt="${xmlEscape(title)}" /></p>` : ''}
+    ${summary ? `<p>${xmlEscape(summary)}</p>` : ''}
+    <p><a href="${xmlEscape(link)}">Read more</a></p>
+  `.trim();
+
+  // Optional standard RSS <author>: expects "email (Name)". Use a generic email.
+  const authorEmail = process.env.FEED_AUTHOR_EMAIL || 'noreply@timelyvoice.com';
+
+  return `
+    <item>
+      <title>${xmlEscape(title)}</title>
+      <link>${xmlEscape(link)}</link>
+      <guid isPermaLink="false">${xmlEscape(String(a._id))}</guid>
+      <pubDate>${pubDate}</pubDate>
+
+      <description><![CDATA[${summary}]]></description>
+      <content:encoded><![CDATA[${contentHtml}]]></content:encoded>
+
+      <dc:creator><![CDATA[${author}]]></dc:creator>
+      <author>${xmlEscape(authorEmail)} (${xmlEscape(author)})</author>
+
+      <category><![CDATA[${category}]]></category>
+      <source url="${xmlEscape(SITE_URL)}"><![CDATA[Timely Voice]]></source>
+
+      <media:content url="${xmlEscape(image)}" medium="image" />
+      <media:thumbnail url="${xmlEscape(image)}" />
+    </item>`;
+}).join('');
+
+   const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:dc="http://purl.org/dc/elements/1.1/"
+  xmlns:media="http://search.yahoo.com/mrss/"
+  xmlns:atom="http://www.w3.org/2005/Atom"
+>
   <channel>
-    <title>${xmlEscape('My News')}</title>
+    <title>${xmlEscape('Timely Voice')}</title>
     <link>${xmlEscape(SITE_URL)}</link>
-    <description>${xmlEscape('Latest articles from My News')}</description>
+    <atom:link rel="self" type="application/rss+xml" href="${xmlEscape(`${SITE_URL.replace(/\/$/, '')}/rss.xml`)}" />
+    <description>${xmlEscape('Latest articles from Timely Voice')}</description>
     <language>en</language>
     ${feedItems}
   </channel>
 </rss>`;
 
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    res.set('Content-Type', 'application/rss+xml; charset=utf-8').send(xml);
+    res.type('application/rss+xml; charset=utf-8').send(xml);
   } catch (e) {
     console.error('rss.xml error:', e);
     res.status(500).send('rss generation failed');
@@ -1567,57 +1611,106 @@ app.get('/rss.xml', async (req, res) => {
 });
 
 
-// Google News Sitemap (last 48 hours)
-app.get('/news-sitemap.xml', async (req, res) => {
+// Per-category RSS (e.g., /rss/top-news.xml)
+app.get('/rss/:slug.xml', async (req, res) => {
   try {
-    const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    const slug = String(req.params.slug || '').trim();
+    const cat = await Category.findOne({
+      $or: [{ slug }, { name: slug }]
+    }).lean();
+    if (!cat) return res.status(404).send('category not found');
 
     const docs = await Article.find({
       status: 'published',
-      publishAt: { $lte: new Date() },
-      publishedAt: { $gte: twoDaysAgo }
+      $or: [
+    { publishAt: { $lte: now } },
+    { publishAt: { $exists: false } },
+    { publishAt: null }
+  ],
+      category: cat.name,
     })
       .sort({ publishedAt: -1 })
-      .limit(1000)
+      .limit(100)
       .lean();
 
     const geo = req.geo || {};
     const items = docs.filter(d => isAllowedForGeoDoc(d, geo));
 
-    const urlItems = items.map(a => {
-      const loc = `${SITE_URL}/article/${encodeURIComponent(a.slug)}`;
-      const pubDate = new Date(a.publishedAt || a.createdAt || Date.now()).toISOString();
-      const title = a.title || 'Article';
+   const feedItems = items.map(a => {
+  const link = `${SITE_URL}/article/${encodeURIComponent(a.slug)}`;
+  const pubDate = new Date(a.publishedAt || a.createdAt || Date.now()).toUTCString();
 
-      return `
-  <url>
-    <loc>${xmlEscape(loc)}</loc>
-    <news:news>
-      <news:publication>
-        <news:name>${xmlEscape(PUBLICATION_NAME)}</news:name>
-        <news:language>en</news:language>
-      </news:publication>
-      <news:publication_date>${pubDate}</news:publication_date>
-      <news:title>${xmlEscape(title)}</news:title>
-    </news:news>
-  </url>`;
-    }).join('');
+  const title    = (a.title && a.title.trim()) || 'Article';
+  const author   = (a.author && a.author.trim()) || 'Timely Voice Staff';
+  const image    = (a.ogImage && a.ogImage.trim()) || (a.imageUrl && a.imageUrl.trim()) || SITE_LOGO;
 
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<urlset
-  xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
-  xmlns:news="http://www.google.com/schemas/sitemap-news/0.9"
+  const summary =
+    (a.summary && a.summary.trim()) ||
+    buildDescription(a) ||
+    '';
+
+  const contentHtml = `
+    ${image ? `<p><img src="${xmlEscape(image)}" alt="${xmlEscape(title)}" /></p>` : ''}
+    ${summary ? `<p>${xmlEscape(summary)}</p>` : ''}
+    <p><a href="${xmlEscape(link)}">Read more</a></p>
+  `.trim();
+
+  // Standard <author> field wants "email (Name)"
+  const authorEmail = process.env.FEED_AUTHOR_EMAIL || 'noreply@timelyvoice.com';
+
+  return `
+    <item>
+      <title>${xmlEscape(title)}</title>
+      <link>${xmlEscape(link)}</link>
+      <guid isPermaLink="false">${xmlEscape(String(a._id))}</guid>
+      <pubDate>${pubDate}</pubDate>
+
+      <description><![CDATA[${summary}]]></description>
+      <content:encoded><![CDATA[${contentHtml}]]></content:encoded>
+
+      <dc:creator><![CDATA[${author}]]></dc:creator>
+      <author>${xmlEscape(authorEmail)} (${xmlEscape(author)})</author>
+
+      <source url="${xmlEscape(SITE_URL)}"><![CDATA[Timely Voice]]></source>
+      <category><![CDATA[${cat.name}]]></category>
+
+      <media:content url="${xmlEscape(image)}" medium="image" />
+      <media:thumbnail url="${xmlEscape(image)}" />
+    </item>`;
+}).join('');
+
+
+    const selfHref = `${SITE_URL.replace(/\/$/, '')}/rss/${encodeURIComponent(slug)}.xml`;
+
+const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:dc="http://purl.org/dc/elements/1.1/"
+  xmlns:media="http://search.yahoo.com/mrss/"
+  xmlns:atom="http://www.w3.org/2005/Atom"
 >
-${urlItems}
-</urlset>`;
+  <channel>
+    <title>${xmlEscape(`Timely Voice — ${cat.name}`)}</title>
+    <link>${xmlEscape(`${SITE_URL}/category/${encodeURIComponent(slug)}`)}</link>
+    <atom:link rel="self" type="application/rss+xml" href="${xmlEscape(selfHref)}" />
+    <description>${xmlEscape(`Latest ${cat.name} articles`)}</description>
+    <language>en</language>
+    ${feedItems}
+  </channel>
+</rss>`;
 
-    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600');
-    res.set('Content-Type', 'application/xml; charset=utf-8').send(xml);
+
+    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+    res.type('application/rss+xml; charset=utf-8').send(xml);
   } catch (e) {
-    console.error('news-sitemap.xml error:', e);
-    res.status(500).send('news sitemap generation failed');
+    console.error('category rss error:', e);
+    res.status(500).send('rss generation failed');
   }
 });
+
+
+
+
 
 /* -------------------- Start server -------------------- */
 app.listen(PORT, '0.0.0.0', () => {
