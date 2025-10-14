@@ -1697,9 +1697,6 @@ function escapeXml(str) {
 
 
 
-
-
-
 /* -------------------- Start server -------------------- */
 app.listen(PORT, '0.0.0.0', () => {
   console.log('API listening on', PORT);
