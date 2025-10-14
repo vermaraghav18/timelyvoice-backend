@@ -2,7 +2,6 @@
 require('dotenv').config();
 const express = require('express');
 const compression = require('compression');
-
 const cors = require('cors');
 const analyticsBotFilter = require('./middleware/analyticsBotFilter');
 const analyticsRouter = require('./routes/analytics');
@@ -42,7 +41,6 @@ app.use(compression({ threshold: 0 }));
 
 // Strong ETags let browsers/CDNs validate cached JSON quickly
 app.set('etag', 'strong');
-
 // Cache public GET endpoints so repeat visits are instant
 app.use((req, res, next) => {
   // Only cache safe GET requests
@@ -150,8 +148,7 @@ app.use((err, req, res, next) => {
 app.use(geoMiddleware());
 app.use(analyticsBotFilter());
 
-const rssRouter = require('./src/routes/rss'); // adjust path if your entry is elsewhere
-app.use(rssRouter);
+
 
 
 // Country-aware caching: make caches keep separate copies per geo + auth
@@ -398,20 +395,9 @@ const Subscriber = require('./models/Subscriber');
 setSitemapModels({ Article, Category, Tag });
 app.use(sitemapRouter);
 
-// Comments API routes (public + admin)
-const commentsRouterFactory = require('./routes/comments');
-// Reuse existing auth helpers: optionalAuth (public can pass token or not), auth (admin-only)
-app.use(commentsRouterFactory(
-  { Article, Comment },
-  { requireAuthOptional: optionalAuth, requireAuthAdmin: auth }
-));
 
 
-const newsletterRouterFactory = require('./routes/newsletter');
-app.use(newsletterRouterFactory(
-  { Subscriber },
-  { requireAuthAdmin: auth }
-));
+
 
 
 
@@ -503,6 +489,18 @@ function optionalAuth(req, _res, next) {
   next();
 }
 
+
+const commentsRouterFactory = require('./routes/comments');
+app.use(commentsRouterFactory(
+  { Article, Comment },
+  { requireAuthOptional: optionalAuth, requireAuthAdmin: auth }
+));
+
+const newsletterRouterFactory = require('./routes/newsletter');
+app.use(newsletterRouterFactory(
+  { Subscriber },
+  { requireAuthAdmin: auth }
+));
 /* -------------------- Health & Auth -------------------- */
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.post('/api/auth/login', loginLimiter, (req, res) => {
@@ -1221,7 +1219,7 @@ app.get('/api/export/articles', async (_req, res) => {
 const PORT = process.env.PORT || 4000;
 
 const FRONTEND_BASE_URL =
-  process.env.FRONTEND_BASE_URL || 'https://news-site-frontend-sigma.vercel.app';
+  process.env.FRONTEND_BASE_URL || 'https://www.timelyvoice.com';
 
 const SITE_URL = FRONTEND_BASE_URL; // keep old name for rest of code
 
