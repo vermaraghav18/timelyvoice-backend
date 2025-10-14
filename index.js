@@ -1611,102 +1611,90 @@ app.get('/rss.xml', async (req, res) => {
 });
 
 
-// Per-category RSS (e.g., /rss/top-news.xml)
 app.get('/rss/:slug.xml', async (req, res) => {
   try {
-    const slug = String(req.params.slug || '').trim();
-    const cat = await Category.findOne({
-      $or: [{ slug }, { name: slug }]
-    }).lean();
-    if (!cat) return res.status(404).send('category not found');
+    const slug = String(req.params.slug || '').trim().toLowerCase();
+    if (!slug) return res.status(400).send('missing category slug');
 
+    // 1) Find category by slug
+    const cat = await Category.findOne({ slug }).lean();
+    if (!cat) {
+      // Helpful error (readers prefer 404 over generic 500)
+      return res.status(404).send(`unknown category: ${slug}`);
+    }
+
+    // 2) Fetch articles in this category, allow missing publishAt
+    const now = new Date();
     const docs = await Article.find({
       status: 'published',
+      categories: cat._id,
       $or: [
-    { publishAt: { $lte: now } },
-    { publishAt: { $exists: false } },
-    { publishAt: null }
-  ],
-      category: cat.name,
+        { publishAt: { $lte: now } },
+        { publishAt: { $exists: false } },
+        { publishAt: null },
+      ],
     })
-      .sort({ publishedAt: -1 })
+      .sort({ publishedAt: -1, _id: -1 })
       .limit(100)
       .lean();
 
-    const geo = req.geo || {};
-    const items = docs.filter(d => isAllowedForGeoDoc(d, geo));
+    // 3) Build RSS safely
+    const siteUrl = process.env.SITE_URL?.replace(/\/+$/, '') || 'https://www.timelyvoice.com';
+    const feedTitle = `${cat.title || cat.name || slug} — Timely Voice`;
+    const selfUrl = `${siteUrl}/rss/${encodeURIComponent(slug)}.xml`;
 
-   const feedItems = items.map(a => {
-  const link = `${SITE_URL}/article/${encodeURIComponent(a.slug)}`;
-  const pubDate = new Date(a.publishedAt || a.createdAt || Date.now()).toUTCString();
+    let xml = '';
+    xml += `<?xml version="1.0" encoding="UTF-8"?>\n`;
+    xml += `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xmlns:content="http://purl.org/rss/1.0/modules/content/">\n`;
+    xml += `<channel>\n`;
+    xml += `<title>${escapeXml(feedTitle)}</title>\n`;
+    xml += `<link>${siteUrl}</link>\n`;
+    xml += `<description>${escapeXml(feedTitle)}</description>\n`;
+    xml += `<atom:link href="${selfUrl}" rel="self" type="application/rss+xml"/>\n`;
 
-  const title    = (a.title && a.title.trim()) || 'Article';
-  const author   = (a.author && a.author.trim()) || 'Timely Voice Staff';
-  const image    = (a.ogImage && a.ogImage.trim()) || (a.imageUrl && a.imageUrl.trim()) || SITE_LOGO;
+    for (const a of docs) {
+      const url = `${siteUrl}/article/${a.slug}`;
+      const title = a.title || 'Untitled';
+      const summary = a.summary || a.excerpt || '';
+      // tolerate missing dates:
+      const pubISO = new Date(a.publishedAt || a.publishAt || a.updatedAt || Date.now()).toUTCString();
+      // tolerate missing image:
+      const imgUrl = a.image?.url || a.coverImage?.url || a.thumbnail?.url || '';
 
-  const summary =
-    (a.summary && a.summary.trim()) ||
-    buildDescription(a) ||
-    '';
+      xml += `<item>\n`;
+      xml += `  <title>${escapeXml(title)}</title>\n`;
+      xml += `  <link>${url}</link>\n`;
+      xml += `  <guid isPermaLink="true">${url}</guid>\n`;
+      xml += `  <pubDate>${pubISO}</pubDate>\n`;
+      if (summary) xml += `  <description><![CDATA[${summary}]]></description>\n`;
+      if (a.contentHtml) xml += `  <content:encoded><![CDATA[${a.contentHtml}]]></content:encoded>\n`;
+      if (imgUrl) {
+        xml += `  <media:content url="${imgUrl}" medium="image" />\n`;
+        xml += `  <media:thumbnail url="${imgUrl}" />\n`;
+      }
+      xml += `  <source url="${siteUrl}">Timely Voice</source>\n`;
+      xml += `</item>\n`;
+    }
 
-  const contentHtml = `
-    ${image ? `<p><img src="${xmlEscape(image)}" alt="${xmlEscape(title)}" /></p>` : ''}
-    ${summary ? `<p>${xmlEscape(summary)}</p>` : ''}
-    <p><a href="${xmlEscape(link)}">Read more</a></p>
-  `.trim();
+    xml += `</channel>\n</rss>\n`;
 
-  // Standard <author> field wants "email (Name)"
-  const authorEmail = process.env.FEED_AUTHOR_EMAIL || 'noreply@timelyvoice.com';
-
-  return `
-    <item>
-      <title>${xmlEscape(title)}</title>
-      <link>${xmlEscape(link)}</link>
-      <guid isPermaLink="false">${xmlEscape(String(a._id))}</guid>
-      <pubDate>${pubDate}</pubDate>
-
-      <description><![CDATA[${summary}]]></description>
-      <content:encoded><![CDATA[${contentHtml}]]></content:encoded>
-
-      <dc:creator><![CDATA[${author}]]></dc:creator>
-      <author>${xmlEscape(authorEmail)} (${xmlEscape(author)})</author>
-
-      <source url="${xmlEscape(SITE_URL)}"><![CDATA[Timely Voice]]></source>
-      <category><![CDATA[${cat.name}]]></category>
-
-      <media:content url="${xmlEscape(image)}" medium="image" />
-      <media:thumbnail url="${xmlEscape(image)}" />
-    </item>`;
-}).join('');
-
-
-    const selfHref = `${SITE_URL.replace(/\/$/, '')}/rss/${encodeURIComponent(slug)}.xml`;
-
-const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"
-  xmlns:content="http://purl.org/rss/1.0/modules/content/"
-  xmlns:dc="http://purl.org/dc/elements/1.1/"
-  xmlns:media="http://search.yahoo.com/mrss/"
-  xmlns:atom="http://www.w3.org/2005/Atom"
->
-  <channel>
-    <title>${xmlEscape(`Timely Voice — ${cat.name}`)}</title>
-    <link>${xmlEscape(`${SITE_URL}/category/${encodeURIComponent(slug)}`)}</link>
-    <atom:link rel="self" type="application/rss+xml" href="${xmlEscape(selfHref)}" />
-    <description>${xmlEscape(`Latest ${cat.name} articles`)}</description>
-    <language>en</language>
-    ${feedItems}
-  </channel>
-</rss>`;
-
-
-    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    res.type('application/rss+xml; charset=utf-8').send(xml);
-  } catch (e) {
-    console.error('category rss error:', e);
-    res.status(500).send('rss generation failed');
+    res.set('Content-Type', 'application/rss+xml; charset=utf-8');
+    return res.status(200).send(xml);
+  } catch (err) {
+    console.error('RSS(category) error:', err?.stack || err);
+    return res.status(500).send('rss generation failed');
   }
 });
+
+// helper
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 
 
 
