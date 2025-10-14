@@ -1523,14 +1523,17 @@ app.get('/ssr/article/:slug', async (req, res) => {
 // requires: SITE_URL, xmlEscape(), stripHtml(), buildDescription(), isAllowedForGeoDoc()
 app.get('/rss.xml', async (req, res) => {
   try {
+    const now = new Date(); // <-- INSERTED: define now
+
     const docs = await Article.find({
-      status: 'published',      
-       $or: [
-    { publishAt: { $lte: now } },
-    { publishAt: { $exists: false } },
-    { publishAt: null }
-  ]
+      status: 'published',
+      $or: [
+        { publishAt: { $lte: now } },
+        { publishAt: { $exists: false } },
+        { publishAt: null }
+      ]
     })
+
       .sort({ publishedAt: -1 })
       .limit(100)
       .lean();
@@ -1615,10 +1618,10 @@ app.get('/rss/:slug.xml', async (req, res) => {
   try {
      const slugAliases = { world: 'international', biz: 'business' };
 
-    // 2) normalize and resolve
-    const raw = String(req.params.slug || '').trim().toLowerCase();
-    const slug = String(req.params.slug || '').trim().toLowerCase();
-    if (!slug) return res.status(400).send('missing category slug');
+const raw  = String(req.params.slug || '').trim().toLowerCase();
+const slug = slugAliases[raw] || raw;
+if (!slug) return res.status(400).send('missing category slug');
+
 
     // 1) Find category by slug
     const cat = await Category.findOne({ slug }).lean();
@@ -1628,22 +1631,24 @@ app.get('/rss/:slug.xml', async (req, res) => {
     }
 
     // 2) Fetch articles in this category, allow missing publishAt
-    const now = new Date();
-    const docs = await Article.find({
-      status: 'published',
-      categories: cat._id,
-      $or: [
-        { publishAt: { $lte: now } },
-        { publishAt: { $exists: false } },
-        { publishAt: null },
-      ],
-    })
-      .sort({ publishedAt: -1, _id: -1 })
-      .limit(100)
-      .lean();
+const now = new Date();
+const docs = await Article.find({
+  status: 'published',
+  category: cat.name, // <-- use Category NAME, not ObjectId field
+  $or: [
+    { publishAt: { $lte: now } },
+    { publishAt: { $exists: false } },
+    { publishAt: null },
+  ],
+})
+  .sort({ publishedAt: -1, _id: -1 })
+  .limit(100)
+  .lean();
+
 
     // 3) Build RSS safely
-    const siteUrl = process.env.SITE_URL?.replace(/\/+$/, '') || 'https://www.timelyvoice.com';
+    const siteUrl = SITE_URL.replace(/\/+$/, '');
+
     const feedTitle = `${cat.title || cat.name || slug} — Timely Voice`;
     const selfUrl = `${siteUrl}/rss/${encodeURIComponent(slug)}.xml`;
 
@@ -1659,43 +1664,41 @@ app.get('/rss/:slug.xml', async (req, res) => {
       xml += `<language>en</language>\n`;
 
     for (const a of docs) {
-      const url = `${siteUrl}/article/${a.slug}`;
-      const title = a.title || 'Untitled';
-     // inside the loop for each article "a" in /rss/:slug.xml
-const summary = cleanSummary(a.summary || a.excerpt || '');
-if (summary) {
-  xml += `  <description><![CDATA[${summary}]]></description>\n`;
+  const title  = a.title || 'Untitled';
+  const url    = `${siteUrl}/article/${a.slug}`;
+  const pubISO = new Date(a.publishedAt || a.publishAt || a.updatedAt || Date.now()).toUTCString();
+
+  // Robust image fallback
+  const imgUrl =
+    (a.ogImage && a.ogImage.trim()) ||
+    (a.imageUrl && a.imageUrl.trim()) ||
+    SITE_LOGO;
+
+  // Clean, short description
+  const summary = cleanSummary(a.summary || a.excerpt || '');
+
+  // Optional rich body for readers that support content:encoded
+  const contentHtml = `
+    ${imgUrl ? `<p><img src="${escapeXml(imgUrl)}" alt="${escapeXml(title)}" /></p>` : ''}
+    ${summary ? `<p>${escapeXml(summary)}</p>` : ''}
+    <p><a href="${escapeXml(url)}">Read more</a></p>
+  `.trim();
+
+  xml += `  <item>\n`;
+  xml += `    <title>${escapeXml(title)}</title>\n`;
+  xml += `    <link>${escapeXml(url)}</link>\n`;               // escaped link ✅
+  xml += `    <guid isPermaLink="true">${escapeXml(url)}</guid>\n`;
+  xml += `    <pubDate>${pubISO}</pubDate>\n`;
+  if (summary) xml += `    <description><![CDATA[${summary}]]></description>\n`;
+  xml += `    <content:encoded><![CDATA[${contentHtml}]]></content:encoded>\n`;
+  if (imgUrl) {
+    xml += `    <media:content url="${escapeXml(imgUrl)}" medium="image" />\n`;
+    xml += `    <media:thumbnail url="${escapeXml(imgUrl)}" />\n`;
+  }
+  xml += `    <source url="${escapeXml(siteUrl)}">Timely Voice</source>\n`;
+  xml += `  </item>\n`;
 }
 
-      // tolerate missing dates:
-      const pubISO = new Date(a.publishedAt || a.publishAt || a.updatedAt || Date.now()).toUTCString();
-      // tolerate missing image:
-     const imgUrl =
-  a.image?.url ||
-  a.coverImage?.url ||
-  a.thumbnail?.url ||
-  a.images?.[0]?.url ||
-  '';
-
-if (imgUrl) {
-  xml += `  <media:content url="${imgUrl}" medium="image" />\n`;
-  xml += `  <media:thumbnail url="${imgUrl}" />\n`;
-}
-
-      xml += `<item>\n`;
-      xml += `  <title>${escapeXml(title)}</title>\n`;
-      xml += `  <link>${url}</link>\n`;
-      xml += `  <guid isPermaLink="true">${url}</guid>\n`;
-      xml += `  <pubDate>${pubISO}</pubDate>\n`;
-      if (summary) xml += `  <description><![CDATA[${summary}]]></description>\n`;
-      if (a.contentHtml) xml += `  <content:encoded><![CDATA[${a.contentHtml}]]></content:encoded>\n`;
-      if (imgUrl) {
-        xml += `  <media:content url="${imgUrl}" medium="image" />\n`;
-        xml += `  <media:thumbnail url="${imgUrl}" />\n`;
-      }
-      xml += `  <source url="${siteUrl}">Timely Voice</source>\n`;
-      xml += `</item>\n`;
-    }
 
     xml += `</channel>\n</rss>\n`;
 
