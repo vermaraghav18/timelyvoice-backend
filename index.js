@@ -1613,6 +1613,10 @@ app.get('/rss.xml', async (req, res) => {
 
 app.get('/rss/:slug.xml', async (req, res) => {
   try {
+     const slugAliases = { world: 'international', biz: 'business' };
+
+    // 2) normalize and resolve
+    const raw = String(req.params.slug || '').trim().toLowerCase();
     const slug = String(req.params.slug || '').trim().toLowerCase();
     if (!slug) return res.status(400).send('missing category slug');
 
@@ -1648,18 +1652,35 @@ app.get('/rss/:slug.xml', async (req, res) => {
     xml += `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xmlns:content="http://purl.org/rss/1.0/modules/content/">\n`;
     xml += `<channel>\n`;
     xml += `<title>${escapeXml(feedTitle)}</title>\n`;
-    xml += `<link>${siteUrl}</link>\n`;
-    xml += `<description>${escapeXml(feedTitle)}</description>\n`;
-    xml += `<atom:link href="${selfUrl}" rel="self" type="application/rss+xml"/>\n`;
+      xml += `<link>${siteUrl}</link>\n`;
+      xml += `<description>${escapeXml(feedTitle)}</description>\n`;
+      xml += `<atom:link href="${selfUrl}" rel="self" type="application/rss+xml"/>\n`;
+      xml += `<lastBuildDate>${new Date().toUTCString()}</lastBuildDate>\n`;
+      xml += `<language>en</language>\n`;
 
     for (const a of docs) {
       const url = `${siteUrl}/article/${a.slug}`;
       const title = a.title || 'Untitled';
-      const summary = a.summary || a.excerpt || '';
+     // inside the loop for each article "a" in /rss/:slug.xml
+const summary = cleanSummary(a.summary || a.excerpt || '');
+if (summary) {
+  xml += `  <description><![CDATA[${summary}]]></description>\n`;
+}
+
       // tolerate missing dates:
       const pubISO = new Date(a.publishedAt || a.publishAt || a.updatedAt || Date.now()).toUTCString();
       // tolerate missing image:
-      const imgUrl = a.image?.url || a.coverImage?.url || a.thumbnail?.url || '';
+     const imgUrl =
+  a.image?.url ||
+  a.coverImage?.url ||
+  a.thumbnail?.url ||
+  a.images?.[0]?.url ||
+  '';
+
+if (imgUrl) {
+  xml += `  <media:content url="${imgUrl}" medium="image" />\n`;
+  xml += `  <media:thumbnail url="${imgUrl}" />\n`;
+}
 
       xml += `<item>\n`;
       xml += `  <title>${escapeXml(title)}</title>\n`;
@@ -1693,6 +1714,16 @@ function escapeXml(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function cleanSummary(str = '') {
+  const s = String(str);
+  // remove our internal markers or stray tokens
+  return s
+    .replace(/:contentReference\[.*?\]/g, '')
+    .replace(/\[oaicite:.*?\]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 
