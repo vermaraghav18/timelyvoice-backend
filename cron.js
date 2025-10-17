@@ -33,3 +33,16 @@ if (CRON_DEBUG_EVERY_MINUTE) {
   cron.schedule('* * * * *', () => run('debug-1m'), { timezone: CRON_TZ });
   console.warn('[cron] DEBUG_EVERY_MINUTE=true — running every minute for testing');
 }
+
+// === Autmotion: start scheduler on boot (respects AUTMOTION_ENABLED) ===
+try {
+  const { startAutmotion } = require("./src/jobs/autmotion");
+  if (String(process.env.AUTMOTION_ENABLED || "true") === "true") {
+    const sec = parseInt(process.env.AUTMOTION_INTERVAL_SECONDS || "300", 10);
+    startAutmotion(sec);
+  } else {
+    console.log("[autmotion] booted in paused mode (AUTMOTION_ENABLED=false)");
+  }
+} catch (e) {
+  console.warn("[autmotion] not started:", e?.message || e);
+}

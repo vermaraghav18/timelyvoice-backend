@@ -29,6 +29,8 @@ const sectionsRouter = require('./src/routes/sections');
 const sectionsV2 = require("./src/routes/sectionsV2");
 require('./cron'); // periodic rollup jobs
 
+const automationRoutes = require('./src/routes/automation');
+
 
 // === MEDIA step imports ===
 const multer = require('multer');
@@ -135,6 +137,8 @@ app.use('/api/ticker', tickerRoutes);
 app.use('/api/sections', sectionsRouter);
 app.use("/api", sectionsV2);
 app.use("/api/top-news", require("./src/routes/topnews"));
+app.use('/api/automation', automationRoutes);
+
 
 // Return a clean message if an origin is not allowed by CORS
 app.use((err, req, res, next) => {
