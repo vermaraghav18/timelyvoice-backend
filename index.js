@@ -1,5 +1,7 @@
 // index.js (backend server)
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+
 const express = require('express');
 const compression = require('compression');
 const cors = require('cors');
@@ -30,8 +32,8 @@ const sectionsV2 = require("./src/routes/sectionsV2");
 require('./cron'); // periodic rollup jobs
 
 const automationRoutes = require('./src/routes/automation');
-
-
+const xRoutes = require("./src/routes/x");
+const automationX = require("./src/routes/automation/x");
 // === MEDIA step imports ===
 const multer = require('multer');
 const stream = require('stream');
@@ -130,6 +132,15 @@ const corsOptions = {
 
 
 app.use(cors(corsOptions));
+app.get("/api/automation/_debug/openrouter", (req, res) => {
+  res.json({
+    keyPresent: !!process.env.OPENROUTER_API_KEY,
+    keyPrefix: process.env.OPENROUTER_API_KEY?.slice(0, 10) || null,
+    cwd: process.cwd(),
+    envFileExpectedAt: require("path").resolve(__dirname, ".env")
+  });
+});
+
 app.options(/.*/, cors(corsOptions)); // ensure preflight OPTIONS succeeds
 app.use("/", robotsRoute);
 app.use('/api/breaking', breakingRoutes);
@@ -138,8 +149,8 @@ app.use('/api/sections', sectionsRouter);
 app.use("/api", sectionsV2);
 app.use("/api/top-news", require("./src/routes/topnews"));
 app.use('/api/automation', automationRoutes);
-
-
+app.use("/api/x", xRoutes);
+app.use("/api/automation/x", automationX);
 // Return a clean message if an origin is not allowed by CORS
 app.use((err, req, res, next) => {
   if (err && err.message && err.message.includes('CORS')) {
@@ -1732,6 +1743,39 @@ function cleanSummary(str = '') {
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
+
+// --- OpenRouter key sanity ping (returns model list on success) ---
+app.get("/api/automation/_debug/openrouter/ping", async (req, res) => {
+  try {
+    const raw = process.env.OPENROUTER_API_KEY;
+    const apiKey = (raw || "").trim();
+
+    const r = await fetch("https://openrouter.ai/api/v1/models", {
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": process.env.SITE_URL || "http://localhost",
+        "X-Title": "TimelyVoice Admin",
+      }
+    });
+
+    const body = await r.text();
+    res.status(r.status).type("application/json").send(body);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// --- Surface server errors in JSON so the Admin can see the real cause ---
+app.use((err, req, res, next) => {
+  console.error("[SERVER ERROR]", err);
+  const msg = (err && err.message) ? err.message : String(err);
+  res.status(500).json({ error: msg, stack: err?.stack });
+});
+
+// Also catch unhandled async errors
+process.on("unhandledRejection", (err) => {
+  console.error("[UNHANDLED REJECTION]", err);
+});
 
 
 

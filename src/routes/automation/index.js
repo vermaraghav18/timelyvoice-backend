@@ -2,6 +2,7 @@
 const express = require('express');
 const ctrl = require('../../controllers/automation.controller');
 
+
 const router = express.Router();
 
 // Feeds
@@ -17,6 +18,10 @@ router.post('/items/:id/extract', ctrl.extractItem);
 router.post('/items/:id/generate', ctrl.generateItem);
 router.post('/items/:id/mark-ready', ctrl.markReady);
 router.post('/items/:id/draft', ctrl.createDraft);
+
+// X/Twitter automation
+router.use('/x', require('./x'));
+
 
 // === Global controls: Start / Stop / Status / Run Now ===
 const { startAutmotion, stopAutmotion, runOnceNow, getStatus } = require("../../jobs/autmotion");
