@@ -39,6 +39,16 @@ const ALLOWED_TEMPLATES = [
   "rail_v6",
   "rail_v7",
   "rail_v8",
+
+  // ✅ New: FilmyBazaar rail template
+  "rail_filmybazaar_v1",
+  "rail_filmybazaar_v2",
+  "rail_filmybazaar_v3",
+  "rail_filmybazaar_v4",
+  "rail_sports_v1", 
+  "sports_v2",
+  "sports_v3",
+   "tech_main_v1",
 ];
 
 /* ================= Helpers ================= */
@@ -284,7 +294,6 @@ router.get("/:id", ctrl.read);
 router.post(
   "/",
   (req, _res, next) => {
-    console.log("DEBUG CREATE /api/sections body:", req.body);
     next();
   },
   withValidation(SectionCreateSchema),
@@ -295,7 +304,7 @@ router.post(
 router.patch(
   "/:id",
   (req, _res, next) => {
-    console.log("DEBUG UPDATE /api/sections body:", req.body);
+
     next();
   },
   withValidation(SectionUpdateSchema),

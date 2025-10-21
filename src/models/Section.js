@@ -11,6 +11,15 @@ const DEFAULT_CAP = {
   rail_v5: 8,
   rail_v6: 6,   // lead + up to 5 rows
   rail_v7: 1,   // single promo/image rail
+  rail_filmybazaar_v1: 8, // ✅ added
+  rail_filmybazaar_v2: 8,
+  rail_filmybazaar_v3: 8, 
+  rail_filmybazaar_v4: 4, 
+  rail_sports_v1: 8, 
+  sports_v2: 6,
+  sports_v3: 8, 
+   tech_main_v1: 9,  // 👈 1 feature + 2 mids + 6 list
+
 
   // Main sections
   main_v1: 12,
@@ -47,6 +56,14 @@ const MAX_CAP = {
   rail_v5: 24,
   rail_v6: 12,
   rail_v7: 1,   // fixed single
+  rail_filmybazaar_v1: 12, // ✅ added
+  rail_filmybazaar_v2: 12,
+  rail_filmybazaar_v3: 12,
+  rail_filmybazaar_v4: 8,
+  rail_sports_v1: 12, 
+  sports_v2: 6,
+  sports_v3: 12,
+  tech_main_v1: 12, // 👈 let editors bump as needed
 
   // Main sections
   main_v1: 24,

@@ -142,6 +142,118 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
       continue;
     }
 
+        // ---- Composite section: tech_main_v1 ----
+    if (s.template === "tech_main_v1") {
+      // capacity default is already 9 in Section model; honor overrides
+      const limit = Number(s.capacity ?? 9);
+
+      // helper to convert Article docs to FE shape (same as in top_v2)
+      const shape = (rows) => rows.map(stripArticleFields);
+
+      // We’ll support 3 modes like top_v*:
+      // - auto: query from feed.query/categories (or fallback to "tech")
+      // - manual: strictly use pins
+      // - mixed: use pins first, then top up from query excluding pinned ids
+      const mode = s.feed?.mode || "auto";
+
+      // Collect articles based on mode
+      let rows = [];
+      if (mode === "manual" || mode === "mixed") {
+        // collect ordered, active pins
+        const activePins = (s.pins || []).filter(
+          (p) => (!p.startAt || p.startAt <= now) && (!p.endAt || p.endAt >= now)
+        );
+        const pinIds = activePins.map((p) => p.articleId);
+
+        if (pinIds.length) {
+          const pinDocs = await Article.find({
+            _id: { $in: pinIds },
+            status: "published",
+          })
+            .sort({ publishedAt: -1, createdAt: -1 })
+            .limit(limit)
+            .lean({ getters: true })
+            .maxTimeMS(5000);
+
+          // keep original pin order
+          const byId = new Map(pinDocs.map((d) => [String(d._id), d]));
+          rows = pinIds
+            .map((id) => byId.get(String(id)))
+            .filter(Boolean);
+        }
+
+        if (mode === "mixed" && rows.length < limit) {
+          const excludeIds = rows.map((a) => String(a._id || a.id));
+          const q = s.feed?.query || {};
+          // fallback category if none specified
+          if (!q.categories || !q.categories.length) {
+            q.categories = ["tech"];
+          }
+          const topUp = await runQuery({
+            query: q,
+            limit: limit - rows.length,
+            excludeIds,
+          });
+          rows = [...rows, ...topUp];
+        }
+      } else {
+        // pick a smart fallback from the section’s own target
+const fallbackCatRaw = (s.target?.value || "tech");
+const fallbackCat = String(fallbackCatRaw).trim();
+const cap = fallbackCat.charAt(0).toUpperCase() + fallbackCat.slice(1).toLowerCase();
+
+const buildCategoryFallback = (q0 = {}) => {
+  const q = { ...q0 };
+  if (!q.categories || !q.categories.length) {
+    // try both lowercase & Capitalized to match stored Article.category values
+    q.categories = [fallbackCat.toLowerCase(), cap];
+  }
+  return q;
+};
+
+if (mode === "manual" || mode === "mixed") {
+  // ... after rows from pins ...
+  if (mode === "mixed" && rows.length < limit) {
+    const excludeIds = rows.map((a) => String(a._id || a.id));
+    const q = buildCategoryFallback(s.feed?.query || {});
+    const topUp = await runQuery({
+      query: q,
+      limit: limit - rows.length,
+      excludeIds,
+    });
+    rows = [...rows, ...topUp];
+  }
+} else {
+  const q = buildCategoryFallback(s.feed?.query || {});
+  rows = await runQuery({ query: q, limit });
+}
+
+      }
+
+      // Split into hero(1) + mids(2) + heads(6) from the first `limit` rows
+      const pins = rows.slice(0, limit);
+      const hero  = pins.slice(0, 1);
+      const mids  = pins.slice(1, 3);
+      const heads = pins.slice(3, 9);
+
+      const items = [...shape(hero), ...shape(mids), ...shape(heads)];
+
+      out.push({
+        id: String(s._id),
+        title: s.title,
+        slug: s.slug,
+        template: "tech_main_v1",
+        side: s.side || "",
+        placementIndex: s.placementIndex || 0,
+        target: s.target,
+        capacity: limit,
+        moreLink: s.moreLink || "",
+        custom: s.custom || {},
+        items,
+      });
+      continue;
+    }
+
     // ---- Composite section: top_v1 ----
     if (s.template === "top_v1") {
       const cfg = s.custom || {};
