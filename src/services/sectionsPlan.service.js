@@ -2,6 +2,8 @@
 const Section = require("../models/Section");
 const Article = require("../models/Article");
 
+/* =============================== Utilities =============================== */
+
 /** Normalize image fields so FE can rely on { imageUrl, imageAlt } */
 function normalizeMedia(a) {
   const cover = a.cover; // string or { url, alt }
@@ -31,49 +33,75 @@ function stripArticleFields(a) {
     imageAlt,
     publishedAt: a.publishedAt,
     author: a.author,
-    category: a.category,
+    category: a.category,       // display category
+    // categorySlug: a.categorySlug, // uncomment if FE wants slug too
   };
 }
 
+// Light list projection (skip heavy fields)
+const PROJECTION_LIST = {
+  body: 0,
+  bodyHtml: 0,
+};
+
 // Include old + new names
 const ARTICLE_FIELDS =
-  "title slug summary imageUrl imageAlt cover publishedAt author category";
+  "title slug summary imageUrl imageAlt cover publishedAt author category categorySlug tags";
+
+/** Escape string for building a safe RegExp */
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Normalize array of strings */
+function normArray(v) {
+  if (!v) return [];
+  const arr = Array.isArray(v) ? v : String(v).split(",");
+  return arr.map((x) => String(x || "").trim()).filter(Boolean);
+}
 
 /* ------------------------------------------------------------------
- * Helper: run a flexible query for composite sections (e.g., top_v1/top_v2)
+ * Helper: run a flexible query for composite sections
+ * - honors status=published
+ * - accepts categories against either `category` or `categorySlug`
+ * - dedupes by excludeIds
+ * - supports tags, includeIds, sinceDays, and sort
  * ------------------------------------------------------------------ */
 async function runQuery({ query = {}, limit = 4, excludeIds = [] } = {}) {
-  const q = { publishedAt: { $ne: null } };
-  if (Array.isArray(query.categories) && query.categories.length) {
-    q.category = { $in: query.categories };
+  const q = { status: "published", publishedAt: { $ne: null } };
+
+  const cats = Array.isArray(query.categories) ? query.categories.filter(Boolean) : [];
+  if (cats.length) {
+    q.$or = [
+      { category: { $in: cats } },
+      { categorySlug: { $in: cats } },
+    ];
   }
-  if (Array.isArray(query.tags) && query.tags.length) {
-    q.tags = { $in: query.tags };
-  }
-  if (Array.isArray(query.includeIds) && query.includeIds.length) {
-    q._id = { $in: query.includeIds.map(String) };
-  }
+
+  const tags = Array.isArray(query.tags) ? query.tags.filter(Boolean) : [];
+  if (tags.length) q.tags = { $in: tags };
+
+  const includeIds = Array.isArray(query.includeIds) ? query.includeIds.map(String) : [];
+  if (includeIds.length) q._id = { $in: includeIds };
+
   if (Array.isArray(excludeIds) && excludeIds.length) {
     q._id = q._id || {};
     q._id.$nin = excludeIds.map(String);
   }
+
   if (Number.isFinite(query.sinceDays) && query.sinceDays > 0) {
     const d = new Date();
     d.setDate(d.getDate() - query.sinceDays);
     q.publishedAt = { ...(q.publishedAt || {}), $gte: d };
   }
 
-    // Clamp limit and exclude heavy fields for list feeds
+  // Clamp limit and exclude heavy fields for list feeds
   const hardLimit = Math.min(Number(limit || 12), 12);
 
-  const PROJECTION_LIST = {
-    body: 0,
-    bodyHtml: 0,
-  };
-
-  const SORT = query.sort === "publishedAt_asc"
-    ? { publishedAt: 1, _id: 1 }
-    : { publishedAt: -1, _id: -1 };
+  const SORT =
+    query.sort === "publishedAt_asc"
+      ? { publishedAt: 1, _id: 1 }
+      : { publishedAt: -1, _id: -1 };
 
   const rows = await Article.find(q, PROJECTION_LIST)
     .sort(SORT)
@@ -82,19 +110,31 @@ async function runQuery({ query = {}, limit = 4, excludeIds = [] } = {}) {
     .maxTimeMS(5000);
 
   return rows.map(stripArticleFields);
-
 }
 
+/* =============================== Plan Builder =============================== */
+
 /**
- * Build the homepage plan
- * NOTE: passes through slug/side/custom/placementIndex/target for all rows.
- * rail_v7 is image/promo only (no items), so it’s always included if enabled.
+ * Build the plan for a given target.
+ * Accepts either:
+ * - { sectionType, sectionValue } (from client)
+ * - { targetType, targetValue }  (legacy / internal)
  */
-exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) => {
+exports.buildPlan = async (params = {}) => {
+  // Accept aliases & normalize
+  const targetType =
+    String(params.sectionType || params.targetType || "homepage").toLowerCase();
+  const rawTargetValue = String(params.sectionValue || params.targetValue || "/");
+  const targetValue = rawTargetValue; // do not lowerCase here; use case-insensitive match in DB query
+
+  // Case-insensitive match for target.value so Admin can save "Politics" while FE sends "politics"
+  const valueRe = new RegExp(`^${escapeRegExp(targetValue)}$`, "i");
+
+  // Pull all enabled sections for this target
   const sections = await Section.find({
     enabled: true,
     "target.type": targetType,
-    "target.value": targetValue,
+    "target.value": valueRe,
   })
     .select(
       "title slug template capacity moreLink side custom placementIndex target feed pins enabled"
@@ -106,25 +146,25 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
   const out = [];
 
   for (const s of sections) {
-    // ---- Promo rail: rail_v7 (image only) ----
+    /* ===================== rail_v7: image promo (no items) ===================== */
     if (s.template === "rail_v7") {
       out.push({
         id: String(s._id),
         title: s.title,
         slug: s.slug,
         template: s.template,
-        side: s.side || "right", // allow renderer to place it
+        side: s.side || "right",
         placementIndex: s.placementIndex || 0,
         target: s.target,
-        capacity: 1, // fixed single
+        capacity: 1,
         moreLink: s.moreLink || "",
-        custom: s.custom || {}, // << contains imageUrl/alt/linkUrl/aspect
-        items: [], // << important: render even with no items
+        custom: s.custom || {}, // { imageUrl, alt, linkUrl, aspect }
+        items: [],
       });
       continue;
     }
 
-    // ---- Promo rail: rail_v8 (content card) ----
+    /* ===================== rail_v8: promo content card ===================== */
     if (s.template === "rail_v8") {
       out.push({
         id: String(s._id),
@@ -142,53 +182,56 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
       continue;
     }
 
-        // ---- Composite section: tech_main_v1 ----
+    /* ===================== tech_main_v1 (center/main grid) ===================== */
     if (s.template === "tech_main_v1") {
-      // capacity default is already 9 in Section model; honor overrides
-      const limit = Number(s.capacity ?? 9);
-
-      // helper to convert Article docs to FE shape (same as in top_v2)
+      const limit = Math.max(1, Number(s.capacity ?? 9));
       const shape = (rows) => rows.map(stripArticleFields);
-
-      // We’ll support 3 modes like top_v*:
-      // - auto: query from feed.query/categories (or fallback to "tech")
-      // - manual: strictly use pins
-      // - mixed: use pins first, then top up from query excluding pinned ids
       const mode = s.feed?.mode || "auto";
 
-      // Collect articles based on mode
+      // Safe category fallback:
+      const pageCat = targetType === "category"
+        ? String(targetValue).trim().toLowerCase()
+        : "";
+      const pageCatCap = pageCat ? pageCat.charAt(0).toUpperCase() + pageCat.slice(1) : "";
+
+      const buildCategoryFallback = (q0 = {}) => {
+        const q = { ...(q0 || {}) };
+        const cats = normArray(q.categories);
+        if (!cats.length) {
+          const secCats = normArray(s.feed?.categories);
+          if (secCats.length) q.categories = secCats;
+          else if (pageCat) q.categories = [pageCat, pageCatCap];
+          else q.categories = ["tech"]; // last resort default
+        }
+        return q;
+      };
+
       let rows = [];
+
       if (mode === "manual" || mode === "mixed") {
-        // collect ordered, active pins
+        // ordered, active pins
         const activePins = (s.pins || []).filter(
           (p) => (!p.startAt || p.startAt <= now) && (!p.endAt || p.endAt >= now)
         );
         const pinIds = activePins.map((p) => p.articleId);
 
         if (pinIds.length) {
-          const pinDocs = await Article.find({
-            _id: { $in: pinIds },
-            status: "published",
-          })
+          const pinDocs = await Article.find(
+            { _id: { $in: pinIds }, status: "published" },
+            PROJECTION_LIST
+          )
             .sort({ publishedAt: -1, createdAt: -1 })
             .limit(limit)
             .lean({ getters: true })
             .maxTimeMS(5000);
 
-          // keep original pin order
           const byId = new Map(pinDocs.map((d) => [String(d._id), d]));
-          rows = pinIds
-            .map((id) => byId.get(String(id)))
-            .filter(Boolean);
+          rows = activePins.map((p) => byId.get(String(p.articleId))).filter(Boolean);
         }
 
         if (mode === "mixed" && rows.length < limit) {
           const excludeIds = rows.map((a) => String(a._id || a.id));
-          const q = s.feed?.query || {};
-          // fallback category if none specified
-          if (!q.categories || !q.categories.length) {
-            q.categories = ["tech"];
-          }
+          const q = buildCategoryFallback(s.feed?.query || {});
           const topUp = await runQuery({
             query: q,
             limit: limit - rows.length,
@@ -197,43 +240,14 @@ exports.buildPlan = async ({ targetType = "homepage", targetValue = "/" } = {}) 
           rows = [...rows, ...topUp];
         }
       } else {
-        // pick a smart fallback from the section’s own target
-const fallbackCatRaw = (s.target?.value || "tech");
-const fallbackCat = String(fallbackCatRaw).trim();
-const cap = fallbackCat.charAt(0).toUpperCase() + fallbackCat.slice(1).toLowerCase();
-
-const buildCategoryFallback = (q0 = {}) => {
-  const q = { ...q0 };
-  if (!q.categories || !q.categories.length) {
-    // try both lowercase & Capitalized to match stored Article.category values
-    q.categories = [fallbackCat.toLowerCase(), cap];
-  }
-  return q;
-};
-
-if (mode === "manual" || mode === "mixed") {
-  // ... after rows from pins ...
-  if (mode === "mixed" && rows.length < limit) {
-    const excludeIds = rows.map((a) => String(a._id || a.id));
-    const q = buildCategoryFallback(s.feed?.query || {});
-    const topUp = await runQuery({
-      query: q,
-      limit: limit - rows.length,
-      excludeIds,
-    });
-    rows = [...rows, ...topUp];
-  }
-} else {
-  const q = buildCategoryFallback(s.feed?.query || {});
-  rows = await runQuery({ query: q, limit });
-}
-
+        // AUTO: derive categories from feed or page; default to 'tech'
+        const q = buildCategoryFallback(s.feed?.query || {});
+        rows = await runQuery({ query: q, limit });
       }
 
-      // Split into hero(1) + mids(2) + heads(6) from the first `limit` rows
       const pins = rows.slice(0, limit);
-      const hero  = pins.slice(0, 1);
-      const mids  = pins.slice(1, 3);
+      const hero = pins.slice(0, 1);
+      const mids = pins.slice(1, 3);
       const heads = pins.slice(3, 9);
 
       const items = [...shape(hero), ...shape(mids), ...shape(heads)];
@@ -254,17 +268,33 @@ if (mode === "manual" || mode === "mixed") {
       continue;
     }
 
-    // ---- Composite section: top_v1 ----
+    /* ===================== top_v1 (composite zones) ===================== */
     if (s.template === "top_v1") {
       const cfg = s.custom || {};
       const dedupe = !!cfg.dedupeAcrossZones;
       const used = new Set();
 
+      const pageCat = targetType === "category"
+        ? String(targetValue).trim().toLowerCase()
+        : "";
+      const pageCatCap = pageCat ? pageCat.charAt(0).toUpperCase() + pageCat.slice(1) : "";
+
+      const mergeQuery = (zoneQuery = {}) => {
+        const q = { ...(zoneQuery || {}) };
+        const explicit = normArray(q.categories);
+        if (!explicit.length) {
+          const secCats = normArray(s.feed?.categories);
+          if (secCats.length) q.categories = secCats;
+          else if (pageCat) q.categories = [pageCat, pageCatCap];
+        }
+        return q;
+      };
+
       const take = async (zone = {}, fallbackLimit = 0) => {
         if (zone?.enable === false) return [];
         const lim = Number(zone?.limit ?? fallbackLimit);
         const list = await runQuery({
-          query: zone?.query || {},
+          query: mergeQuery(zone?.query || {}),
           limit: lim,
           excludeIds: dedupe ? Array.from(used) : [],
         });
@@ -285,28 +315,45 @@ if (mode === "manual" || mode === "mixed") {
         title: s.title,
         slug: s.slug,
         template: s.template,
-        side: "", // center/main
+        side: "",
         placementIndex: s.placementIndex || 0,
         target: s.target,
         capacity: 0,
         moreLink: s.moreLink || "",
         custom: { ...(s.custom || {}), zoneItems },
-        items: [], // renderer relies on custom.zoneItems
+        items: [],
       });
       continue;
     }
 
-    // ---- Composite section: top_v2 ----
+    /* ===================== top_v2 (composite zones - fixed) ===================== */
     if (s.template === "top_v2") {
       const cfg = s.custom || {};
       const dedupe = !!cfg.dedupeAcrossZones;
       const used = new Set();
 
+      // page context (category page fallback)
+      const pageCat = targetType === "category"
+        ? String(targetValue).trim().toLowerCase()
+        : "";
+      const pageCatCap = pageCat ? pageCat.charAt(0).toUpperCase() + pageCat.slice(1) : "";
+
+      const mergeQuery = (zoneQuery = {}) => {
+        const q = { ...(zoneQuery || {}) };
+        const explicit = normArray(q.categories);
+        if (!explicit.length) {
+          const secCats = normArray(s.feed?.categories);
+          if (secCats.length) q.categories = secCats;
+          else if (pageCat) q.categories = [pageCat, pageCatCap];
+        }
+        return q;
+      };
+
       const take = async (zone = {}, fallbackLimit = 0) => {
         if (zone?.enable === false) return [];
         const lim = Number(zone?.limit ?? fallbackLimit);
         const list = await runQuery({
-          query: zone?.query || {},
+          query: mergeQuery(zone?.query || {}),
           limit: lim,
           excludeIds: dedupe ? Array.from(used) : [],
         });
@@ -314,15 +361,12 @@ if (mode === "manual" || mode === "mixed") {
         return list;
       };
 
-      // helper to convert Article docs to FE shape
       const shape = (rows) => rows.map(stripArticleFields);
-
-      // Build from pins if requested
       const mode = s.feed?.mode || "auto";
       let zoneItems = { hero: [], sideStack: [], belowGrid: [], trending: [] };
 
       if (mode === "manual" || mode === "mixed") {
-        // collect ordered, active pins
+        // ordered, active pins
         const activePins = (s.pins || []).filter(
           (p) => (!p.startAt || p.startAt <= now) && (!p.endAt || p.endAt >= now)
         );
@@ -330,14 +374,13 @@ if (mode === "manual" || mode === "mixed") {
 
         let pins = [];
         if (pinIds.length) {
-          const pinDocs = await Article.find({
-            _id: { $in: pinIds },
-            status: "published",
-          })
-            .select(ARTICLE_FIELDS)
-            .lean();
-          const map = new Map(pinDocs.map((a) => [String(a._id), a]));
-          pins = activePins.map((p) => map.get(String(p.articleId))).filter(Boolean);
+          const pinDocs = await Article.find(
+            { _id: { $in: pinIds }, status: "published" },
+            ARTICLE_FIELDS
+          ).lean({ getters: true });
+
+          const byId = new Map(pinDocs.map((a) => [String(a._id), a]));
+          pins = activePins.map((p) => byId.get(String(p.articleId))).filter(Boolean);
         }
 
         // Map pins to zones: 1 / 3 / 6 / 10
@@ -357,9 +400,8 @@ if (mode === "manual" || mode === "mixed") {
         }
 
         if (mode === "mixed") {
-          // top-up each zone to its limit using runQuery (excluding used)
-          const heroNeed = Math.max(0, Number(cfg.hero?.limit ?? 1) - zoneItems.hero.length);
-          const sideNeed = Math.max(0, Number(cfg.sideStack?.limit ?? 3) - zoneItems.sideStack.length);
+          const heroNeed  = Math.max(0, Number(cfg.hero?.limit ?? 1)  - zoneItems.hero.length);
+          const sideNeed  = Math.max(0, Number(cfg.sideStack?.limit ?? 3) - zoneItems.sideStack.length);
           const belowNeed = Math.max(0, Number(cfg.belowGrid?.limit ?? 6) - zoneItems.belowGrid.length);
           const trendNeed = Math.max(0, Number(cfg.trending?.limit ?? 10) - zoneItems.trending.length);
 
@@ -381,12 +423,12 @@ if (mode === "manual" || mode === "mixed") {
           }
         }
       } else {
-        // AUTO (default): previous behavior
+        // AUTO (default): inherit categories from section/page
         zoneItems = {
           hero: (await take({ ...(cfg.hero || {}), limit: 1 }, 1)).slice(0, 1),
-          sideStack: await take(cfg.sideStack, 3),
-          belowGrid: await take(cfg.belowGrid, 6),
-          trending: await take(cfg.trending, 10),
+          sideStack: await take({ ...(cfg.sideStack || {}) }, 3),
+          belowGrid: await take({ ...(cfg.belowGrid || {}) }, 6),
+          trending: await take({ ...(cfg.trending || {}) }, 10),
         };
       }
 
@@ -395,18 +437,18 @@ if (mode === "manual" || mode === "mixed") {
         title: s.title,
         slug: s.slug,
         template: s.template,
-        side: "", // center/main
+        side: "",
         placementIndex: s.placementIndex || 0,
         target: s.target,
         capacity: 0,
         moreLink: s.moreLink || "",
         custom: s.custom || {},
-        items: zoneItems, // composite payload for top_v2
+        items: zoneItems,
       });
       continue;
     }
 
-    // ---- Feed/pinned sections (existing behavior) ----
+    /* ===================== Generic feed/pinned sections ===================== */
     const activePins = (s.pins || []).filter(
       (p) => (!p.startAt || p.startAt <= now) && (!p.endAt || p.endAt >= now)
     );
@@ -414,29 +456,44 @@ if (mode === "manual" || mode === "mixed") {
     let orderedPins = [];
 
     if (pinIds.length) {
-          const pinDocs = await Article.find(
-        { _id: { $in: pinIds }, status: "published" }
+      const pinDocs = await Article.find(
+        { _id: { $in: pinIds }, status: "published" },
+        ARTICLE_FIELDS
       )
-        .select(ARTICLE_FIELDS)
         .lean({ getters: true })
         .maxTimeMS(5000);
 
-
       const map = new Map(pinDocs.map((a) => [String(a._id), a]));
-      orderedPins = activePins
-        .map((p) => map.get(String(p.articleId)))
-        .filter(Boolean);
+      orderedPins = activePins.map((p) => map.get(String(p.articleId))).filter(Boolean);
     }
 
-    // Auto-fill remaining slots unless feed is manual
-        let autoItems = [];
+    let autoItems = [];
     if (s.feed?.mode !== "manual") {
+      // Build a simple query for generic feeds
       const q = { status: "published" };
-      if (s.feed?.categories?.length) q.category = { $in: s.feed.categories };
-      if (s.feed?.tags?.length) q.tags = { $in: s.feed.tags };
-      if (s.feed?.timeWindowHours > 0) {
+
+      const secCats = normArray(s.feed?.categories);
+      // If no categories set in Admin and this is a category page, fallback to page context
+      if (!secCats.length && targetType === "category") {
+        const pageCat = String(targetValue).trim().toLowerCase();
+        const pageCatCap = pageCat ? pageCat.charAt(0).toUpperCase() + pageCat.slice(1) : "";
+        q.$or = [
+          { category: { $in: [pageCat, pageCatCap] } },
+          { categorySlug: { $in: [pageCat, pageCatCap] } },
+        ];
+      } else if (secCats.length) {
+        q.$or = [
+          { category: { $in: secCats } },
+          { categorySlug: { $in: secCats } },
+        ];
+      }
+
+      const secTags = normArray(s.feed?.tags);
+      if (secTags.length) q.tags = { $in: secTags };
+
+      if (Number(s.feed?.timeWindowHours) > 0) {
         q.publishedAt = {
-          $gte: new Date(Date.now() - s.feed?.timeWindowHours * 3600 * 1000),
+          $gte: new Date(Date.now() - Number(s.feed.timeWindowHours) * 3600 * 1000),
         };
       }
 
@@ -445,36 +502,30 @@ if (mode === "manual" || mode === "mixed") {
           ? { priority: -1, publishedAt: -1, _id: -1 }
           : { publishedAt: -1, _id: -1 };
 
-      // Hard-cap capacity so sections never over-fetch
       const hardCapacity = Math.min(Number(s.capacity || 0), 12);
       const need = Math.max(0, hardCapacity - orderedPins.length);
 
-      autoItems = await Article.find(q)
-        .select(ARTICLE_FIELDS)
+      autoItems = await Article.find(q, PROJECTION_LIST)
         .sort(SORT)
         .limit(need)
         .lean({ getters: true })
         .maxTimeMS(5000);
     }
 
-    // Final clamp on the outgoing items
     const hardCapacity = Math.min(Number(s.capacity || 0), 12);
-    const items = [...orderedPins, ...autoItems]
-      .slice(0, hardCapacity)
-      .map(stripArticleFields);
-
+    const items = [...orderedPins, ...autoItems].slice(0, hardCapacity).map(stripArticleFields);
 
     out.push({
       id: String(s._id),
       title: s.title,
       slug: s.slug,
       template: s.template,
-      side: s.side || "", // usually empty for mains, used by rails
+      side: s.side || "",
       placementIndex: s.placementIndex || 0,
       target: s.target,
       capacity: s.capacity || 0,
       moreLink: s.moreLink || "",
-      custom: s.custom || {}, // harmless for non-rail_v7 rows
+      custom: s.custom || {},
       items,
     });
   }
