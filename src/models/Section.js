@@ -29,6 +29,8 @@ const DEFAULT_CAP = {
   main_v5: 6,
   main_v6: 12,
   main_v7: 7,   // preserved from your setup
+  main_v8: 7,   // preserved from your setup
+  main_v9 :8,
 
   // Heads / others
   head_v1: 12,
@@ -73,6 +75,8 @@ const MAX_CAP = {
   main_v5: 12,
   main_v6: 24,
   main_v7: 12,
+  main_v8: 12,
+  main_v9 : 8,
 
   // Heads / others
   head_v1: 24,
@@ -158,6 +162,10 @@ const SectionSchema = new Schema(
       tags: [{ type: String }],
       sortBy: { type: String, enum: ["publishedAt", "priority"], default: "publishedAt" },
       timeWindowHours: { type: Number, default: 0 },
+      // Slice controls (1-based)
+    sliceFrom: { type: Number, default: 1 },
+    sliceTo:   { type: Number },
+
     },
 
     pins: [PinSchema],

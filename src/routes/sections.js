@@ -24,6 +24,8 @@ const ALLOWED_TEMPLATES = [
   "dark_v1",
 
   // Main layouts
+  "main_v9",
+  "main_v8",
   "main_v7",
   "main_v6",
   "main_v5",
@@ -138,6 +140,8 @@ const BaseSectionSchema = z
         tags: z.array(z.string()).default([]),
         sortBy: z.enum(["publishedAt", "priority"]).default("publishedAt"),
         timeWindowHours: z.coerce.number().int().min(0).default(0),
+        sliceFrom: z.coerce.number().int().min(1).optional(),
+        sliceTo: z.coerce.number().int().min(1).optional(),
       })
       .optional(),
 

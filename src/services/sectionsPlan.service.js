@@ -103,11 +103,21 @@ async function runQuery({ query = {}, limit = 4, excludeIds = [] } = {}) {
       ? { publishedAt: 1, _id: 1 }
       : { publishedAt: -1, _id: -1 };
 
+      // Slice / offset (1-based)
+const from1 = Number(query?.sliceFrom) || 1;
+const to1 = Number.isFinite(query?.sliceTo) ? Number(query.sliceTo) : undefined;
+const offset = Math.max(0, from1 - 1);
+const effLimit = Number.isFinite(to1)
+  ? Math.min(hardLimit, Math.max(0, to1 - from1 + 1))
+  : hardLimit;
+
   const rows = await Article.find(q, PROJECTION_LIST)
-    .sort(SORT)
-    .limit(hardLimit)
-    .lean({ getters: true })
-    .maxTimeMS(5000);
+  .sort(SORT)
+  .skip(offset)
+  .limit(effLimit)
+  .lean({ getters: true })
+  .maxTimeMS(5000);
+
 
   return rows.map(stripArticleFields);
 }
@@ -274,6 +284,13 @@ exports.buildPlan = async (params = {}) => {
       const dedupe = !!cfg.dedupeAcrossZones;
       const used = new Set();
 
+      // Global slice range from section feed (1-based)
+      const globalFrom = Number(s.feed?.sliceFrom) || 1;
+      
+      const globalTo = Number.isFinite(s.feed?.sliceTo) ? Number(s.feed.sliceTo) : undefined;
+      let cursor = Math.max(1, globalFrom);
+
+
       const pageCat = targetType === "category"
         ? String(targetValue).trim().toLowerCase()
         : "";
@@ -290,17 +307,48 @@ exports.buildPlan = async (params = {}) => {
         return q;
       };
 
-      const take = async (zone = {}, fallbackLimit = 0) => {
-        if (zone?.enable === false) return [];
-        const lim = Number(zone?.limit ?? fallbackLimit);
-        const list = await runQuery({
-          query: mergeQuery(zone?.query || {}),
-          limit: lim,
-          excludeIds: dedupe ? Array.from(used) : [],
-        });
-        if (dedupe) list.forEach((a) => used.add(String(a.id || a._id)));
-        return list;
-      };
+      // NEW: canonical list (FE will render this exact list)
+// respects Admin feed.sliceFrom/sliceTo and categories (like top_v2)
+const gridLimit = Math.max(1, Number(s.capacity ?? 6));
+const sliceFrom = Number(s.feed?.sliceFrom) || Number((s.custom || {}).offset ?? (s.custom || {}).afterNth ?? 0) + 1; // 1-based
+const sliceTo = Number.isFinite(s.feed?.sliceTo) ? Number(s.feed.sliceTo) : undefined;
+
+const baseQuery = mergeQuery((s.custom && s.custom.query) || {});
+const canonicalItems = await runQuery({
+  query: {
+    ...baseQuery,
+    sliceFrom,
+    ...(Number.isFinite(sliceTo) ? { sliceTo } : {}),
+  },
+  limit: gridLimit,
+  excludeIds: dedupe ? Array.from(used) : [],
+});
+
+
+     const take = async (zone = {}, fallbackLimit = 0) => {
+  if (zone?.enable === false) return [];
+  const lim = Number(zone?.limit ?? fallbackLimit);
+
+  // Compose this zone's slice from the global cursor
+  const zoneFrom = cursor;
+  const zoneTo = Number.isFinite(globalTo) ? Math.min(globalTo, zoneFrom + lim - 1) : undefined;
+
+  const list = await runQuery({
+    query: {
+      ...mergeQuery(zone?.query || {}),
+      sliceFrom: zoneFrom,
+      ...(Number.isFinite(zoneTo) ? { sliceTo: zoneTo } : {}),
+    },
+    limit: lim,
+    excludeIds: dedupe ? Array.from(used) : [],
+  });
+
+  if (dedupe) list.forEach((a) => used.add(String(a.id || a._id)));
+
+  // Advance global cursor for next zone
+  cursor = zoneFrom + lim;
+  return list;
+};
 
       const zoneItems = {
         topStrip: await take(cfg.topStrip, 4),
@@ -331,6 +379,9 @@ exports.buildPlan = async (params = {}) => {
       const cfg = s.custom || {};
       const dedupe = !!cfg.dedupeAcrossZones;
       const used = new Set();
+      const globalFrom = Number(s.feed?.sliceFrom) || 1;
+      const globalTo = Number.isFinite(s.feed?.sliceTo) ? Number(s.feed.sliceTo) : undefined;
+      let cursor = Math.max(1, globalFrom);
 
       // page context (category page fallback)
       const pageCat = targetType === "category"
@@ -349,17 +400,31 @@ exports.buildPlan = async (params = {}) => {
         return q;
       };
 
-      const take = async (zone = {}, fallbackLimit = 0) => {
-        if (zone?.enable === false) return [];
-        const lim = Number(zone?.limit ?? fallbackLimit);
-        const list = await runQuery({
-          query: mergeQuery(zone?.query || {}),
-          limit: lim,
-          excludeIds: dedupe ? Array.from(used) : [],
-        });
-        if (dedupe) list.forEach((a) => used.add(String(a.id || a._id)));
-        return list;
-      };
+        const take = async (zone = {}, fallbackLimit = 0) => {
+    if (zone?.enable === false) return [];
+    const lim = Number(zone?.limit ?? fallbackLimit);
+
+    // Compute this zone's slice window from the global cursor
+    const zoneFrom = cursor;
+    const zoneTo = Number.isFinite(globalTo) ? Math.min(globalTo, zoneFrom + lim - 1) : undefined;
+
+    const list = await runQuery({
+      query: {
+        ...mergeQuery(zone?.query || {}),
+        sliceFrom: zoneFrom,
+        ...(Number.isFinite(zoneTo) ? { sliceTo: zoneTo } : {}),
+      },
+      limit: lim,
+      excludeIds: dedupe ? Array.from(used) : [],
+    });
+
+    if (dedupe) list.forEach((a) => used.add(String(a.id || a._id)));
+
+    // Advance the global cursor by the requested window for sequential consumption
+    cursor = zoneFrom + lim;
+    return list;
+  };
+
 
       const shape = (rows) => rows.map(stripArticleFields);
       const mode = s.feed?.mode || "auto";
@@ -502,14 +567,27 @@ exports.buildPlan = async (params = {}) => {
           ? { priority: -1, publishedAt: -1, _id: -1 }
           : { publishedAt: -1, _id: -1 };
 
-      const hardCapacity = Math.min(Number(s.capacity || 0), 12);
-      const need = Math.max(0, hardCapacity - orderedPins.length);
+     const capClamp = Math.min(Number(s.capacity || 0), 12);
 
-      autoItems = await Article.find(q, PROJECTION_LIST)
-        .sort(SORT)
-        .limit(need)
-        .lean({ getters: true })
-        .maxTimeMS(5000);
+// Slice / offset (1-based)
+const from1 = Number(s.feed?.sliceFrom) || 1;
+const to1 = Number.isFinite(s.feed?.sliceTo) ? Number(s.feed.sliceTo) : undefined;
+const offset = Math.max(0, from1 - 1);
+const rangeCount = Number.isFinite(to1) ? Math.max(0, to1 - from1 + 1) : undefined;
+
+// Effective capacity for auto (pins not counted here)
+const effCap = Math.min(capClamp, Number.isFinite(rangeCount) ? rangeCount : capClamp);
+
+// How many auto items still needed after pins
+const need = Math.max(0, effCap - orderedPins.length);
+
+autoItems = await Article.find(q, PROJECTION_LIST)
+  .sort(SORT)
+  .skip(offset)
+  .limit(need)
+  .lean({ getters: true })
+  .maxTimeMS(5000);
+
     }
 
     const hardCapacity = Math.min(Number(s.capacity || 0), 12);
