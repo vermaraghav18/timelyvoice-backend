@@ -567,6 +567,10 @@ const canonicalItems = await runQuery({
           ? { priority: -1, publishedAt: -1, _id: -1 }
           : { publishedAt: -1, _id: -1 };
 
+          // Enforce exactly two items for m10
+if (s.template === "m10") s.capacity = 2;
+
+
      const capClamp = Math.min(Number(s.capacity || 0), 12);
 
 // Slice / offset (1-based)
