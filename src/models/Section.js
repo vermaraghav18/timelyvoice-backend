@@ -32,6 +32,7 @@ const DEFAULT_CAP = {
   main_v8: 7,   // preserved from your setup
   main_v9 :8,
   m10 :2,
+  m11 :1,   // NEW: single composite block
 
   // Heads / others
   head_v1: 12,
@@ -79,6 +80,7 @@ const MAX_CAP = {
   main_v8: 12,
   main_v9 : 8,
   m10 :2, 
+   m11 :1,   // NEW: fixed single (no need for more than one)
 
   // Heads / others
   head_v1: 24,

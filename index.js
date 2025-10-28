@@ -1,6 +1,7 @@
 // index.js (backend server)
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+const slugify = require('slugify');
 
 const express = require('express');
 const compression = require('compression');
@@ -29,9 +30,11 @@ const Article = require('./src/models/Article');
 // keep routes below
 const sectionsRouter = require('./src/routes/sections');
 const sectionsV2 = require("./src/routes/sectionsV2");
+const adminAdsRouter = require("./src/routes/admin.ads.routes");
+
 require('./cron'); // periodic rollup jobs
 
-const automationRoutes = require('./src/routes/automation');
+const automationRoutes = require("./src/routes/automation.routes");
 const xRoutes = require("./src/routes/x");
 const automationX = require("./src/routes/automation/x");
 // === MEDIA step imports ===
@@ -91,8 +94,16 @@ if (String(process.env.TRUST_PROXY || 'true') === 'true') {
   app.set('trust proxy', 1);
 }
 
-// JSON parser (needed for POST /analytics/collect and others)
-app.use(express.json({ limit: '5mb' }));
+// Body parsers
+ // 1) JSON for normal APIs (login, single-article create/update, etc.)
+ app.use(express.json({ limit: '10mb' }));
+ // 2) Text for NDJSON (bulk import) and plain text
+ app.use(express.text({
+   type: ['text/plain', 'application/x-ndjson'],
+   limit: '10mb'
+ }));
+
+
 /* -------------------- CORS -------------------- */
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -141,6 +152,14 @@ app.get("/api/automation/_debug/openrouter", (req, res) => {
   });
 });
 
+// [ADMIN_ARTICLES_ROUTE_IMPORT] Add this near other route imports
+const adminArticlesRouter = require('./src/routes/admin.articles.routes');
+
+
+
+// [ADMIN_ARTICLES_ROUTE_MOUNT] Add this near other app.use(...) mounts
+app.use('/api/admin/articles', adminArticlesRouter);
+
 app.options(/.*/, cors(corsOptions)); // ensure preflight OPTIONS succeeds
 app.use("/", robotsRoute);
 app.use('/api/breaking', breakingRoutes);
@@ -148,9 +167,12 @@ app.use('/api/ticker', tickerRoutes);
 app.use('/api/sections', sectionsRouter);
 app.use("/api", sectionsV2);
 app.use("/api/top-news", require("./src/routes/topnews"));
-app.use('/api/automation', automationRoutes);
+app.use("/api/automation", automationRoutes);  
 app.use("/api/x", xRoutes);
 app.use("/api/automation/x", automationX);
+app.use("/api/admin/ads", adminAdsRouter);
+
+
 // Return a clean message if an origin is not allowed by CORS
 app.use((err, req, res, next) => {
   if (err && err.message && err.message.includes('CORS')) {
@@ -264,6 +286,27 @@ app.get('/api/dev/echo-geo', (req, res) => {
   res.json({ geo: req.geo });
 });
 
+app.get('/api/dev/test-image-pick', async (req, res) => {
+  const title    = String(req.query.title || '');
+  const tags     = String(req.query.tags || '').split(',').map(s => s.trim()).filter(Boolean);
+  const category = String(req.query.category || '');
+
+  const picked = await pickBestImageForArticle({ title, tags, category });
+  res.json({ title, tags, category, picked });
+});
+
+
+// Quick test for Cloudinary auto-image picking
+app.get('/api/dev/test-image-pick', async (req, res) => {
+  const title = String(req.query.title || '');
+  const tags  = (req.query.tags || '').split(',').map(s => s.trim()).filter(Boolean);
+  const category = String(req.query.category || '');
+
+  const picked = await pickBestImageForArticle({ title, tags, category });
+  res.json({ title, tags, category, picked });
+});
+
+
 /* -------------------- Cloudinary -------------------- */
 cloudinary.config({
   cloud_name: CLOUDINARY_CLOUD_NAME,
@@ -271,6 +314,88 @@ cloudinary.config({
   api_secret: CLOUDINARY_API_SECRET,
 });
 
+/* ==================== IMAGE AUTOPICK HELPERS (ADD THIS) ==================== */
+// tiny tokenizer -> ["modi","speech","india",...]
+function keywordsFrom(title = "", tags = [], category = "") {
+  const stop = new Set(["the","a","an","of","and","for","to","in","on","at","by","with","from","is","are","was","were"]);
+  const raw = [
+    ...String(title).toLowerCase().split(/[^a-z0-9]+/g),
+    ...tags.map(t => String(t).toLowerCase()),
+    String(category).toLowerCase()
+  ];
+  return Array.from(
+    new Set(raw.filter(w => w && w.length >= 3 && !stop.has(w)))
+  );
+}
+
+// Cloudinary Search -> pick best match inside your folder
+async function pickBestImageForArticle({ title, tags = [], category = "" }) {
+  if (String(process.env.CLOUDINARY_AUTOPICK || "").toLowerCase() !== "on") return null;
+
+  const folder = process.env.AUTOMATION_IMAGE_FOLDER || process.env.CLOUDINARY_FOLDER || "news-images";
+  const terms  = keywordsFrom(title, tags, category);
+  if (!terms.length) return null;
+
+  // Build a permissive search: same folder AND any of the keywords in filename/tags/context
+  // Example: folder=news-images AND (filename:modi OR tags=modi OR context=*modi*)
+  const orParts = [];
+  for (const t of terms) {
+    orParts.push(`filename:${t}`);
+    orParts.push(`tags=${t}`);
+    orParts.push(`context=*${t}*`);
+  }
+  const expression =
+    `resource_type:image AND folder=${folder} AND (${orParts.join(" OR ")})`;
+
+  // Pull a reasonable page of candidates
+  const limit = Math.max(50, Math.min(400, parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || "200", 10)));
+
+  let result;
+  try {
+    // Both .search() and .api.resources work; search is more flexible
+    result = await cloudinary.search
+      .expression(expression)
+      .with_field("context")
+      .with_field("tags")
+      .sort_by("created_at", "desc")
+      .max_results(limit)
+      .execute();
+  } catch (e) {
+    console.warn("[autopick] cloudinary search failed:", e?.message || e);
+    return null;
+  }
+
+  const list = Array.isArray(result?.resources) ? result.resources : [];
+  if (!list.length) return null;
+
+  // Score candidates by how many terms hit filename/tags/context, prefer large images
+  function score(r) {
+    const name = String(r.public_id || "").toLowerCase();
+    const ctx  = JSON.stringify(r.context || {}).toLowerCase();
+    const tg   = (r.tags || []).map(t => String(t).toLowerCase());
+    let s = 0;
+    for (const t of terms) {
+      if (name.includes(t)) s += 3;
+      if (ctx.includes(t))  s += 2;
+      if (tg.includes(t))   s += 2;
+    }
+    // Nudge for bigger images
+    if (r.width >= 1000 || r.height >= 600) s += 1;
+    return s;
+  }
+
+  list.sort((a, b) => score(b) - score(a));
+
+  const top = list[0];
+  if (!top) return null;
+
+  // Build canonical URLs your app expects
+  const publicId = top.public_id;                          // no extension
+  const imageUrl = top.secure_url;                         // Cloudinary’s original delivery URL
+  const ogImage  = cloudinary.url(publicId, { width: 1200, height: 630, crop: "fill", format: "jpg" });
+
+  return { publicId, imageUrl, ogImage };
+}
 /* -------------------- MongoDB -------------------- */
 mongoose.set('strictQuery', true);
 console.log('[env] MONGO_URI=%s', MONGO_URI);
@@ -286,24 +411,17 @@ mongoose.connect(MONGO_URI, { dbName: 'newsdb', autoIndex: true })
   });
 
 /* -------------------- Helpers -------------------- */
-function slugify(str) {
-  return String(str || '')
-    .toLowerCase()
-    .trim()
-    .replace(/['"]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-async function uniqueSlugForTitle(title) {
-  const base = slugify(title) || 'article';
+
+async function uniqueSlugForTitle(title = 'article') {
+  const base = slugify(String(title), { lower: true, strict: true }) || 'article';
   let s = base;
   let i = 2;
-  // eslint-disable-next-line no-constant-condition
   while (await Article.exists({ slug: s })) {
     s = `${base}-${i++}`;
   }
   return s;
 }
+
 // Estimate reading time (minutes) at ~200 wpm, min 1 if body exists
 function estimateReadingTime(text = '') {
   const words = String(text || '').replace(/<[^>]*>/g, ' ').trim().split(/\s+/).filter(Boolean).length;
@@ -556,6 +674,265 @@ app.post('/api/uploads/sign', auth, (req, res) => {
   });
 });
 
+
+// ===== Bulk import helpers =====
+
+// Parse JSON array OR JSONL (one JSON per line) OR { items: [...] }
+function parseBulkBody(reqBody) {
+  if (Array.isArray(reqBody)) return reqBody;
+  if (typeof reqBody === 'string') {
+    const trimmed = reqBody.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith('[')) return JSON.parse(trimmed); // JSON array
+    // JSONL / NDJSON
+    return trimmed.split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+  }
+  if (reqBody && Array.isArray(reqBody.items)) return reqBody.items;
+  throw new Error('Provide an array of JSON objects or JSONL string');
+}
+
+// Normalize one incoming article to your DB shape (reuses your existing logic)
+async function normalizeIncomingArticle(input = {}) {
+  const {
+    title, summary, author, body,
+    category = 'General',
+    imageUrl, imagePublicId,
+    status = 'published',
+    publishAt,
+    geoMode,
+    geoAreas,
+    tags: incomingTags,
+    imageAlt,
+    metaTitle,
+    metaDesc,
+    ogImage,
+  } = input || {};
+
+  if (!title || !summary || !author || !body) {
+    throw new Error('Missing fields: title, summary, author, body are required');
+  }
+
+  // geo
+  const allowedModes = ['global', 'include', 'exclude'];
+  const sanitizedGeoMode = allowedModes.includes(String(geoMode)) ? String(geoMode) : 'global';
+  const sanitizedGeoAreas = Array.isArray(geoAreas)
+    ? geoAreas.map(s => String(s).trim()).filter(Boolean)
+    : [];
+
+  // category by slug or name → store name
+  let categoryName = category;
+  const foundCat = await Category.findOne({
+    $or: [{ slug: slugify(category) }, { name: category }]
+  }).lean();
+  if (foundCat) categoryName = foundCat.name;
+
+  // tags by slug or name → store names
+  const rawTags = Array.isArray(incomingTags) ? incomingTags : [];
+  const tagsByName = [];
+  for (const t of rawTags) {
+    const nameOrSlug = String(t).trim();
+    if (!nameOrSlug) continue;
+    const tagDoc = await Tag.findOne({ $or: [{ slug: slugify(nameOrSlug) }, { name: nameOrSlug }] }).lean();
+    tagsByName.push(tagDoc ? tagDoc.name : nameOrSlug);
+  }
+
+  // unique slug (uses your helper)
+  const slug = await uniqueSlugForTitle(title);
+
+  /* >>> ADD THIS: try Cloudinary autopick if no image provided <<< */
+  let finalImagePublicId = imagePublicId;
+  let finalImageUrl      = imageUrl;
+  let finalOgImage       = ogImage;
+
+  if (!finalImagePublicId && !finalImageUrl &&
+      String(process.env.CLOUDINARY_AUTOPICK || "").toLowerCase() === "on") {
+    const picked = await pickBestImageForArticle({
+      title,
+      tags: tagsByName,
+      category: categoryName
+    });
+    if (picked) {
+      finalImagePublicId = picked.publicId;
+      finalImageUrl      = picked.imageUrl;
+      finalOgImage       = picked.ogImage;
+    }
+  }
+
+  const doc = {
+    title,
+    slug,
+    summary,
+    author,
+    body,
+    category: categoryName,
+    tags: tagsByName,
+    imageUrl,
+    imagePublicId,
+
+    imageAlt: (imageAlt || title || ''),
+    metaTitle: (metaTitle || '').slice(0, 80),
+    metaDesc: (metaDesc || '').slice(0, 200),
+    ogImage: (ogImage || ''),
+
+    readingTime: estimateReadingTime(body),
+
+    status,
+    publishAt: publishAt ? new Date(publishAt) : new Date(),
+    publishedAt: new Date(),
+
+    geoMode: sanitizedGeoMode,
+    geoAreas: sanitizedGeoAreas
+  };
+
+   // 🔽 add this line
+  await ensureArticleHasImage(doc);
+
+  return doc;
+}
+
+
+/* -------------------- Auto image match (Cloudinary) -------------------- */
+
+/**
+ * Minimal stop-words so titles like "PM Modi addresses the nation" become useful keywords.
+ */
+const STOP_WORDS = new Set([
+  'the','a','an','and','or','of','to','in','on','for','at','by','with','is','are','was','were','be',
+  'as','from','that','this','these','those','it','its','into','over','after','before','about','than',
+  'new'
+]);
+
+/**
+ * Build keywords from title + tags + category (lowercased, no short words, no stop words).
+ */
+function buildArticleKeywords({ title = '', tags = [], category = '' }) {
+  const raw = [
+    String(title || ''),
+    String(category || ''),
+    ...(Array.isArray(tags) ? tags : [])
+  ].join(' ');
+  const words = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w && w.length >= 3 && !STOP_WORDS.has(w));
+  // de-dup while keeping order
+  const seen = new Set();
+  const out = [];
+  for (const w of words) {
+    if (seen.has(w)) continue;
+    seen.add(w);
+    out.push(w);
+  }
+  // keep first 8–12 is enough signal
+  return out.slice(0, 12);
+}
+
+/**
+ * Query Cloudinary Search for images in your folder that match any of the keywords
+ * in tags OR in public_id/filename.
+ */
+async function searchCloudinaryByKeywords(keywords = []) {
+  if (!keywords.length) return [];
+  const folder = process.env.CLOUDINARY_FOLDER || 'news-images';
+
+  // Build a search expression like:
+  //  folder=news-images AND resource_type:image AND (tags=modi OR public_id:modi OR filename=modi OR ...)
+  const ors = keywords.map(k => `(tags=${k} OR public_id:${k} OR filename:${k})`);
+  const expr = `folder=${folder} AND resource_type:image AND (${ors.join(' OR ')})`;
+
+  // Cloudinary Search API
+  const max = parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || '40', 10);
+  const res = await cloudinary.search
+    .expression(expr)
+    .sort_by('uploaded_at','desc')
+    .with_field('tags')
+    .max_results(Math.min(100, Math.max(10, max)))
+    .execute();
+
+  return Array.isArray(res?.resources) ? res.resources : [];
+}
+
+/**
+ * Score an image for our keywords (simple overlap + a small bonus for larger width).
+ */
+function scoreImage(resource, keywordsSet) {
+  const id = String(resource.public_id || '').toLowerCase();
+  const filename = id.split('/').pop(); // last segment
+  const tags = (resource.tags || []).map(t => String(t).toLowerCase());
+  let score = 0;
+
+  for (const k of keywordsSet) {
+    if (tags.includes(k)) score += 5;                 // strong tag hit
+    if (id.includes(k)) score += 3;                   // id/public_id hit
+    if (filename.includes(k)) score += 3;             // filename hit
+  }
+  // prefer decent images
+  if (resource.width >= 1000) score += 2;
+  if (resource.width >= 1600) score += 1;
+
+  return score;
+}
+
+/**
+ * Pick the single best Cloudinary image for an article.
+ * Returns { imageUrl, imagePublicId, ogImage } or null.
+ */
+async function pickBestImageForArticle({ title, tags = [], category = '' }) {
+  try {
+    if (String(process.env.CLOUDINARY_AUTOPICK || 'on').toLowerCase() === 'off') return null;
+
+    const keywords = buildArticleKeywords({ title, tags, category });
+    if (!keywords.length) return null;
+
+    const resources = await searchCloudinaryByKeywords(keywords);
+    if (!resources.length) return null;
+
+    const kwSet = new Set(keywords);
+    let best = null;
+    let bestScore = -1;
+
+    for (const r of resources) {
+      const s = scoreImage(r, kwSet);
+      if (s > bestScore) { bestScore = s; best = r; }
+    }
+    if (!best) return null;
+
+    // Build nice variants
+    const publicId = best.public_id;
+    const imageUrl = best.secure_url || cloudinary.url(publicId, { secure: true });
+    const ogImage  = cloudinary.url(publicId, { width: 1200, height: 630, crop: 'fill', format: 'jpg', secure: true });
+
+    return { imageUrl, imagePublicId: publicId, ogImage };
+  } catch (e) {
+    console.warn('[autopick-image] failed:', e?.message || e);
+    return null;
+  }
+}
+
+/**
+ * If the payload has no image, try to attach one from Cloudinary based on keywords.
+ * Mutates and returns the same object.
+ */
+async function ensureArticleHasImage(payload = {}) {
+  if (payload.imageUrl || payload.ogImage || payload.imagePublicId) return payload;
+  const chosen = await pickBestImageForArticle({
+    title: payload.title,
+    tags: payload.tags,
+    category: payload.category
+  });
+  if (chosen) {
+    payload.imageUrl = chosen.imageUrl;
+    payload.imagePublicId = chosen.imagePublicId;
+    payload.ogImage = chosen.ogImage || payload.ogImage;
+  }
+  return payload;
+}
+
+
 /* -------------------- Articles API -------------------- */
 // list
 app.get('/api/articles', optionalAuth, async (req, res) => {
@@ -714,7 +1091,7 @@ app.post('/api/articles', auth, async (req, res) => {
   const {
     title, summary, author, body, category = 'General',
     imageUrl, imagePublicId,
-    status = 'published',
+    status = 'draft',
     publishAt,
     geoMode,
     geoAreas,
@@ -749,28 +1126,145 @@ app.post('/api/articles', auth, async (req, res) => {
   }
 
   const slug = await uniqueSlugForTitle(title);
-  const doc = await Article.create({
-    title, slug, summary, author, body,
-    category: categoryName,
-    tags: tagsByName,
-    imageUrl, imagePublicId,
 
-    imageAlt: (imageAlt || title || ''),
-    metaTitle: (metaTitle || '').slice(0, 80),
-    metaDesc: (metaDesc || '').slice(0, 200),
-    ogImage: (ogImage || ''),
+    /* >>> ADD THIS: try Cloudinary autopick if no image provided <<< */
+  let finalImagePublicId = imagePublicId;
+  let finalImageUrl      = imageUrl;
+  let finalOgImage       = ogImage;
 
-    readingTime: estimateReadingTime(body),
+  if (!finalImagePublicId && !finalImageUrl &&
+      String(process.env.CLOUDINARY_AUTOPICK || "").toLowerCase() === "on") {
+    const picked = await pickBestImageForArticle({
+      title,
+      tags: tagsByName,
+      category: categoryName
+    });
+    if (picked) {
+      finalImagePublicId = picked.publicId;
+      finalImageUrl      = picked.imageUrl;
+      finalOgImage       = picked.ogImage;
+    }
+  }
 
-    status,
-    publishAt: publishAt ? new Date(publishAt) : new Date(),
-    publishedAt: new Date(),
+  // decide publishAt
+const finalPublishAt =
+  publishAt ? new Date(publishAt)
+            : (String(status) === 'published' ? new Date() : undefined);
 
-    geoMode: sanitizedGeoMode,
-    geoAreas: sanitizedGeoAreas
-  });
+const baseDoc = {
+  title, slug, summary, author, body,
+  category: categoryName,
+  tags: tagsByName,
+
+  imageUrl:      finalImageUrl || imageUrl,
+  imagePublicId: finalImagePublicId || imagePublicId,
+
+  imageAlt: (imageAlt || title || ''),
+  metaTitle: (metaTitle || '').slice(0, 80),
+  metaDesc: (metaDesc || '').slice(0, 200),
+  ogImage: (finalOgImage || ogImage || ''),
+
+  readingTime: estimateReadingTime(body),
+
+  status,
+  publishAt: finalPublishAt,
+
+  geoMode: sanitizedGeoMode,
+  geoAreas: sanitizedGeoAreas
+};
+
+
+
+// 🔽 add this
+await ensureArticleHasImage(baseDoc);
+
+if (String(status) === 'published') {
+  baseDoc.publishedAt = new Date();
+} else {
+  baseDoc.publishedAt = undefined;
+}
+
+
+const doc = await Article.create(baseDoc);
+
    markSitemapDirty();
   res.status(201).json({ ...doc.toObject(), id: doc._id });
+});
+
+// ===== Bulk create articles =====
+// POST /api/articles/bulk?dryRun=1&continueOnError=1
+app.post('/api/articles/bulk', auth, async (req, res) => {
+  const isDry = String(req.query.dryRun || '').match(/^(1|true)$/i);
+  const allowPartial = String(req.query.continueOnError || '').match(/^(1|true)$/i);
+
+  let items;
+  try {
+    items = parseBulkBody(req.body);
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: 'Invalid bulk payload: ' + e.message });
+  }
+
+  if (!items || !items.length) {
+    return res.status(400).json({ ok: false, error: 'No items' });
+  }
+
+  const session = await mongoose.startSession();
+  const results = [];
+  let committed = false;
+
+  try {
+    if (!isDry) await session.startTransaction();
+
+    for (let index = 0; index < items.length; index++) {
+      try {
+        const payload = await normalizeIncomingArticle(items[index]);
+
+        if (isDry) {
+          // Only report the slug we plan to create
+          results.push({ index, ok: true, dryRun: true, slug: payload.slug });
+        } else {
+          const created = await Article.create([payload], { session });
+          results.push({ index, ok: true, id: created[0]._id, slug: created[0].slug });
+        }
+      } catch (err) {
+        results.push({ index, ok: false, error: err.message || 'validation failed' });
+        if (!allowPartial) {
+          // Abort entire run on first error unless continueOnError=1
+          throw err;
+        }
+      }
+    }
+
+    if (!isDry) {
+      await session.commitTransaction();
+      committed = true;
+      // sitemap may have changed (new URLs)
+      markSitemapDirty();
+    }
+
+    const success = results.filter(r => r.ok).length;
+    const failed  = results.length - success;
+
+    return res.json({
+      ok: true,
+      dryRun: !!isDry,
+      total: results.length,
+      success,
+      failed,
+      results
+    });
+  } catch (e) {
+    if (!committed && session.inTransaction()) {
+      await session.abortTransaction();
+    }
+    return res.status(400).json({
+      ok: false,
+      message: e?.message || 'Bulk import failed',
+      results
+    });
+  } finally {
+    session.endSession();
+  }
 });
 
 // C) update (allow slug changes + write a redirect)
@@ -856,6 +1350,15 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
       await createRedirect('article', oldSlug, newSlug, 301);
     }
   }
+
+  // If moving to published, ensure publishAt/publishedAt exist
+if (status !== undefined && String(status) === 'published') {
+  if (!update.publishAt && !existing.publishAt) {
+    update.publishAt = new Date();      // ✅ makes it visible now
+  }
+  update.publishedAt = new Date();      // ✅ for sorting/feeds/SSR
+}
+
 
   const doc = await Article.findByIdAndUpdate(req.params.id, update, { new: true });
     // ✅ invalidate sitemap cache (slug/status/publishAt/category/tag changes can affect URLs or listings)

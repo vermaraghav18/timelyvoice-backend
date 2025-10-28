@@ -24,6 +24,7 @@ const ALLOWED_TEMPLATES = [
   "dark_v1",
 
   // Main layouts
+  "m11",   // NEW
    "m10",
   "main_v9",
   "main_v8",

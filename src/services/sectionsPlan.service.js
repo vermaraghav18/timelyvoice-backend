@@ -156,6 +156,150 @@ exports.buildPlan = async (params = {}) => {
   const out = [];
 
   for (const s of sections) {
+    /* ===================== m11 (composite finance layout) ===================== */
+if (s.template === "m11") {
+  // Dedupe across queries
+  const used = new Set();
+  const pushUsed = (arr = []) => arr.forEach((a) => a?.id && used.add(String(a.id)));
+
+  // Helper that merges section/page categories with a default fallback
+  const pageCat =
+    targetType === "category" ? String(targetValue).trim().toLowerCase() : "";
+  const pageCatCap = pageCat
+    ? pageCat.charAt(0).toUpperCase() + pageCat.slice(1)
+    : "";
+  const secCats = normArray(s.feed?.categories);
+  const baseCats = secCats.length
+    ? secCats
+    : pageCat
+    ? [pageCat, pageCatCap]
+    : ["finance", "business"];
+
+  // LEAD (hero image story)
+  const leadArr = await runQuery({
+    query: { categories: baseCats },
+    limit: 1,
+    excludeIds: [],
+  });
+  const lead = leadArr[0] || null;
+  if (lead) pushUsed([lead]);
+
+  // HERO headline + related (exclude lead)
+  const heroList = await runQuery({
+    query: { categories: baseCats },
+    limit: 5,
+    excludeIds: Array.from(used),
+  });
+  const hero = {
+    headline: heroList[0] || null,
+    related: heroList.slice(1, 5),
+  };
+  pushUsed(heroList);
+
+  // RAILS (two strips). If you store subcategory/tags, tweak below.
+  const railLeft = await runQuery({
+    query: { categories: baseCats /*, tags: ['macro']*/ },
+    limit: 8,
+    excludeIds: Array.from(used),
+  });
+  pushUsed(railLeft);
+  const railRight = await runQuery({
+    query: { categories: baseCats /*, tags: ['fx']*/ },
+    limit: 8,
+    excludeIds: Array.from(used),
+  });
+  pushUsed(railRight);
+
+  // DENSE GRID (rest of recent items)
+  const grid = await runQuery({
+    query: { categories: [...baseCats, "markets", "economy"] },
+    limit: Math.max(12, Math.min(Number(s.capacity ?? 20), 24)),
+    excludeIds: Array.from(used),
+  });
+  pushUsed(grid);
+
+  // Markets tiles — if editors provided custom markets in Admin, prefer that; else stub.
+  const markets =
+    Array.isArray(s.custom?.markets) && s.custom.markets.length
+      ? s.custom.markets
+      : [
+          {
+            id: "nifty50",
+            label: "NIFTY 50",
+            value: "—",
+            delta: { value: "—", direction: "flat" },
+          },
+          {
+            id: "sensex",
+            label: "Sensex",
+            value: "—",
+            delta: { value: "—", direction: "flat" },
+          },
+          {
+            id: "nasdaq",
+            label: "Nasdaq",
+            value: "—",
+            delta: { value: "—", direction: "flat" },
+          },
+          {
+            id: "dow",
+            label: "Dow",
+            value: "—",
+            delta: { value: "—", direction: "flat" },
+          },
+          {
+            id: "usdinr",
+            label: "USD/INR",
+            value: "—",
+            delta: { value: "—", direction: "flat" },
+          },
+          {
+            id: "crude",
+            label: "Crude",
+            value: "—",
+            delta: { value: "—", direction: "flat" },
+          },
+        ];
+
+  // Category pills (static defaults; Admin can override via custom.categoriesPills)
+  const categoriesPills =
+    Array.isArray(s.custom?.categories) && s.custom.categories.length
+      ? s.custom.categories
+      : [
+          { key: "energy", label: "ENERGY" },
+          { key: "financ", label: "FINANC", active: true },
+          { key: "health", label: "HEALTH" },
+          { key: "comms", label: "COMMS" },
+          { key: "const", label: "CONS ST" },
+          { key: "realty", label: "REALTY" },
+          { key: "matls", label: "MATLS" },
+          { key: "utils", label: "UTILS" },
+        ];
+
+  out.push({
+    id: String(s._id),
+    title: s.title,
+    slug: s.slug,
+    template: "m11",
+    side: "",
+    placementIndex: s.placementIndex || 0,
+    target: s.target,
+    capacity: 1,
+    moreLink: s.moreLink || "",
+    // Put the composite payload in `custom` to match your composite section pattern
+    custom: {
+      lead,
+      hero,
+      markets,
+      categories: categoriesPills,
+      rails: [railLeft, railRight],
+      grid,
+    },
+    items: [], // FE reads from `custom` for m11
+  });
+  continue;
+}
+
     /* ===================== rail_v7: image promo (no items) ===================== */
     if (s.template === "rail_v7") {
       out.push({

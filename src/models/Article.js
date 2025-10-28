@@ -28,11 +28,16 @@ const ArticleSchema = new mongoose.Schema({
   readingTime: { type: Number, default: 0 },
 
   // Publishing
-  publishAt:   { type: Date },
-  publishedAt: { type: Date, default: Date.now, index: true },
+  // Publishing
+  status:      { type: String, enum: ['draft','published'], default: 'draft', index: true },
+  publishAt:   { type: Date },   // optional: schedule time
+  publishedAt: { type: Date, index: true }, // set only when actually publishing
+  source:      { type: String, default: 'automation' }, // helps filter AI drafts (optional)
+
 
   // Optional geo targeting (if you use it elsewhere)
-  geoMode:   { type: String, enum: ['global', 'category', 'state', 'city', 'none'], default: 'none' },
+ geoMode:   { type: String, enum: ['global','include','exclude'], default: 'global' },
+
   geoAreas:  { type: [String], default: [] },
 }, { timestamps: true });
 
