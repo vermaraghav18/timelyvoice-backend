@@ -37,6 +37,8 @@ require('./cron'); // periodic rollup jobs
 const automationRoutes = require("./src/routes/automation.routes");
 const xRoutes = require("./src/routes/x");
 const automationX = require("./src/routes/automation/x");
+const automationController = require("./src/controllers/automation.controller");
+
 // === MEDIA step imports ===
 const multer = require('multer');
 const stream = require('stream');
@@ -168,6 +170,24 @@ app.use('/api/sections', sectionsRouter);
 app.use("/api", sectionsV2);
 app.use("/api/top-news", require("./src/routes/topnews"));
 app.use("/api/automation", automationRoutes);  
+
+// --- Simple automation poller (pulls enabled feeds periodically) ---
+const AUTO_ENABLED = String(process.env.AUTMOTION_ENABLED || 'false') === 'true';
+const AUTO_INTERVAL = Math.max(parseInt(process.env.AUTMOTION_INTERVAL_SECONDS || '300', 10), 60) * 1000;
+
+if (AUTO_ENABLED) {
+  console.log(`[automation] enabled; polling every ${AUTO_INTERVAL / 1000}s`);
+  setInterval(async () => {
+    try {
+      await automationController.fetchAllFeeds({}, { json: () => {} });
+      console.log('[automation] fetchAllFeeds ok');
+    } catch (e) {
+      console.error('[automation] fetchAllFeeds error', e?.message || e);
+    }
+  }, AUTO_INTERVAL);
+}
+
+
 app.use("/api/x", xRoutes);
 app.use("/api/automation/x", automationX);
 app.use("/api/admin/ads", adminAdsRouter);

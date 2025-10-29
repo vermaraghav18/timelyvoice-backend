@@ -20,6 +20,7 @@ router.patch("/feeds/:id", requireAuth, automation.updateFeed);
 router.delete("/feeds/:id", requireAuth, automation.deleteFeed);
 router.post("/feeds/:id/fetch", requireAuth, automation.fetchFeed);
 router.post("/feeds/fetch-all", requireAuth, automation.fetchAllFeeds); // NEW (optional)
+router.delete("/feeds/_dedupe", requireAuth, automation.dedupeFeeds);
 
 // ------ Items ------
 router.get("/items", requireAuth, automation.listItems);
@@ -27,6 +28,7 @@ router.post("/items/:id/extract", requireAuth, automation.extractItem);
 router.post("/items/:id/generate", requireAuth, automation.generateItem);
 router.post("/items/:id/mark-ready", requireAuth, automation.markReady);
 router.post("/items/:id/draft", requireAuth, automation.createDraft);
+router.post("/items/:id/run", requireAuth, automation.runSingle);
 
 // ------ Batch process (for Admin UI “Process N items”) ------
 router.post("/process", requireAuth, automation.processBatch);          // NEW (used by Admin UI)

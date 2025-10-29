@@ -65,6 +65,47 @@ function toIST(date) {
   }
 }
 
+function canonicalUrl(raw) {
+  if (!raw || typeof raw !== 'string') return raw;
+  try {
+    const u = new URL(raw.trim());
+    // strip tracking noise
+    ['utm_source','utm_medium','utm_campaign','utm_term','utm_content'].forEach(p => u.searchParams.delete(p));
+    u.hash = '';
+    const s = u.toString().replace(/\/+$/, ''); // remove trailing slash
+    return s;
+  } catch {
+    return raw.trim();
+  }
+}
+
+// generate common variants we want to wipe together
+function urlVariants(raw) {
+  const c = canonicalUrl(raw);
+  const variants = new Set([c]);
+
+  // add trailing slash variant
+  variants.add(c + '/');
+
+  // http/https swap
+  try {
+    const u = new URL(c);
+    if (u.protocol === 'https:') {
+      const http = c.replace(/^https:/, 'http:');
+      variants.add(http);
+      variants.add(http + '/');
+    } else if (u.protocol === 'http:') {
+      const https = c.replace(/^http:/, 'https:');
+      variants.add(https);
+      variants.add(https + '/');
+    }
+  } catch {}
+
+  return [...variants];
+}
+
+
+
 /* ---------- Robust helpers ---------- */
 function safeJsonParse(raw) {
   if (!raw || typeof raw !== "string") return null;
@@ -185,25 +226,37 @@ exports.getFeedById = async (req, res) => {
 
 // POST /api/automation/feeds
 exports.createFeed = async (req, res) => {
-  const payload = req.body || {};
-  const normalizedGeo = payload.geo
-    ? {
-        mode: String(payload.geo.mode || "global").toLowerCase(),
-        areas: payload.geo.areas || DEFAULT_GEO_AREAS,
-      }
-    : { mode: "global", areas: DEFAULT_GEO_AREAS };
+  try {
+    const payload = req.body || {};
+    const normalizedGeo = payload.geo
+      ? { mode: String(payload.geo.mode || "global").toLowerCase(),
+          areas: payload.geo.areas || DEFAULT_GEO_AREAS }
+      : { mode: "global", areas: DEFAULT_GEO_AREAS };
 
-  const feed = await FeedSource.create({
-    name: payload.name,
-    url: payload.url,
-    enabled: payload.enabled !== false,
-    defaultCategory: payload.defaultCategory || "General",
-    defaultAuthor: payload.defaultAuthor || "Desk",
-    geo: normalizedGeo,
-    schedule: payload.schedule || "manual",
-  });
-  res.status(201).json(feed);
+    // idempotent by URL
+    const feed = await FeedSource.findOneAndUpdate(
+      { url: payload.url },
+      {
+        $setOnInsert: {
+          name: payload.name,
+          url: canonicalUrl(payload.url),
+          enabled: payload.enabled !== false,
+          defaultCategory: payload.defaultCategory || "General",
+          defaultAuthor: payload.defaultAuthor || "Desk",
+          geo: normalizedGeo,
+          schedule: payload.schedule || "manual",
+        }
+      },
+      { new: true, upsert: true }
+    );
+
+    res.status(201).json(feed);
+  } catch (e) {
+    // surface readable error, not 500 HTML
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
 };
+
 
 // PATCH /api/automation/feeds/:id
 exports.updateFeed = async (req, res) => {
@@ -221,10 +274,42 @@ exports.updateFeed = async (req, res) => {
 };
 
 // DELETE /api/automation/feeds/:id
+// If ?allByUrl=1, remove this feed AND any canonical-equivalent variants.
 exports.deleteFeed = async (req, res) => {
-  await FeedSource.findByIdAndDelete(req.params.id);
-  res.json({ ok: true });
+  const { allByUrl } = req.query;
+  const doc = await FeedSource.findById(req.params.id).lean();
+  if (!doc) return res.json({ ok: true, deleted: 0 });
+
+  let result;
+  if (String(allByUrl) === '1') {
+    const variants = urlVariants(doc.url);
+    result = await FeedSource.deleteMany({ url: { $in: variants } });
+  } else {
+    result = await FeedSource.deleteOne({ _id: doc._id });
+  }
+  res.json({ ok: true, deleted: result?.deletedCount || 0, url: canonicalUrl(doc.url) });
 };
+
+// DELETE /api/automation/feeds/_dedupe
+exports.dedupeFeeds = async (_req, res) => {
+  const all = await FeedSource.find({ url: { $type: "string" } }, { _id: 1, url: 1, createdAt: 1 }).lean();
+  const groups = new Map(); // canon -> [{_id, createdAt}]
+  for (const d of all) {
+    const key = canonicalUrl(d.url);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(d);
+  }
+  const toDelete = [];
+  for (const [, arr] of groups) {
+    arr.sort((a,b) => b.createdAt - a.createdAt); // newest first
+    for (let i = 1; i < arr.length; i++) toDelete.push(arr[i]._id);
+  }
+  if (toDelete.length === 0) return res.json({ ok: true, deleted: 0 });
+  const r = await FeedSource.deleteMany({ _id: { $in: toDelete } });
+  res.json({ ok: true, deleted: r.deletedCount || 0 });
+};
+
+
 
 /* ---------- Internal reusable fetch for a single feed ---------- */
 exports._fetchSingleFeedInternal = async (feedDoc) => {
@@ -513,7 +598,7 @@ exports.generateItem = async (req, res) => {
 
   const geo = json.geo || defaults.geo || { mode: "global", areas: [] };
   json.geoMode = String(geo.mode || "global").toLowerCase();
-  json.geoAreas = Array.isArray(geo.areas) ? json.geo.areas.map(String) : [];
+  json.geoAreas = Array.isArray(geo.areas) ? geo.areas.map(String) : [];
 
   if (!Array.isArray(json.tags)) json.tags = [];
   json.tags = [
