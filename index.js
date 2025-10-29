@@ -2,7 +2,6 @@
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const slugify = require('slugify');
-
 const express = require('express');
 const compression = require('compression');
 const cors = require('cors');
@@ -1234,6 +1233,15 @@ app.post('/api/articles/bulk', auth, async (req, res) => {
 
   try {
     if (!isDry) await session.startTransaction();
+     let useTx = false;
+  if (!isDry) {
+    try {
+      await session.startTransaction();
+      useTx = true;
+    } catch (e) {
+      console.warn('[bulk] transactions unavailable, continuing without TX:', e?.message || e);
+    }
+  }
 
     for (let index = 0; index < items.length; index++) {
       try {
@@ -1243,7 +1251,7 @@ app.post('/api/articles/bulk', auth, async (req, res) => {
           // Only report the slug we plan to create
           results.push({ index, ok: true, dryRun: true, slug: payload.slug });
         } else {
-          const created = await Article.create([payload], { session });
+          const created = await Article.create([payload], useTx ? { session } : {});
           results.push({ index, ok: true, id: created[0]._id, slug: created[0].slug });
         }
       } catch (err) {
@@ -1255,12 +1263,11 @@ app.post('/api/articles/bulk', auth, async (req, res) => {
       }
     }
 
-    if (!isDry) {
-      await session.commitTransaction();
-      committed = true;
-      // sitemap may have changed (new URLs)
-      markSitemapDirty();
-    }
+   if (useTx) {
+    await session.commitTransaction();
+    committed = true;
+    markSitemapDirty();
+ }
 
     const success = results.filter(r => r.ok).length;
     const failed  = results.length - success;
@@ -1274,7 +1281,7 @@ app.post('/api/articles/bulk', auth, async (req, res) => {
       results
     });
   } catch (e) {
-    if (!committed && session.inTransaction()) {
+    if (!committed && session.inTransaction && session.inTransaction()) {
       await session.abortTransaction();
     }
     return res.status(400).json({
