@@ -720,3 +720,53 @@ exports.processBatch = async (req, res) => {
   const success = results.filter((x) => x.ok).length;
   res.json({ ok: true, count: results.length, success, results });
 };
+// POST /api/automation/items/:id/run
+exports.runSingle = async (req, res) => {
+  const id = req.params.id;
+
+  // Step 1: extract (if needed)
+  try {
+    await exports.extractItem(
+      { params: { id } },
+      { json: () => {}, status: () => ({ json: () => {} }) }
+    );
+  } catch (e) {
+    // ignore if already extracted/generated; we’ll try the next steps
+  }
+
+  // Step 2: generate (if needed)
+  try {
+    await exports.generateItem(
+      { params: { id } },
+      { json: () => {}, status: () => ({ json: () => {} }) }
+    );
+  } catch (e) {
+    // safe to proceed; may already be generated
+  }
+
+  // Step 3: createDraft
+  let articleId = null;
+  try {
+    let out;
+    await exports.createDraft(
+      { params: { id } },
+      { json: (r) => (out = r), status: () => ({ json: () => {} }) }
+    );
+    articleId = out?.articleId || out?._id || null;
+  } catch (e) {
+    // If already drafted, we still try markReady; otherwise bubble up
+    if (!/already/i.test(String(e?.message || e))) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  }
+
+  // Step 4: markReady (optional; keeps parity with your current flow)
+  try {
+    await exports.markReady(
+      { params: { id } },
+      { json: () => {}, status: () => ({ json: () => {} }) }
+    );
+  } catch (_) {}
+
+  res.json({ ok: true, articleId });
+};
