@@ -1,4 +1,6 @@
-// index.js (backend server)
+// Top of file (only if Node < 18)
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const slugify = require('slugify');
@@ -44,7 +46,10 @@ const multer = require('multer');
 const stream = require('stream');
 
 const app = express();
-app.set('trust proxy', true);
+// Trust reverse proxy only when explicitly enabled (default true)
+if (String(process.env.TRUST_PROXY || 'true') === 'true') {
+  app.set('trust proxy', 1);
+}
 
 // Compress all responses (JSON, HTML, etc.)
 app.use(compression({ threshold: 0 }));
@@ -92,10 +97,6 @@ app.use((req, res, next) => {
 
 
 
-// Trust reverse proxy headers only when behind a proxy/CDN
-if (String(process.env.TRUST_PROXY || 'true') === 'true') {
-  app.set('trust proxy', 1);
-}
 
 // Body parsers
  // 1) JSON for normal APIs (login, single-article create/update, etc.)
@@ -174,31 +175,55 @@ app.use("/api/automation", automationRoutes);
 app.use('/api/articles', planImageRoutes);
 
 
-// --- Serve SSR (server-side rendered) pages to crawlers ---
-const BOT_UA = /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i;
+const BOT_UA =
+  /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i;
 
+
+function isBot(req) {
+  const ua = String(req.headers['user-agent'] || '');
+  return BOT_UA.test(ua);
+}
+
+// ultra-simple TTL cache for prerendered HTML
+const SSR_CACHE = new Map(); // key -> { html, exp }
+
+function ssrCacheGet(key) {
+  const hit = SSR_CACHE.get(key);
+  if (!hit) return null;
+  if (hit.exp <= Date.now()) { SSR_CACHE.delete(key); return null; }
+  return hit.html;
+}
+function ssrCacheSet(key, html, ttlMs = 60_000) { // 60s cache
+  SSR_CACHE.set(key, { html, exp: Date.now() + ttlMs });
+}
+
+
+// --- Serve SSR (server-side rendered) pages to crawlers ---
 app.use(async (req, res, next) => {
-  // if request is not an article page, continue
   if (!req.path.startsWith("/article/")) return next();
 
-  // detect crawler user agent
-  const ua = req.headers["user-agent"] || "";
-  if (BOT_UA.test(ua)) {
-    // send the pre-rendered (SSR) HTML from backend route
-    const slug = req.path.replace("/article/", "");
-    try {
-      const response = await fetch(`http://localhost:3001/ssr/article/${slug}`);
-      const html = await response.text();
-      res.status(200).send(html);
-    } catch (err) {
-      console.error("SSR fallback failed:", err.message);
-      next(); // fallback to normal SPA
-    }
-  } else {
-    // normal visitors → frontend SPA
-    next();
+  if (!isBot(req)) return next(); // humans → SPA
+
+  const slug = req.path.slice("/article/".length);
+  try {
+    // build base from the incoming request host (works locally and in prod)
+    const base = `${req.protocol}://${req.get('host')}`;
+    const url  = `${base}/ssr/article/${encodeURIComponent(slug)}`;
+
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`SSR fetch ${r.status}`);
+    const html = await r.text();
+
+    // cache for bots
+    ssrCacheSet(`ssr:article:${slug}`, html, 60_000);
+    res.setHeader('Cache-Control','public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+    return res.status(200).type('html').send(html);
+  } catch (err) {
+    console.error("SSR middleware failed:", err.message);
+    return next(); // fallback to SPA
   }
 });
+
 
 
 // --- Simple automation poller (pulls enabled feeds periodically) ---
@@ -354,88 +379,7 @@ cloudinary.config({
   api_secret: CLOUDINARY_API_SECRET,
 });
 
-/* ==================== IMAGE AUTOPICK HELPERS (ADD THIS) ==================== */
-// tiny tokenizer -> ["modi","speech","india",...]
-function keywordsFrom(title = "", tags = [], category = "") {
-  const stop = new Set(["the","a","an","of","and","for","to","in","on","at","by","with","from","is","are","was","were"]);
-  const raw = [
-    ...String(title).toLowerCase().split(/[^a-z0-9]+/g),
-    ...tags.map(t => String(t).toLowerCase()),
-    String(category).toLowerCase()
-  ];
-  return Array.from(
-    new Set(raw.filter(w => w && w.length >= 3 && !stop.has(w)))
-  );
-}
 
-// Cloudinary Search -> pick best match inside your folder
-async function pickBestImageForArticle({ title, tags = [], category = "" }) {
-  if (String(process.env.CLOUDINARY_AUTOPICK || "").toLowerCase() !== "on") return null;
-
-  const folder = process.env.AUTOMATION_IMAGE_FOLDER || process.env.CLOUDINARY_FOLDER || "news-images";
-  const terms  = keywordsFrom(title, tags, category);
-  if (!terms.length) return null;
-
-  // Build a permissive search: same folder AND any of the keywords in filename/tags/context
-  // Example: folder=news-images AND (filename:modi OR tags=modi OR context=*modi*)
-  const orParts = [];
-  for (const t of terms) {
-    orParts.push(`filename:${t}`);
-    orParts.push(`tags=${t}`);
-    orParts.push(`context=*${t}*`);
-  }
-  const expression =
-    `resource_type:image AND folder=${folder} AND (${orParts.join(" OR ")})`;
-
-  // Pull a reasonable page of candidates
-  const limit = Math.max(50, Math.min(400, parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || "200", 10)));
-
-  let result;
-  try {
-    // Both .search() and .api.resources work; search is more flexible
-    result = await cloudinary.search
-      .expression(expression)
-      .with_field("context")
-      .with_field("tags")
-      .sort_by("created_at", "desc")
-      .max_results(limit)
-      .execute();
-  } catch (e) {
-    console.warn("[autopick] cloudinary search failed:", e?.message || e);
-    return null;
-  }
-
-  const list = Array.isArray(result?.resources) ? result.resources : [];
-  if (!list.length) return null;
-
-  // Score candidates by how many terms hit filename/tags/context, prefer large images
-  function score(r) {
-    const name = String(r.public_id || "").toLowerCase();
-    const ctx  = JSON.stringify(r.context || {}).toLowerCase();
-    const tg   = (r.tags || []).map(t => String(t).toLowerCase());
-    let s = 0;
-    for (const t of terms) {
-      if (name.includes(t)) s += 3;
-      if (ctx.includes(t))  s += 2;
-      if (tg.includes(t))   s += 2;
-    }
-    // Nudge for bigger images
-    if (r.width >= 1000 || r.height >= 600) s += 1;
-    return s;
-  }
-
-  list.sort((a, b) => score(b) - score(a));
-
-  const top = list[0];
-  if (!top) return null;
-
-  // Build canonical URLs your app expects
-  const publicId = top.public_id;                          // no extension
-  const imageUrl = top.secure_url;                         // Cloudinary’s original delivery URL
-  const ogImage  = cloudinary.url(publicId, { width: 1200, height: 630, crop: "fill", format: "jpg" });
-
-  return { publicId, imageUrl, ogImage };
-}
 /* -------------------- MongoDB -------------------- */
 mongoose.set('strictQuery', true);
 console.log('[env] MONGO_URI=%s', MONGO_URI);
@@ -663,6 +607,8 @@ function optionalAuth(req, _res, next) {
 }
 
 
+
+
 const commentsRouterFactory = require('./routes/comments');
 app.use(commentsRouterFactory(
   { Article, Comment },
@@ -809,13 +755,15 @@ async function normalizeIncomingArticle(input = {}) {
     body,
     category: categoryName,
     tags: tagsByName,
-    imageUrl,
-    imagePublicId,
+
+    // ✅ Apply autopick results when available
+    imageUrl: finalImageUrl || imageUrl || '',
+    imagePublicId: finalImagePublicId || imagePublicId || '',
+    ogImage: finalOgImage || ogImage || '',
 
     imageAlt: (imageAlt || title || ''),
     metaTitle: (metaTitle || '').slice(0, 80),
     metaDesc: (metaDesc || '').slice(0, 200),
-    ogImage: (ogImage || ''),
 
     readingTime: estimateReadingTime(body),
 
@@ -825,7 +773,7 @@ async function normalizeIncomingArticle(input = {}) {
 
     geoMode: sanitizedGeoMode,
     geoAreas: sanitizedGeoAreas
-  };
+  };  
 
    // 🔽 add this line
   await ensureArticleHasImage(doc);
@@ -1253,16 +1201,16 @@ app.post('/api/articles/bulk', auth, async (req, res) => {
   let committed = false;
 
   try {
-    if (!isDry) await session.startTransaction();
-     let useTx = false;
-  if (!isDry) {
-    try {
-      await session.startTransaction();
-      useTx = true;
-    } catch (e) {
-      console.warn('[bulk] transactions unavailable, continuing without TX:', e?.message || e);
-    }
+   let useTx = false;
+if (!isDry) {
+  try {
+    await session.startTransaction();
+    useTx = true;
+  } catch (e) {
+    console.warn('[bulk] transactions unavailable, continuing without TX:', e?.message || e);
   }
+}
+
 
     for (let index = 0; index < items.length; index++) {
       try {
