@@ -44,6 +44,7 @@ const multer = require('multer');
 const stream = require('stream');
 
 const app = express();
+app.set('trust proxy', true);
 
 // Compress all responses (JSON, HTML, etc.)
 app.use(compression({ threshold: 0 }));
@@ -171,6 +172,34 @@ app.use("/api", sectionsV2);
 app.use("/api/top-news", require("./src/routes/topnews"));
 app.use("/api/automation", automationRoutes);  
 app.use('/api/articles', planImageRoutes);
+
+
+// --- Serve SSR (server-side rendered) pages to crawlers ---
+const BOT_UA = /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i;
+
+app.use(async (req, res, next) => {
+  // if request is not an article page, continue
+  if (!req.path.startsWith("/article/")) return next();
+
+  // detect crawler user agent
+  const ua = req.headers["user-agent"] || "";
+  if (BOT_UA.test(ua)) {
+    // send the pre-rendered (SSR) HTML from backend route
+    const slug = req.path.replace("/article/", "");
+    try {
+      const response = await fetch(`http://localhost:3001/ssr/article/${slug}`);
+      const html = await response.text();
+      res.status(200).send(html);
+    } catch (err) {
+      console.error("SSR fallback failed:", err.message);
+      next(); // fallback to normal SPA
+    }
+  } else {
+    // normal visitors → frontend SPA
+    next();
+  }
+});
+
 
 // --- Simple automation poller (pulls enabled feeds periodically) ---
 const AUTO_ENABLED = String(process.env.AUTMOTION_ENABLED || 'false') === 'true';
@@ -1797,31 +1826,6 @@ function htmlEscape(s = '') {
 }
 
 
-// --- Bot detector + simple SSR cache (inserted after htmlEscape) ---
-const BOT_UA =
-  /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i;
-
-function isBot(req) {
-  const ua = String(req.headers['user-agent'] || '');
-  // Allow manual override for local testing:
-  if (req.headers['x-force-nonbot'] === '1') return false;
-  return BOT_UA.test(ua);
-}
-
-// Tiny in-memory cache with TTL
-const ssrCache = new Map(); // key -> { html, exp }
-const SSR_TTL_MS = parseInt(process.env.SSR_TTL_MS || '300000', 10); // 5m default
-
-function ssrCacheGet(key) {
-  const now = Date.now();
-  const entry = ssrCache.get(key);
-  if (!entry) return null;
-  if (entry.exp <= now) { ssrCache.delete(key); return null; }
-  return entry.html;
-}
-function ssrCacheSet(key, html) {
-  ssrCache.set(key, { html, exp: Date.now() + SSR_TTL_MS });
-}
 
 /* -------------------- Existing SSR validator page -------------------- */
 app.get('/article/:slug', async (req, res) => {
