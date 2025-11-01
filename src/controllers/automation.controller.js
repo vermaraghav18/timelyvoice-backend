@@ -13,11 +13,12 @@ const fetch = global.fetch || require("node-fetch");
 const FeedSource = require("../models/FeedSource");
 const FeedItem = require("../models/FeedItem");
 const Article = require("../models/Article");
+
 const { chooseHeroImage } = require("../services/imagePicker");
+const { finalizeArticleImages } = require("../services/finalizeArticleImages");
 
 const { rewriteWithGuard } = require("../services/rewrite.service");
 const { cleanseHtml } = require("../services/sanitize.service");
-
 
 const {
   generateAutomationArticleDraft,
@@ -30,9 +31,8 @@ const DEFAULT_GEO_AREAS = (process.env.SITE_DEFAULT_GEO || "country:IN")
   .split(",")
   .map((s) => s.trim());
 
-// ✅ fixed env var name typo
-const MIN_EXTRACT_LEN = parseInt(
-  process.env.AUTOMATION_MIN_EXTRACT_LEN || "250",
+const MIN_EXTRACT_WORDS = parseInt(
+  process.env.AUTOMATION_MIN_EXTRACT_WORDS || process.env.AUTOMATION_MIN_EXTRACT_LEN || "800",
   10
 );
 
@@ -69,25 +69,19 @@ function canonicalUrl(raw) {
   if (!raw || typeof raw !== 'string') return raw;
   try {
     const u = new URL(raw.trim());
-    // strip tracking noise
     ['utm_source','utm_medium','utm_campaign','utm_term','utm_content'].forEach(p => u.searchParams.delete(p));
     u.hash = '';
-    const s = u.toString().replace(/\/+$/, ''); // remove trailing slash
+    const s = u.toString().replace(/\/+$/, '');
     return s;
   } catch {
     return raw.trim();
   }
 }
 
-// generate common variants we want to wipe together
 function urlVariants(raw) {
   const c = canonicalUrl(raw);
   const variants = new Set([c]);
-
-  // add trailing slash variant
   variants.add(c + '/');
-
-  // http/https swap
   try {
     const u = new URL(c);
     if (u.protocol === 'https:') {
@@ -100,74 +94,52 @@ function urlVariants(raw) {
       variants.add(https + '/');
     }
   } catch {}
-
   return [...variants];
 }
 
-
-
-/* ---------- Robust helpers ---------- */
 function safeJsonParse(raw) {
   if (!raw || typeof raw !== "string") return null;
-  // Strip control chars that break JSON.parse
   const cleaned = raw.replace(/[\u0000-\u001F]+/g, "");
-  try {
-    return JSON.parse(cleaned);
-  } catch (_) {}
+  try { return JSON.parse(cleaned); } catch (_){}
 
-  // Try ```json ... ```
   const fence = cleaned.match(/```json\s*([\s\S]*?)```/i);
-  if (fence) {
-    try {
-      return JSON.parse(fence[1]);
-    } catch (_) {}
-  }
+  if (fence) { try { return JSON.parse(fence[1]); } catch (_) {} }
 
-  // Try from first { to last }
-  const first = cleaned.indexOf("{"),
-    last = cleaned.lastIndexOf("}");
+  const first = cleaned.indexOf("{"), last = cleaned.lastIndexOf("}");
   if (first !== -1 && last > first) {
-    try {
-      return JSON.parse(cleaned.slice(first, last + 1));
-    } catch (_) {}
+    try { return JSON.parse(cleaned.slice(first, last + 1)); } catch (_){}
   }
   return null;
 }
 
 function toValidDate(input) {
-  // Accept Date, ISO string, timestamp; default to now if invalid
   const d = input instanceof Date ? input : new Date(input);
   return isNaN(d.getTime()) ? new Date() : d;
 }
 
+function plain(s=''){ return String(s).replace(/<[^>]*>/g,' '); }
+function wc(s=''){ return plain(s).trim().split(/\s+/).filter(Boolean).length; }
+
 function stripToText(html) {
   if (!html) return "";
   const $ = cheerio.load(html);
-
-  // Remove non-article chrome
   $("script,style,noscript,header,footer,nav,aside,iframe").remove();
-
-  // common paywall/boilerplate selectors (best-effort; harmless if not present)
   $('[class*="paywall"]').remove();
   $('[class*="subscribe"]').remove();
   $('[class*="advert"], [id*="advert"]').remove();
 
   const parts = [];
-  // Prefer article blocks if present
   const article = $("article");
   const scope = article.length ? article : $("body");
-
   scope.find("p, h1, h2, h3, li").each((_, el) => {
     const t = $(el).text().replace(/\s+/g, " ").trim();
     if (t && t.length > 2) parts.push(t);
   });
-
   const text = parts.join("\n\n").trim();
   return text || $("body").text().replace(/\s+/g, " ").trim();
 }
 
 async function fetchHTML(url) {
-  // Use a realistic desktop header set
   const headers = {
     "user-agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -177,15 +149,12 @@ async function fetchHTML(url) {
     "cache-control": "no-cache",
     pragma: "no-cache",
   };
-
   const res = await fetch(url, { headers, redirect: "follow" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  // Some sites use non-utf8; node-fetch handles most; if needed, add iconv here
   return await res.text();
 }
 
 /* -------------------- Debug -------------------- */
-// GET /api/automation/_debug/automation-ping
 exports.pingAutomation = async (_req, res) => {
   try {
     const model =
@@ -194,10 +163,7 @@ exports.pingAutomation = async (_req, res) => {
     const resp = await callOpenRouter({
       model,
       messages: [
-        {
-          role: "system",
-          content: 'Return ONLY a JSON object exactly: {"ok": true}',
-        },
+        { role: "system", content: 'Return ONLY a JSON object exactly: {"ok": true}' },
         { role: "user", content: "ping" },
       ],
       temperature: 0.0,
@@ -217,7 +183,7 @@ exports.getFeeds = async (_req, res) => {
   res.json(feeds);
 };
 
-// ✅ NEW: GET /api/automation/feeds/:id
+// GET /api/automation/feeds/:id
 exports.getFeedById = async (req, res) => {
   const feed = await FeedSource.findById(req.params.id);
   if (!feed) return res.status(404).json({ error: "Feed not found" });
@@ -233,7 +199,6 @@ exports.createFeed = async (req, res) => {
           areas: payload.geo.areas || DEFAULT_GEO_AREAS }
       : { mode: "global", areas: DEFAULT_GEO_AREAS };
 
-    // idempotent by URL
     const feed = await FeedSource.findOneAndUpdate(
       { url: payload.url },
       {
@@ -252,11 +217,9 @@ exports.createFeed = async (req, res) => {
 
     res.status(201).json(feed);
   } catch (e) {
-    // surface readable error, not 500 HTML
     res.status(400).json({ ok: false, error: String(e?.message || e) });
   }
 };
-
 
 // PATCH /api/automation/feeds/:id
 exports.updateFeed = async (req, res) => {
@@ -267,14 +230,11 @@ exports.updateFeed = async (req, res) => {
       areas: body.geo.areas || DEFAULT_GEO_AREAS,
     };
   }
-  const feed = await FeedSource.findByIdAndUpdate(req.params.id, body, {
-    new: true,
-  });
+  const feed = await FeedSource.findByIdAndUpdate(req.params.id, body, { new: true });
   res.json(feed);
 };
 
-// DELETE /api/automation/feeds/:id
-// If ?allByUrl=1, remove this feed AND any canonical-equivalent variants.
+// DELETE /api/automation/feeds/:id (with ?allByUrl=1 to nuke variants)
 exports.deleteFeed = async (req, res) => {
   const { allByUrl } = req.query;
   const doc = await FeedSource.findById(req.params.id).lean();
@@ -293,7 +253,7 @@ exports.deleteFeed = async (req, res) => {
 // DELETE /api/automation/feeds/_dedupe
 exports.dedupeFeeds = async (_req, res) => {
   const all = await FeedSource.find({ url: { $type: "string" } }, { _id: 1, url: 1, createdAt: 1 }).lean();
-  const groups = new Map(); // canon -> [{_id, createdAt}]
+  const groups = new Map();
   for (const d of all) {
     const key = canonicalUrl(d.url);
     if (!groups.has(key)) groups.set(key, []);
@@ -301,15 +261,13 @@ exports.dedupeFeeds = async (_req, res) => {
   }
   const toDelete = [];
   for (const [, arr] of groups) {
-    arr.sort((a,b) => b.createdAt - a.createdAt); // newest first
+    arr.sort((a,b) => b.createdAt - a.createdAt);
     for (let i = 1; i < arr.length; i++) toDelete.push(arr[i]._id);
   }
   if (toDelete.length === 0) return res.json({ ok: true, deleted: 0 });
   const r = await FeedSource.deleteMany({ _id: { $in: toDelete } });
   res.json({ ok: true, deleted: r.deletedCount || 0 });
 };
-
-
 
 /* ---------- Internal reusable fetch for a single feed ---------- */
 exports._fetchSingleFeedInternal = async (feedDoc) => {
@@ -322,15 +280,11 @@ exports._fetchSingleFeedInternal = async (feedDoc) => {
   });
 
   const rss = await parser.parseURL(feedDoc.url);
-  let created = 0,
-    skipped = 0;
+  let created = 0, skipped = 0;
 
   for (const item of rss.items || []) {
     const link = item.link || item.guid;
-    if (!link) {
-      skipped++;
-      continue;
-    }
+    if (!link) { skipped++; continue; }
 
     const published = item.isoDate
       ? new Date(item.isoDate)
@@ -338,13 +292,8 @@ exports._fetchSingleFeedInternal = async (feedDoc) => {
       ? new Date(item.pubDate)
       : new Date();
 
-    const exists = await FeedItem.findOne({
-      $or: [{ link }, { guid: item.guid || null }],
-    }).lean();
-    if (exists) {
-      skipped++;
-      continue;
-    }
+    const exists = await FeedItem.findOne({ $or: [{ link }, { guid: item.guid || null }] }).lean();
+    if (exists) { skipped++; continue; }
 
     await FeedItem.create({
       feedId: feedDoc._id,
@@ -371,11 +320,10 @@ exports.fetchFeed = async (req, res) => {
   res.json(r);
 };
 
-// ✅ NEW: POST /api/automation/feeds/fetch-all
+// POST /api/automation/feeds/fetch-all
 exports.fetchAllFeeds = async (_req, res) => {
   const feeds = await FeedSource.find({ enabled: true }).lean();
-  let totalCreated = 0,
-    totalSkipped = 0;
+  let totalCreated = 0, totalSkipped = 0;
   const perFeed = [];
 
   for (const f of feeds) {
@@ -385,19 +333,10 @@ exports.fetchAllFeeds = async (_req, res) => {
       totalSkipped += r.skipped;
       perFeed.push({ feedId: String(f._id), created: r.created, skipped: r.skipped, total: r.total });
     } catch (e) {
-      perFeed.push({
-        feedId: String(f._id),
-        error: String(e?.message || e),
-      });
+      perFeed.push({ feedId: String(f._id), error: String(e?.message || e) });
     }
   }
-  res.json({
-    ok: true,
-    feeds: feeds.length,
-    created: totalCreated,
-    skipped: totalSkipped,
-    results: perFeed,
-  });
+  res.json({ ok: true, feeds: feeds.length, created: totalCreated, skipped: totalSkipped, results: perFeed });
 };
 
 // GET /api/automation/items
@@ -405,10 +344,7 @@ exports.listItems = async (req, res) => {
   const { status, limit = 50 } = req.query;
   const q = {};
   if (status) {
-    const arr = String(status)
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const arr = String(status).split(",").map(s => s.trim()).filter(Boolean);
     q.status = arr.length > 1 ? { $in: arr } : arr[0];
   }
   const items = await FeedItem.find(q)
@@ -426,27 +362,23 @@ exports.extractItem = async (req, res) => {
     let text = "";
     let html = "";
 
-    // 1) Try full page fetch & strip
     try {
       html = await fetchHTML(item.link);
       text = stripToText(html);
     } catch (e) {
-      // Keep going—fallback next
       item.error = `fetch_failed:${e.message}`;
     }
 
-    // 2) Fallback to RSS snippet if page blocked/too short
-    if (!text || text.length < MIN_EXTRACT_LEN) {
+    if (!text || wc(text) < MIN_EXTRACT_WORDS) {
       const fallback = String(item.rawSummary || "").trim();
-      if (fallback && fallback.length >= Math.min(120, MIN_EXTRACT_LEN)) {
+      if (fallback && wc(fallback) >= Math.min(120, MIN_EXTRACT_WORDS)) {
         text = fallback;
       }
     }
 
-    // 3) Give up only if we still have nothing
-    if (!text || text.length < Math.min(120, MIN_EXTRACT_LEN)) {
+    if (!text || wc(text) < Math.min(120, MIN_EXTRACT_WORDS)) {
       item.status = "skipped";
-      item.error = item.error || "too_short_or_unreadable";
+      item.error = item.error || `too_short_or_unreadable (< ${MIN_EXTRACT_WORDS} words)`;
     } else {
       item.extract = {
         html,
@@ -477,7 +409,6 @@ exports.generateItem = async (req, res) => {
   const item = await FeedItem.findById(req.params.id).populate("feedId");
   if (!item) return res.status(404).json({ error: "Not found" });
 
-  // If already generated once, DON'T spend credits again
   if (item.status === "gen" && item.generated?.title) {
     return res.json(item);
   }
@@ -486,8 +417,11 @@ exports.generateItem = async (req, res) => {
     return res.status(400).json({ error: "no_extract" });
   }
 
-  // ↓↓↓ Cost control: keep prompt small
-  const MAX_INPUT_CHARS = 5000; // you can lower to 3000 to save more
+  if (wc(item.extract.text) < MIN_EXTRACT_WORDS) {
+    return res.status(400).json({ error: `extract_too_short_<${MIN_EXTRACT_WORDS}_words` });
+  }
+
+  const MAX_INPUT_CHARS = 5000;
   const trimmedText = String(item.extract.text).slice(0, MAX_INPUT_CHARS);
 
   const feed = item.feedId;
@@ -502,7 +436,6 @@ exports.generateItem = async (req, res) => {
   let json = null;
   let rewriteFailed = false;
 
-  // ---------- 1) PRIMARY: rewrite with anti-copy guard ----------
   try {
     const sourceBlob = {
       url: item.link,
@@ -518,7 +451,6 @@ exports.generateItem = async (req, res) => {
     json = {
       title: rewritten.title || (item.rawTitle || "Untitled"),
       summary: rewritten.summary || (item.rawSummary || ""),
-      // sanitize NOW so language rails / menus never leak
       body: cleanseHtml(rewritten.bodyHtml || ""),
       author: defaults.author,
       category: defaults.category,
@@ -535,7 +467,6 @@ exports.generateItem = async (req, res) => {
     rewriteFailed = true;
   }
 
-  // ---------- 2) FALLBACK: old generator (but still sanitized) ----------
   if (!json) {
     try {
       let g = await generateAutomationArticleDraft({
@@ -548,7 +479,6 @@ exports.generateItem = async (req, res) => {
         if (parsed) g = parsed;
       }
 
-      // Always sanitize the body coming from the old path
       const rawBody = g.bodyHtml || g.body || item.extract.text || "";
       json = {
         title: g.title || item.rawTitle || "Untitled",
@@ -562,7 +492,6 @@ exports.generateItem = async (req, res) => {
         seo: g.seo || { metaTitle: "", metaDescription: "", imageAlt: "" },
       };
     } catch (e2) {
-      // Minimal last-resort so pipeline continues
       json = {
         title: item.rawTitle || "Untitled",
         summary: item.rawSummary || "",
@@ -577,7 +506,7 @@ exports.generateItem = async (req, res) => {
     }
   }
 
-  // --- normalize to Article schema (flat SEO + GEO) ---
+  // normalize for later drafting
   json = json || {};
   json.imageUrl = json.imageUrl || "";
   json.imagePublicId = json.imagePublicId || "";
@@ -587,31 +516,25 @@ exports.generateItem = async (req, res) => {
   json.author = json.author || defaults.author;
   json.category = json.category || defaults.category;
 
-  // ensure body is sanitized (even if already done above)
   json.body = cleanseHtml(json.body || json.bodyHtml || "");
 
   const seo = json.seo || {};
   json.imageAlt = seo.imageAlt || json.title || "";
   json.metaTitle = (seo.metaTitle || json.title || "").slice(0, 80);
-  json.metaDesc = (seo.metaDescription || json.summary || "").slice(0, 200);
-  json.ogImage = (seo.ogImageUrl || "").trim();
+  json.metaDesc  = (seo.metaDescription || json.summary || "").slice(0, 200);
+  json.ogImage   = (seo.ogImageUrl || "").trim();
 
   const geo = json.geo || defaults.geo || { mode: "global", areas: [] };
   json.geoMode = String(geo.mode || "global").toLowerCase();
   json.geoAreas = Array.isArray(geo.areas) ? geo.areas.map(String) : [];
 
   if (!Array.isArray(json.tags)) json.tags = [];
-  json.tags = [
-    ...new Set(json.tags.map((t) => String(t).trim()).filter(Boolean)),
-  ].slice(0, 6);
+  json.tags = [...new Set(json.tags.map(t => String(t).trim()).filter(Boolean))].slice(0, 6);
 
   json.slug =
-    slugify(json.slug || json.title || "article", {
-      lower: true,
-      strict: true,
-    }) || `article-${Date.now()}`;
+    slugify(json.slug || json.title || "article", { lower: true, strict: true }) ||
+    `article-${Date.now()}`;
 
-  // Save on the item
   item.generated = json;
   item.status = "gen";
   item.error = rewriteFailed ? "rewrite_failed_used_fallback" : "";
@@ -619,8 +542,6 @@ exports.generateItem = async (req, res) => {
 
   res.json(item);
 };
-
-
 
 // POST /api/automation/items/:id/mark-ready
 exports.markReady = async (req, res) => {
@@ -643,82 +564,74 @@ exports.createDraft = async (req, res) => {
   if (!item) return res.status(404).json({ error: "Not found" });
   if (!item.generated) return res.status(400).json({ error: "not_generated" });
 
-   const g = item.generated;
+  const g = item.generated;
 
-  // ---- compute slug early so picker can use it (for exact match) ----
+  const ARTICLE_MIN_BODY = parseInt(process.env.ARTICLE_MIN_BODY || '450', 10);
+  const bodyForCount = (g.body && g.body.trim().length) ? g.body : (g.bodyHtml || '');
+  if (wc(bodyForCount) < ARTICLE_MIN_BODY) {
+    return res.status(400).json({
+      error: `generated_body_too_short_<${ARTICLE_MIN_BODY}_words`,
+      gotWords: wc(bodyForCount) || 0
+    });
+  }
+
+  // compute base slug so picker can match exact if asset exists
   const baseSlug =
     g.slug ||
     slugify(g.title || "article", { lower: true, strict: true }) ||
     `article-${Date.now()}`;
 
-  // If the generator did not provide an image, pick one from Cloudinary
-  // IMPORTANT: Admin list builds the preview from imagePublicId itself.
-  if (!g.imagePublicId) {
-    const picked = await chooseHeroImage({
-      title: g.title,
-      summary: g.summary,
-      category: g.category,
-      tags: g.tags,
-      slug: baseSlug, // pass slug to enable exact-slug fast path
-    });
-
-    // Set ONLY the public id for the Admin "quick URL" widget
-    g.imagePublicId = picked.publicId;
-
-    // Leave imageUrl empty; Admin composes it from publicId.
-    g.imageUrl = g.imageUrl || "";
-
-    // Keep a full transformed URL for social previews/open graph
-    if (!g.ogImage) g.ogImage = picked.url;
-
-    // Alt text fallback
-    if (!g.imageAlt) g.imageAlt = g.title || "Article image";
-
-    // Optional: during QA, see why an image was chosen
-    // console.log("[image-pick]", { title: g.title, publicId: g.imagePublicId, why: picked.why });
-  }
-
-  // ---- safe publishAt ----
-  let publishAt = toValidDate(g.publishAt || Date.now());
-
-  // ---- unique slug (auto -2, -3) ----
-  let finalSlug = baseSlug;
-  let suffix = 2;
-  while (await Article.exists({ slug: finalSlug })) {
-    finalSlug = `${baseSlug}-${suffix++}`;
-  }
-
-
-  // Create the article
-  const doc = await Article.create({
+  // Build payload for Article and FINALIZE IMAGES here (single source of truth)
+  const payload = {
     title: g.title,
-    slug: finalSlug,
-
+    slug: baseSlug,
     summary: g.summary || "",
     author: g.author || "Desk",
     category: g.category || "General",
-
     status: "draft",
-    publishAt, // safe date
-
-    imageUrl: g.imageUrl || "",
-    imagePublicId: g.imagePublicId || "",
-
-    // SEO (flat)
+    publishAt: toValidDate(g.publishAt || Date.now()),
+    imageUrl: g.imageUrl || null,         // normalize empties
+    imagePublicId: g.imagePublicId || null,
     imageAlt: g.imageAlt || g.title || "",
     metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
     metaDesc: (g.metaDesc || g.summary || "").slice(0, 200),
-    ogImage: g.ogImage || "",
-
-    // GEO (flat)
+    ogImage: g.ogImage || null,
     geoMode: g.geoMode || "global",
     geoAreas: Array.isArray(g.geoAreas) ? g.geoAreas : [],
-
     tags: Array.isArray(g.tags) ? g.tags : [],
     body: g.body || "",
-
     sourceUrl: item.link,
+  };
+
+  // ← This call guarantees publicId + hero + og + thumb even if imageUrl is empty
+  const fin = await finalizeArticleImages({
+    title: payload.title,
+    summary: payload.summary,
+    category: payload.category,
+    tags: payload.tags,
+    slug: payload.slug,
+    imageUrl: payload.imageUrl,
+    imagePublicId: payload.imagePublicId,
+    imageAlt: payload.imageAlt,
+    ogImage: payload.ogImage,
+    thumbImage: null,
   });
+
+  payload.imagePublicId = fin.imagePublicId;
+  payload.imageUrl      = fin.imageUrl;
+  payload.ogImage       = fin.ogImage;
+  payload.thumbImage    = fin.thumbImage;
+  payload.imageAlt      = payload.imageAlt || fin.imageAlt;
+
+  // ensure unique slug
+  let finalSlug = payload.slug;
+  let suffix = 2;
+  while (await Article.exists({ slug: finalSlug })) {
+    finalSlug = `${payload.slug}-${suffix++}`;
+  }
+  payload.slug = finalSlug;
+
+  const doc = await Article.create(payload);
 
   item.status = "drafted";
   item.articleId = doc._id;
@@ -728,11 +641,9 @@ exports.createDraft = async (req, res) => {
 };
 
 /* ---------- Batch processor for Admin button ---------- */
-// POST /api/automation/process   { limit?: number }
 exports.processBatch = async (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.body?.limit || "10", 10), 1), 25);
 
-  // newest first to keep the UI feeling responsive
   const items = await FeedItem.find({
     status: { $in: ["fetched", "extr", "gen"] },
   })
@@ -744,22 +655,16 @@ exports.processBatch = async (req, res) => {
   for (const it of items) {
     const r = { itemId: String(it._id), steps: [], ok: true };
     try {
-      // 1) extract (if needed)
       if (it.status === "fetched") {
         r.steps.push("extract");
         await exports.extractItem(
           { params: { id: it._id } },
-          {
-            json: () => {},
-            status: () => ({ json: () => {} }),
-          }
+          { json: () => {}, status: () => ({ json: () => {} }) }
         );
       }
 
-      // reload
       let live = await FeedItem.findById(it._id);
 
-      // 2) generate (if needed)
       if (live && live.status === "extr") {
         r.steps.push("generate");
         try {
@@ -768,7 +673,6 @@ exports.processBatch = async (req, res) => {
             { json: () => {} }
           );
         } catch {
-          // one retry is often enough if the model hiccups
           await exports.generateItem(
             { params: { id: it._id } },
             { json: () => {} }
@@ -778,16 +682,12 @@ exports.processBatch = async (req, res) => {
 
       live = await FeedItem.findById(it._id);
 
-      // 3) draft (if generated)
       if (live && live.status === "gen") {
         r.steps.push("draft");
         const tmp = { _json: null };
         await exports.createDraft(
           { params: { id: it._id } },
-          {
-            json: (obj) => (tmp._json = obj),
-            status: () => ({ json: (obj) => (tmp._json = obj) }),
-          }
+          { json: (obj) => (tmp._json = obj), status: () => ({ json: (obj) => (tmp._json = obj) }) }
         );
         if (tmp._json?.articleId) {
           r.articleId = String(tmp._json.articleId);
@@ -805,31 +705,25 @@ exports.processBatch = async (req, res) => {
   const success = results.filter((x) => x.ok).length;
   res.json({ ok: true, count: results.length, success, results });
 };
+
 // POST /api/automation/items/:id/run
 exports.runSingle = async (req, res) => {
   const id = req.params.id;
 
-  // Step 1: extract (if needed)
   try {
     await exports.extractItem(
       { params: { id } },
       { json: () => {}, status: () => ({ json: () => {} }) }
     );
-  } catch (e) {
-    // ignore if already extracted/generated; we’ll try the next steps
-  }
+  } catch (_) {}
 
-  // Step 2: generate (if needed)
   try {
     await exports.generateItem(
       { params: { id } },
       { json: () => {}, status: () => ({ json: () => {} }) }
     );
-  } catch (e) {
-    // safe to proceed; may already be generated
-  }
+  } catch (_) {}
 
-  // Step 3: createDraft
   let articleId = null;
   try {
     let out;
@@ -839,13 +733,11 @@ exports.runSingle = async (req, res) => {
     );
     articleId = out?.articleId || out?._id || null;
   } catch (e) {
-    // If already drafted, we still try markReady; otherwise bubble up
     if (!/already/i.test(String(e?.message || e))) {
       return res.status(500).json({ ok: false, error: String(e?.message || e) });
     }
   }
 
-  // Step 4: markReady (optional; keeps parity with your current flow)
   try {
     await exports.markReady(
       { params: { id } },

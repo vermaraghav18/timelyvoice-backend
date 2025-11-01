@@ -37,6 +37,7 @@ const automationRoutes = require("./src/routes/automation.routes");
 const xRoutes = require("./src/routes/x");
 const automationX = require("./src/routes/automation/x");
 const automationController = require("./src/controllers/automation.controller");
+const planImageRoutes = require('./src/routes/planImage.routes');
 
 // === MEDIA step imports ===
 const multer = require('multer');
@@ -169,6 +170,7 @@ app.use('/api/sections', sectionsRouter);
 app.use("/api", sectionsV2);
 app.use("/api/top-news", require("./src/routes/topnews"));
 app.use("/api/automation", automationRoutes);  
+app.use('/api/articles', planImageRoutes);
 
 // --- Simple automation poller (pulls enabled feeds periodically) ---
 const AUTO_ENABLED = String(process.env.AUTMOTION_ENABLED || 'false') === 'true';
@@ -314,16 +316,6 @@ app.get('/api/dev/test-image-pick', async (req, res) => {
   res.json({ title, tags, category, picked });
 });
 
-
-// Quick test for Cloudinary auto-image picking
-app.get('/api/dev/test-image-pick', async (req, res) => {
-  const title = String(req.query.title || '');
-  const tags  = (req.query.tags || '').split(',').map(s => s.trim()).filter(Boolean);
-  const category = String(req.query.category || '');
-
-  const picked = await pickBestImageForArticle({ title, tags, category });
-  res.json({ title, tags, category, picked });
-});
 
 
 /* -------------------- Cloudinary -------------------- */

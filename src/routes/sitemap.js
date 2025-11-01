@@ -35,6 +35,8 @@ const ORIGIN =
   'http://localhost:5173';
 
 const PUBLICATION_NAME = process.env.PUBLICATION_NAME || 'My News';
+const PUBLICATION_LANGUAGE = process.env.PUBLICATION_LANGUAGE || 'en';
+
 
 function xmlEscape(s = '') {
   return String(s)
@@ -99,13 +101,17 @@ const articles = await Models.Article.find(
     priority: '0.5',
   }));
 
-  // Articles -> /article/:slug
-  const articleUrls = articles.map(a => ({
+  // Articles -> /article/:slug  (prefer updatedAt → publishedAt → publishAt)
+const articleUrls = articles.map(a => {
+  const last = a.updatedAt || a.publishedAt || a.publishAt || new Date();
+  return {
     loc: `${origin}/article/${encodeURIComponent(a.slug)}`,
-    lastmod: (a.updatedAt || a.publishAt || new Date()).toISOString(),
+    lastmod: new Date(last).toISOString(),
     changefreq: 'weekly',
     priority: '0.8',
-  }));
+  };
+});
+
 
   return [...core, ...catUrls, ...tagUrls, ...articleUrls];
 }
@@ -141,23 +147,31 @@ async function buildNewsXml(origin) {
       status: 'published',
       publishAt: { $lte: new Date() },
       publishedAt: { $gte: twoDaysAgo }
-    }, { slug: 1, title: 1, publishedAt: 1 })
+    }, { slug: 1, title: 1, publishedAt: 1, updatedAt: 1 })
     .sort({ publishedAt: -1 })
     .limit(1000)
     .lean();
 
-  const items = articles.map(a => `
+  const items = articles.map(a => {
+  const pubIso  = new Date(a.publishedAt || new Date()).toISOString();
+  const lastIso = new Date(a.updatedAt || a.publishedAt || new Date()).toISOString();
+  const loc     = `${origin}/article/${encodeURIComponent(a.slug)}`;
+
+  return `
   <url>
-    <loc>${xmlEscape(`${origin}/article/${encodeURIComponent(a.slug)}`)}</loc>
+    <loc>${xmlEscape(loc)}</loc>
+    <lastmod>${lastIso}</lastmod>
     <news:news>
       <news:publication>
         <news:name>${xmlEscape(PUBLICATION_NAME)}</news:name>
-        <news:language>en</news:language>
+        <news:language>${xmlEscape(PUBLICATION_LANGUAGE)}</news:language>
       </news:publication>
-      <news:publication_date>${new Date(a.publishedAt || new Date()).toISOString()}</news:publication_date>
+      <news:publication_date>${pubIso}</news:publication_date>
       <news:title>${xmlEscape(a.title || 'Article')}</news:title>
     </news:news>
-  </url>`).join('');
+  </url>`;
+}).join('');
+
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset
