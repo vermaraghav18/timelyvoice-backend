@@ -136,28 +136,46 @@ ${items}
 /* -------------------------------------------
    Google News sitemap (last 48h)
 -------------------------------------------- */
+/* -------------------------------------------
+   Google News sitemap (last 48h)
+-------------------------------------------- */
 async function buildNewsXml(origin) {
   if (!Models.Article) {
     throw new Error('Sitemap models not set. Call setModels({ Article, Category, Tag }) before mounting the router.');
   }
 
-  const twoDaysAgo = dayjs().subtract(48, 'hour').toDate();
-  const articles = await Models.Article
-    .find({
+  const now = new Date();
+  const twoDaysAgo = dayjs(now).subtract(48, 'hour').toDate();
+
+  // ✅ Allow publishAt null/missing, same as your main sitemap logic
+  const articles = await Models.Article.find(
+    {
       status: 'published',
-      publishAt: { $lte: new Date() },
-      publishedAt: { $gte: twoDaysAgo }
-    }, { slug: 1, title: 1, publishedAt: 1, updatedAt: 1 })
-    .sort({ publishedAt: -1 })
-    .limit(1000)
-    .lean();
+      $or: [
+        { publishAt: { $lte: now } },
+        { publishAt: { $exists: false } },
+        { publishAt: null }
+      ],
+      // within last 48h by publishedAt (fallback to createdAt)
+      $or: [
+        { publishedAt: { $gte: twoDaysAgo } },
+        { $and: [{ publishedAt: { $exists: false } }, { createdAt: { $gte: twoDaysAgo } }] }
+      ]
+    },
+    { slug: 1, title: 1, publishedAt: 1, updatedAt: 1, createdAt: 1 }
+  )
+  .sort({ publishedAt: -1, createdAt: -1 })
+  .limit(200) // Google News: only last ~48h; 200 is safe
+  .lean();
 
   const items = articles.map(a => {
-  const pubIso  = new Date(a.publishedAt || new Date()).toISOString();
-  const lastIso = new Date(a.updatedAt || a.publishedAt || new Date()).toISOString();
-  const loc     = `${origin}/article/${encodeURIComponent(a.slug)}`;
+    const pubDate = a.publishedAt || a.createdAt || new Date();
+    const updDate = a.updatedAt || pubDate;
+    const pubIso  = new Date(pubDate).toISOString();
+    const lastIso = new Date(updDate).toISOString();
+    const loc     = `${origin}/article/${encodeURIComponent(a.slug)}`;
 
-  return `
+    return `
   <url>
     <loc>${xmlEscape(loc)}</loc>
     <lastmod>${lastIso}</lastmod>
@@ -170,14 +188,12 @@ async function buildNewsXml(origin) {
       <news:title>${xmlEscape(a.title || 'Article')}</news:title>
     </news:news>
   </url>`;
-}).join('');
-
+  }).join('');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset
   xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
-  xmlns:news="http://www.google.com/schemas/sitemap-news/0.9"
->
+  xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">
 ${items}
 </urlset>`;
 }

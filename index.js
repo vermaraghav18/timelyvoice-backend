@@ -119,7 +119,9 @@ if (allowedOrigins.length === 0) {
   allowedOrigins.push(
     'http://localhost:5173',
     'http://127.0.0.1:5173',
-    'https://news-site-frontend-sigma.vercel.app'
+    'https://news-site-frontend-sigma.vercel.app',
+    'https://timelyvoice.com',
+    'https://www.timelyvoice.com'
   );
 }
 
@@ -1734,11 +1736,10 @@ app.get('/api/export/articles', async (_req, res) => {
 const PORT = process.env.PORT || 4000;
 
 const FRONTEND_BASE_URL =
-  process.env.FRONTEND_BASE_URL || 'https://www.timelyvoice.com';
-
+  process.env.FRONTEND_BASE_URL || 'https://timelyvoice.com';
 const SITE_URL = FRONTEND_BASE_URL; // keep old name for rest of code
 // Fallback image for RSS when an article has no image set
-const SITE_LOGO = process.env.SITE_LOGO || `${SITE_URL.replace(/\/$/, '')}/logo-512x512.png`;
+const SITE_LOGO = process.env.SITE_LOGO || `${SITE_URL.replace(/\/$/, '')}/logo-192.png`;
 
 function xmlEscape(s = '') {
   return String(s)
