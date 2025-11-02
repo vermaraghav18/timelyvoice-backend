@@ -1913,7 +1913,6 @@ function buildNewsArticleJSONLD(a, canonicalUrl, { title, description, image } =
 
 app.get('/ssr/article/:slug', async (req, res) => {
   try {
-    // Serve cached prerender to bots
     const cacheKey = `ssr:article:${req.params.slug}`;
     if (isBot(req)) {
       const cached = ssrCacheGet(cacheKey);
@@ -1924,11 +1923,10 @@ app.get('/ssr/article/:slug', async (req, res) => {
     }
 
     const { slug } = req.params;
-
     const filter = { slug, status: 'published', publishAt: { $lte: new Date() } };
-    let a = await Article.findOne(filter).lean();
+    const a = await Article.findOne(filter).lean();
     if (!a) {
-      const r = await resolveRedirect('article', slug); // honor redirects
+      const r = await resolveRedirect('article', slug);
       if (r) {
         bumpRedirectHit(r._id);
         return res.redirect(r.type || 301, `${req.protocol}://${req.get('host')}/ssr/article/${encodeURIComponent(r.to)}`);
@@ -1936,9 +1934,16 @@ app.get('/ssr/article/:slug', async (req, res) => {
       return res.status(404).send('Not found');
     }
 
-    if (!isAllowedForGeoDoc(a, req.geo || {})) {
-      return res.status(404).send('Not found');
+    // ✅ NEW: trust bots and skip geo block for them
+    const ua = String(req.headers['user-agent'] || '');
+    const isTrustedBot = /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i.test(ua);
+
+    if (!isTrustedBot) {
+      if (!isAllowedForGeoDoc(a, req.geo || {})) {
+        return res.status(404).send('Not found');
+      }
     }
+
 
     const canonicalUrl = `${FRONTEND_BASE_URL}/article/${encodeURIComponent(slug)}`;
     const selfUrl      = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
