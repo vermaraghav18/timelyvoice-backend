@@ -12,6 +12,7 @@ const analyticsRouter = require('./routes/analytics');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const robotsRoute = require("./src/routes/robots");
+
 const {
   router: sitemapRouter,
   markSitemapDirty,
@@ -1885,25 +1886,29 @@ const ogImage     = (doc.ogImage   && doc.ogImage.trim())   || doc.imageUrl || '
 });
 
 /* -------------------- Crawler-friendly SSR (NewsArticle) -------------------- */
-function buildNewsArticleJSONLD(a, url, { title, description, image } = {}) {
-  const headline = (title && String(title).trim()) || a.title;
-  const desc     = (description !== undefined ? String(description) : (a.summary || ""));
-  const img      = (image && String(image).trim()) || a.ogImage || a.imageUrl;
+function buildNewsArticleJSONLD(a, canonicalUrl, { title, description, image } = {}) {
+  const SITE_LOGO = process.env.SITE_LOGO || "https://timelyvoice.com/logo.png";
 
   return {
     "@context": "https://schema.org",
     "@type": "NewsArticle",
-    "headline": headline,
+    "headline": (title && String(title).trim()) || a.title,
+    "description": description !== undefined ? String(description) : (a.summary || ""),
+    "image": (image ? [image] : (a.ogImage ? [a.ogImage] : (a.imageUrl ? [a.imageUrl] : [SITE_LOGO]))),
     "datePublished": new Date(a.publishedAt || a.createdAt || Date.now()).toISOString(),
     "dateModified": new Date(a.updatedAt || a.publishedAt || a.createdAt || Date.now()).toISOString(),
-    "author": a.author ? [{ "@type": "Person", "name": a.author }] : undefined,
+    "author": a.author ? [{ "@type": "Person", "name": a.author }] : [{ "@type": "Organization", "name": "The Timely Voice" }],
+    "publisher": {
+      "@type": "Organization",
+      "name": "The Timely Voice",
+      "logo": { "@type": "ImageObject", "url": SITE_LOGO }
+    },
     "articleSection": a.category || "General",
-    "image": img ? [img] : undefined,
-    "mainEntityOfPage": { "@type": "WebPage", "@id": url },
-    "url": url,
-    "description": desc
+    "mainEntityOfPage": { "@type": "WebPage", "@id": canonicalUrl },
+    "url": canonicalUrl
   };
 }
+
 
 
 app.get('/ssr/article/:slug', async (req, res) => {
@@ -1943,9 +1948,14 @@ app.get('/ssr/article/:slug', async (req, res) => {
     const desc  = (a.metaDesc  && a.metaDesc.trim())  || buildDescription(a);
     const og    = (a.ogImage   && a.ogImage.trim())   || a.imageUrl || '';
 
-    const jsonLd = buildNewsArticleJSONLD(a, selfUrl, { title, description: desc, image: og });
+   // ✅ Build JSON-LD with canonical frontend URL (not backend)
+const jsonLd = buildNewsArticleJSONLD(a, canonicalUrl, {
+  title,
+  description: desc,
+  image: og
+});
 
-    const html = `<!doctype html>
+const html = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
@@ -1960,7 +1970,7 @@ app.get('/ssr/article/:slug', async (req, res) => {
   <meta property="og:type" content="article"/>
   <meta property="og:title" content="${htmlEscape(title)}"/>
   <meta property="og:description" content="${htmlEscape(desc)}"/>
-  <meta property="og:url" content="${htmlEscape(selfUrl)}"/>
+  <meta property="og:url" content="${htmlEscape(canonicalUrl)}"/>   <!-- ✅ changed -->
   ${og ? `<meta property="og:image" content="${htmlEscape(og)}"/>` : ''}
 
   <meta name="twitter:card" content="${og ? 'summary_large_image' : 'summary'}"/>
@@ -1970,6 +1980,7 @@ app.get('/ssr/article/:slug', async (req, res) => {
 
   <!-- JSON-LD -->
   <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
+
 
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f8fafc;margin:0}
