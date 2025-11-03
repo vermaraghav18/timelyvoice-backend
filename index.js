@@ -13,6 +13,8 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const robotsRoute = require("./src/routes/robots");
 
+
+
 const {
   router: sitemapRouter,
   markSitemapDirty,
@@ -22,6 +24,7 @@ const {
 
 const mongoose = require('mongoose');
 const cloudinary = require('cloudinary').v2;
+
 const geoMiddleware = require('./middleware/geo');
 const breakingRoutes = require('./routes/breaking');
 const tickerRoutes = require('./routes/ticker');
@@ -374,13 +377,6 @@ app.get('/api/dev/test-image-pick', async (req, res) => {
 });
 
 
-
-/* -------------------- Cloudinary -------------------- */
-cloudinary.config({
-  cloud_name: CLOUDINARY_CLOUD_NAME,
-  api_key: CLOUDINARY_API_KEY,
-  api_secret: CLOUDINARY_API_SECRET,
-});
 
 
 /* -------------------- MongoDB -------------------- */
