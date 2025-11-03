@@ -1,6 +1,6 @@
 // Top of file (only if Node < 18)
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-
+require('./src/lib/cloudinary'); 
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const slugify = require('slugify');
