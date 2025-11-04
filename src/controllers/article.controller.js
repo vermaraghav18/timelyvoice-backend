@@ -90,6 +90,44 @@ exports.list = async (req, res) => {
  * POST /api/articles
  * Creates an article and guarantees image fields via finalizeArticleImages.
  */
+
+/**
+ * GET /api/articles/slug/:slug
+ * - Returns the article by slug if it exists and is published.
+ * - If the requested slug is the "base" slug but the stored one is uniquified
+ *   (e.g., "-2"), respond 308 with { redirectTo } so the frontend replaces the URL.
+ */
+exports.getBySlug = async (req, res) => {
+  try {
+    const raw = String(req.params.slug || '').trim();
+    if (!raw) return res.status(400).json({ error: 'bad_slug' });
+
+    // Only show published & already-live (publishedAt <= now)
+    const publishedFilter = { status: 'published', publishedAt: { $lte: new Date() } };
+
+    // 1) Exact match
+    let doc = await Article.findOne({ slug: raw, ...publishedFilter }).lean();
+    if (doc) return res.json(doc);
+
+    // 2) Fallback: match base OR base-<number>
+    const rx = new RegExp(`^${escRegex(raw)}(?:-\\d+)?$`, 'i');
+    doc = await Article
+      .findOne({ slug: rx, ...publishedFilter })
+      .sort({ publishedAt: -1, createdAt: -1 })
+      .lean();
+
+    if (doc) {
+      // Tell client the canonical slug. Your Article.jsx already handles 308 + redirectTo
+      return res.status(308).json({ redirectTo: `/article/${doc.slug}` });
+    }
+
+    return res.status(404).json({ error: 'not_found' });
+  } catch (e) {
+    console.error('GET /api/articles/slug/* error:', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+};
+
 exports.create = async (req, res) => {
   try {
     const payload = normalizeEmptyImages({ ...req.body });

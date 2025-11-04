@@ -2,29 +2,52 @@ const router = require('express').Router();
 const ctrl = require('../controllers/article.controller');
 const { withValidation } = require('../validators/withValidation');
 const { ArticleCreateSchema, ArticleUpdateSchema } = require('../validators/article');
-const { auth, permit } = require('../middleware/auth'); // step 2 will fill this
+const { auth, permit } = require('../middleware/auth');
+const { z } = require('zod');
 
-router.get('/', withValidation(
-  // light query validation inline
-  require('zod').z.object({
-    q: require('zod').z.string().optional(),
-    status: require('zod').z.enum(['draft','published']).optional(),
-    category: require('zod').z.string().optional(),
-    tag: require('zod').z.string().optional(),
-    page: require('zod').z.coerce.number().min(1).optional(),
-    limit: require('zod').z.coerce.number().min(1).max(100).optional(),
-  }), 'query'), ctrl.list);
+router.get(
+  '/',
+  withValidation(
+    z.object({
+      q: z.string().optional(),
+      status: z.enum(['draft','published']).optional(),
+      category: z.string().optional(),
+      tag: z.string().optional(),
+      page: z.coerce.number().min(1).optional(),
+      limit: z.coerce.number().min(1).max(100).optional(),
+    }),
+    'query'
+  ),
+  ctrl.list
+);
+
+/** 👇👇 NEW: public slug reader — MUST be before '/:id' 👇👇 */
+router.get(
+  '/slug/:slug',
+  withValidation(z.object({ slug: z.string().min(1) }), 'params'),
+  ctrl.getBySlug
+);
 
 router.get('/:id', ctrl.read);
 
-router.post('/', auth, permit(['author','editor','admin']),
-  withValidation(ArticleCreateSchema), ctrl.create);
+router.post(
+  '/',
+  auth,
+  permit(['author','editor','admin']),
+  withValidation(ArticleCreateSchema),
+  ctrl.create
+);
 
-router.patch('/:id', auth, permit(['author','editor','admin']),
-  withValidation(ArticleUpdateSchema), ctrl.update);
+router.patch(
+  '/:id',
+  auth,
+  permit(['author','editor','admin']),
+  withValidation(ArticleUpdateSchema),
+  ctrl.update
+);
 
-router.post('/:id/publish', auth, permit(['editor','admin']), ctrl.publish);
+router.post('/:id/publish',   auth, permit(['editor','admin']), ctrl.publish);
 router.post('/:id/unpublish', auth, permit(['editor','admin']), ctrl.unpublish);
-router.delete('/:id', auth, permit(['admin']), ctrl.softDelete);
+router.delete('/:id',         auth, permit(['admin']),          ctrl.softDelete);
 
 module.exports = router;
