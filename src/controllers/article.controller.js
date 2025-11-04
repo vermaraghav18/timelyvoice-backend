@@ -3,7 +3,7 @@ const Article = require('../models/Article');
 const Category = require('../models/Category');
 const slugify = require('slugify');
 const { finalizeArticleImages } = require('../services/finalizeArticleImages');
-const { extractTags } = require('../services/textFeatures'); // <-- ADD THIS
+const { extractTags } = require('../services/textFeatures');
 
 function escRegex(str = '') {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -36,7 +36,7 @@ exports.list = async (req, res) => {
     const limit = Math.min(limitReq || 12, 24);
 
     const q = {};
-    q.status = req.query.status || 'published';
+    q.status = (req.query.status || 'published').toLowerCase();
 
     if (req.query.category) {
       const raw = String(req.query.category);
@@ -52,6 +52,11 @@ exports.list = async (req, res) => {
     if (req.query.q && String(req.query.q).trim()) {
       const rx = new RegExp(escRegex(String(req.query.q).trim()), 'i');
       q.$or = [{ title: rx }, { summary: rx }, { slug: rx }];
+    }
+
+    // Show only already-published items when status=published
+    if (String(q.status).toLowerCase() === 'published') {
+      q.publishedAt = { $lte: new Date() };
     }
 
     const PROJECTION = {
@@ -90,33 +95,56 @@ exports.create = async (req, res) => {
     const payload = normalizeEmptyImages({ ...req.body });
 
     // Prepare slug early if not present
-    payload.slug = payload.slug || slugify(payload.title || 'article', { lower: true, strict: true }) || `article-${Date.now()}`;
+    payload.slug =
+      payload.slug ||
+      slugify(payload.title || 'article', { lower: true, strict: true }) ||
+      `article-${Date.now()}`;
+
+    // Normalize status + set publishedAt if coming in as Published
+    payload.status = (payload.status || 'draft').toLowerCase();
+    if (payload.status === 'published' && !payload.publishedAt) {
+      payload.publishedAt = new Date();
+    }
 
     // Auto-generate tags only if none were provided
-if (!payload.tags || (Array.isArray(payload.tags) && payload.tags.length === 0)) {
-  try {
-    payload.tags = extractTags(
-      {
-        title: payload.title || '',
-        summary: payload.summary || '',
-        body: payload.body || ''
-      },
-      8
-    );
-  } catch (_) {
-    payload.tags = payload.tags || [];
-  }
-}
+    if (!payload.tags || (Array.isArray(payload.tags) && payload.tags.length === 0)) {
+      try {
+        payload.tags = extractTags(
+          {
+            title: payload.title || '',
+            summary: payload.summary || '',
+            body: payload.body || '',
+          },
+          8
+        );
+      } catch (_) {
+        payload.tags = payload.tags || [];
+      }
+    }
 
+    // Respect manual image URL on create (when no publicId provided)
+    const manualUrlProvidedOnCreate =
+      typeof payload.imageUrl === 'string' &&
+      payload.imageUrl.trim() !== '' &&
+      !payload.imagePublicId;
 
-    // If any image fields missing → finalize
+    // If any image fields missing → finalize.
+    // Do NOT overwrite a manual imageUrl; only backfill missing fields.
     if (!payload.imageUrl || !payload.imagePublicId || !payload.ogImage || !payload.thumbImage) {
+      const beforeManualUrl = manualUrlProvidedOnCreate ? payload.imageUrl : (payload.imageUrl || null);
+
       const fin = await finalizeArticleImages(payload);
-      payload.imagePublicId = fin.imagePublicId;
-      payload.imageUrl = fin.imageUrl;
-      payload.ogImage = fin.ogImage;
-      payload.thumbImage = fin.thumbImage;
-      payload.imageAlt = payload.imageAlt || fin.imageAlt;
+
+      payload.imageUrl = beforeManualUrl || fin.imageUrl;
+
+      if (!payload.imagePublicId) {
+        payload.imagePublicId = fin.imagePublicId || null;
+      }
+
+      if (!payload.ogImage) payload.ogImage = fin.ogImage || null;
+      if (!payload.thumbImage) payload.thumbImage = fin.thumbImage || null;
+
+      payload.imageAlt = payload.imageAlt || fin.imageAlt || '';
     }
 
     const doc = await Article.create(payload);
@@ -130,6 +158,7 @@ if (!payload.tags || (Array.isArray(payload.tags) && payload.tags.length === 0))
 /**
  * PATCH /api/articles/:id
  * Updates an article and re-finalizes image fields if any are missing.
+ * Also ensures publishing sets a publishedAt timestamp.
  */
 exports.update = async (req, res) => {
   try {
@@ -142,32 +171,69 @@ exports.update = async (req, res) => {
     Object.assign(doc, patch);
 
     if (!doc.slug) {
-      doc.slug = slugify(doc.title || 'article', { lower: true, strict: true }) || `article-${Date.now()}`;
+      doc.slug =
+        slugify(doc.title || 'article', { lower: true, strict: true }) ||
+        `article-${Date.now()}`;
+    }
+
+    // 1) Normalize status casing (store as lowercase)
+    if (typeof doc.status === 'string') {
+      doc.status = doc.status.toLowerCase();
+    }
+
+    // 2) If transitioning to published and no publishedAt yet, set it now
+    if (doc.status === 'published' && !doc.publishedAt) {
+      doc.publishedAt = new Date();
+    }
+
+    // 3) Manual image override handling:
+    // If the patch included a new imageUrl and NO imagePublicId, prefer the URL and clear publicId.
+    const manualUrlProvided =
+      Object.prototype.hasOwnProperty.call(patch, 'imageUrl') &&
+      typeof patch.imageUrl === 'string' &&
+      patch.imageUrl?.trim() !== '' &&
+      !patch.imagePublicId;
+
+    if (manualUrlProvided) {
+      // ensure we use the manual URL
+      doc.imagePublicId = null; // so downstream won't re-override URL with a Cloudinary public id
     }
 
     // If tags were cleared/missing after patch, auto-generate tags again
-if (!doc.tags || (Array.isArray(doc.tags) && doc.tags.length === 0)) {
-  try {
-    doc.tags = extractTags(
-      {
-        title: doc.title || '',
-        summary: doc.summary || '',
-        body: doc.body || ''
-      },
-      8
-    );
-  } catch (_) {
-    doc.tags = doc.tags || [];
-  }
-}
+    if (!doc.tags || (Array.isArray(doc.tags) && doc.tags.length === 0)) {
+      try {
+        doc.tags = extractTags(
+          {
+            title: doc.title || '',
+            summary: doc.summary || '',
+            body: doc.body || '',
+          },
+          8
+        );
+      } catch (_) {
+        doc.tags = doc.tags || [];
+      }
+    }
 
+    // Finalize ONLY missing fields; do not overwrite manual URL
     if (!doc.imageUrl || !doc.imagePublicId || !doc.ogImage || !doc.thumbImage) {
+      const beforeManualUrl = doc.imageUrl || null;
+
       const fin = await finalizeArticleImages(doc.toObject());
-      doc.imagePublicId = fin.imagePublicId;
-      doc.imageUrl = fin.imageUrl;
-      doc.ogImage = fin.ogImage;
-      doc.thumbImage = fin.thumbImage;
-      doc.imageAlt = doc.imageAlt || fin.imageAlt;
+
+      // If the editor provided a manual Image URL, DO NOT overwrite it.
+      doc.imageUrl = beforeManualUrl || fin.imageUrl;
+
+      // Only set publicId if we don't already have one
+      if (!doc.imagePublicId) {
+        doc.imagePublicId = fin.imagePublicId || null;
+      }
+
+      // Always backfill OG & thumb if missing
+      if (!doc.ogImage) doc.ogImage = fin.ogImage || null;
+      if (!doc.thumbImage) doc.thumbImage = fin.thumbImage || null;
+
+      doc.imageAlt = doc.imageAlt || fin.imageAlt || '';
     }
 
     await doc.save();

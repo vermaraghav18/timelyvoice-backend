@@ -1044,10 +1044,14 @@ app.get('/api/articles/:id', async (req, res) => {
 app.get('/api/articles/slug/:slug', optionalAuth, async (req, res) => {
   const isAdmin = req.user?.role === 'admin';
   const filter = { slug: req.params.slug };
-  if (!isAdmin) {
-    filter.status = 'published';
-    filter.publishAt = { $lte: new Date() };
-  }
+ if (!isAdmin) {
+  filter.status = 'published';
+  // allow small future skew (e.g., RSS in UTC ahead of server)
+  const now = new Date();
+  const skew = new Date(now.getTime() + 1000 * 60 * 60 * 6); // +6 hours
+  filter.publishAt = { $lte: skew };
+}
+
   let a = await Article.findOne(filter).lean();
 
   if (!a) {
@@ -1061,9 +1065,16 @@ app.get('/api/articles/slug/:slug', optionalAuth, async (req, res) => {
     return res.status(404).json({ error: 'Not found' });
   }
 
+  // --- allow trusted crawlers (e.g., Googlebot/AdsBot/MediaPartners) to bypass geo restrictions ---
   if (!isAdmin) {
-    const allowed = isAllowedForGeoDoc(a, req.geo || {});
-    if (!allowed) return res.status(404).json({ error: 'Not found' }); // soft-block
+    const ua = String(req.headers['user-agent'] || '');
+    const isTrustedBot =
+      isBot(req) || /\bmediapartners-google\b/i.test(ua); // include AdSense crawler
+
+    if (!isTrustedBot) {
+      const allowed = isAllowedForGeoDoc(a, req.geo || {});
+      if (!allowed) return res.status(404).json({ error: 'Not available in your region' });
+    }
   }
 
   if (!isAdmin) {

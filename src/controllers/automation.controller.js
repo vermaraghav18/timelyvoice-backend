@@ -631,6 +631,9 @@ exports.createDraft = async (req, res) => {
   }
   payload.slug = finalSlug;
 
+  payload.status = "published";
+  payload.publishedAt = new Date();
+
   const doc = await Article.create(payload);
 
   item.status = "drafted";
