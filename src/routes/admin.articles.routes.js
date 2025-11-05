@@ -273,7 +273,19 @@ router.post('/:id/publish', async (req, res) => {
     ).lean();
 
     if (!updated) return res.status(404).json({ error: 'not_found' });
+
+    // respond immediately to the client
     res.json(updated);
+
+    // fire-and-forget social posting (does not block the response)
+    try {
+      const { publishEverywhere } = require('../services/socialPublisher');
+      // run in background; ignore errors
+      Promise.resolve().then(() => publishEverywhere(updated)).catch(() => {});
+    } catch (_) {
+      // swallow module-load errors silently to avoid breaking publish
+    }
+
   } catch (err) {
     console.error('[admin.articles] publish error', err);
     res.status(500).json({ error: 'failed_to_publish' });
