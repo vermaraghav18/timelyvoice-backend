@@ -82,7 +82,6 @@ function cacheRoute(ttlMs = 60_000) {
   };
 }
 
-
 /* -------------------- CORS (unified) -------------------- */
 const cors = require('cors');
 
@@ -91,6 +90,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .map(s => s.trim())
   .filter(Boolean);
 
+// sensible defaults if ALLOWED_ORIGINS not set
 if (allowedOrigins.length === 0) {
   allowedOrigins.push(
     'http://localhost:5173',
@@ -103,10 +103,19 @@ if (allowedOrigins.length === 0) {
 
 const corsOptions = {
   origin(origin, cb) {
-    // allow local dev tools & Postman with no Origin
+    // allow server-to-server, curl, health checks (no Origin header)
     if (!origin) return cb(null, true);
-    const ok = allowedOrigins.includes(origin);
-    cb(ok ? null : new Error('Not allowed by CORS'), ok);
+
+    // normalize and check
+    const ok =
+      allowedOrigins.includes(origin) ||
+      /^http:\/\/localhost:5173$/.test(origin) ||
+      /^http:\/\/127\.0\.0\.1:5173$/.test(origin);
+
+    if (ok) return cb(null, true);
+
+    console.warn('[CORS] blocked origin:', origin, 'allowed:', allowedOrigins);
+    return cb(new Error('CORS not allowed for ' + origin), false);
   },
   credentials: true,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
@@ -118,9 +127,10 @@ const corsOptions = {
   maxAge: 86400
 };
 
-// must mount before any routes or redirects
+// mount CORS BEFORE routes
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
+
 
 // Trust reverse proxy only when explicitly enabled (default true)
 if (String(process.env.TRUST_PROXY || 'true') === 'true') {
