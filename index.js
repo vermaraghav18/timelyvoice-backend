@@ -6,7 +6,6 @@ require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const slugify = require('slugify');
 const express = require('express');
 const compression = require('compression');
-const cors = require('cors');
 const analyticsBotFilter = require('./middleware/analyticsBotFilter');
 const analyticsRouter = require('./routes/analytics');
 const jwt = require('jsonwebtoken');
@@ -50,13 +49,92 @@ const multer = require('multer');
 const stream = require('stream');
 
 const app = express();
+
+/* -------------------- Tiny in-memory cache for hot GET endpoints -------------------- */
+const cache = new Map(); // key -> { data, exp }
+
+function getCache(key) {
+  const v = cache.get(key);
+  if (!v) return null;
+  if (Date.now() > v.exp) { cache.delete(key); return null; }
+  return v.data;
+}
+
+function setCache(key, data, ttlMs = 60_000) {
+  cache.set(key, { data, exp: Date.now() + ttlMs });
+}
+
+function cacheRoute(ttlMs = 60_000) {
+  return (req, res, next) => {
+    if (req.method !== 'GET') return next();
+    const key = req.originalUrl;
+    const hit = getCache(key);
+    if (hit) {
+      console.log('⚡ Cache HIT:', key);
+      return res.json(hit);
+    }
+    const send = res.json.bind(res);
+    res.json = (body) => {
+      setCache(key, body, ttlMs);
+      return send(body);
+    };
+    next();
+  };
+}
+
+
+/* -------------------- CORS (unified) -------------------- */
+const cors = require('cors');
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+if (allowedOrigins.length === 0) {
+  allowedOrigins.push(
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'https://timelyvoice.com',
+    'https://www.timelyvoice.com',
+    'https://news-site-frontend-sigma.vercel.app'
+  );
+}
+
+const corsOptions = {
+  origin(origin, cb) {
+    // allow local dev tools & Postman with no Origin
+    if (!origin) return cb(null, true);
+    const ok = allowedOrigins.includes(origin);
+    cb(ok ? null : new Error('Not allowed by CORS'), ok);
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: [
+    'Content-Type','Authorization','Cache-Control','Pragma',
+    'If-Modified-Since','If-None-Match',
+    'X-Geo-Preview-Country','X-Force-NonBot','X-Analytics-OptOut'
+  ],
+  maxAge: 86400
+};
+
+// must mount before any routes or redirects
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
+
 // Trust reverse proxy only when explicitly enabled (default true)
 if (String(process.env.TRUST_PROXY || 'true') === 'true') {
   app.set('trust proxy', 1);
 }
 
+
 // Compress all responses (JSON, HTML, etc.)
 app.use(compression({ threshold: 0 }));
+
+// ✅ Enforce canonical domain and HTTPS
+const canonicalHost = require('./src/middleware/canonicalHost');
+app.use(canonicalHost());
+
 
 // Strong ETags let browsers/CDNs validate cached JSON quickly
 app.set('etag', 'strong');
@@ -112,47 +190,8 @@ app.use((req, res, next) => {
  }));
 
 
-/* -------------------- CORS -------------------- */
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-if (allowedOrigins.length === 0) {
-  allowedOrigins.push(
-    'http://localhost:5173',
-    'http://127.0.0.1:5173',
-    'https://news-site-frontend-sigma.vercel.app',
-    'https://timelyvoice.com',
-    'https://www.timelyvoice.com'
-  );
-}
-
-const corsOptions = {
-  origin(origin, callback) {
-    if (!origin) return callback(null, true); // allow curl/postman
-    const ok = allowedOrigins.includes(origin);
-    callback(ok ? null : new Error('Not allowed by CORS'), ok);
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'X-Geo-Preview-Country',
-    'X-Force-NonBot',
-    'X-Analytics-OptOut',
-    // ✅ add these:
-    'Cache-Control',
-    'Pragma',
-    'If-Modified-Since',
-    'If-None-Match',
-  ],
-  credentials: true,
-  maxAge: 86400,
-};
 
 
-app.use(cors(corsOptions));
 app.get("/api/automation/_debug/openrouter", (req, res) => {
   res.json({
     keyPresent: !!process.env.OPENROUTER_API_KEY,
@@ -172,13 +211,21 @@ app.use('/api/admin/articles', adminArticlesRouter);
 
 app.options(/.*/, cors(corsOptions)); // ensure preflight OPTIONS succeeds
 app.use("/", robotsRoute);
-app.use('/api/breaking', breakingRoutes);
-app.use('/api/ticker', tickerRoutes);
-app.use('/api/sections', sectionsRouter);
-app.use("/api", sectionsV2);
-app.use("/api/top-news", require("./src/routes/topnews"));
+// Cached versions of high-traffic endpoints
+app.use('/api/breaking',  cacheRoute(30_000), breakingRoutes);
+app.use('/api/ticker',    cacheRoute(30_000), tickerRoutes);
+app.use('/api/sections',  cacheRoute(60_000), sectionsRouter);
+app.use('/api/top-news',  cacheRoute(30_000), require("./src/routes/topnews"));
+
 app.use("/api/automation", automationRoutes);  
 app.use('/api/articles', planImageRoutes);
+
+
+function clearCache(prefix = '') {
+  for (const key of cache.keys()) {
+    if (!prefix || key.startsWith(prefix)) cache.delete(key);
+  }
+}
 
 
 const BOT_UA =
@@ -505,16 +552,9 @@ const Comment = require('./models/Comment');
 const Subscriber = require('./models/Subscriber');
 
 
-
-
-// Wire models into the sitemap router, then mount it
+// ⬇️ INSERT THESE TWO LINES HERE
 setSitemapModels({ Article, Category, Tag });
 app.use(sitemapRouter);
-
-
-
-
-
 
 
 /* -------------------- MEDIA helpers -------------------- */

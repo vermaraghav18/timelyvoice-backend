@@ -24,6 +24,11 @@ const AUTOMATION_MODEL =
   process.env.OPENROUTER_MODEL ||
   DEFAULT_MODEL;
 
+// Knobs for X-generation (long-form)
+const XGEN_TARGET_WORDS =
+  parseInt(process.env.XGEN_TARGET_WORDS || process.env.ARTICLE_MIN_BODY || "600", 10);
+const XGEN_MAX_TOKENS = parseInt(process.env.XGEN_MAX_TOKENS || "1600", 10);
+
 // Friendly boot logs (do not print secrets)
 console.log("[OpenRouter] global model =", process.env.OPENROUTER_MODEL);
 console.log("[OpenRouter] xgen model   =", process.env.OPENROUTER_MODEL_XGEN);
@@ -31,6 +36,8 @@ console.log(
   "[OpenRouter] automation   =",
   process.env.OPENROUTER_MODEL_AUTOMATION || "(fallback to global)"
 );
+console.log("[OpenRouter] xgen targetWords =", XGEN_TARGET_WORDS);
+console.log("[OpenRouter] xgen max_tokens  =", XGEN_MAX_TOKENS);
 
 // -------------------------------
 // Helpers
@@ -62,7 +69,13 @@ function safeParseJSON(raw) {
 }
 
 /** Low-level OpenRouter caller that allows model/key overrides */
-async function callOpenRouter({ messages, model, apiKey, temperature = 0.3 }) {
+async function callOpenRouter({
+  messages,
+  model,
+  apiKey,
+  temperature = 0.3,
+  max_tokens, // NEW: allow caller to set token budget
+}) {
   const key =
     (apiKey ||
       process.env.OPENROUTER_API_KEY ||
@@ -75,6 +88,14 @@ async function callOpenRouter({ messages, model, apiKey, temperature = 0.3 }) {
   const modelToUse = model || DEFAULT_MODEL;
   const meta = getHeaderMeta();
 
+  const body = {
+    model: modelToUse,
+    temperature,
+    response_format: { type: "json_object" }, // ask for JSON
+    messages,
+  };
+  if (Number.isFinite(max_tokens)) body.max_tokens = max_tokens;
+
   const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -83,12 +104,7 @@ async function callOpenRouter({ messages, model, apiKey, temperature = 0.3 }) {
       "HTTP-Referer": meta.referer,
       "X-Title": meta.title,
     },
-    body: JSON.stringify({
-      model: modelToUse,
-      temperature,
-      response_format: { type: "json_object" }, // ask for JSON
-      messages,
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -103,13 +119,24 @@ async function callOpenRouter({ messages, model, apiKey, temperature = 0.3 }) {
 }
 
 // -------------------------------
-// 1) EXISTING FUNCTION — keep behavior for official sources
+// 1) EXISTING FUNCTION — now supports long-form bodies (targetWords)
 // -------------------------------
-async function generateJSONDraft({ tweetText, extractText, defaults, sources, model }) {
-  // Uses your app's DEFAULT model & key (backwards compatible)
-  const useModel = model || DEFAULT_MODEL;
+async function generateJSONDraft({
+  tweetText,
+  extractText,
+  defaults,
+  sources,
+  model,
+  targetWords,   // NEW: optional override; falls back to env
+  maxTokens,     // NEW: optional override; falls back to env
+}) {
+  // Model resolution: prefer explicit override, then xgen env, then default
+  const useModel = model || process.env.OPENROUTER_MODEL_XGEN || DEFAULT_MODEL;
 
-  const sys = `You write concise news article drafts from OFFICIAL Indian government sources only.
+  const words = parseInt(String(targetWords || XGEN_TARGET_WORDS), 10);
+  const maxTok = Number.isFinite(maxTokens) ? maxTokens : XGEN_MAX_TOKENS;
+
+  const sys = `You write news article drafts from OFFICIAL Indian government sources only.
 Return STRICTLY a JSON object with these fields:
 {
   "title": "<70–80 chars>",
@@ -132,10 +159,11 @@ Return STRICTLY a JSON object with these fields:
   "body": "<plain text body>"
 }
 Rules:
-- Use ONLY the provided official sources (gov.in / nic.in). Ignore everything else.
+- Use ONLY the provided official sources (domains: *.gov.in or *.nic.in). Ignore everything else.
 - Leave image fields blank.
 - Keep neutral, factual tone.
-- slug must be kebab-case; append 6 random digits if needed to ensure uniqueness.`;
+- Slug must be kebab-case; append 6 random digits if needed to ensure uniqueness.
+- BODY LENGTH: write a cohesive, paragraph-based body of approximately ${words}–${words + 200} words (no bullet lists). Ensure clarity, chronology, and attribution to the provided official sources only.`;
 
   const user = `
 TWEET:
@@ -160,8 +188,8 @@ geo.mode=${defaults?.geo?.mode}
       { role: "system", content: sys },
       { role: "user", content: user },
     ],
-    // keep it a bit conservative for this flow
     temperature: 0.2,
+    max_tokens: maxTok,
   });
 }
 
@@ -206,12 +234,14 @@ STRICTLY return a JSON object with exactly these fields and nothing else:
     "areas": ["country:IN"]
   },
   "tags": ["tag1","tag2","tag3"],
-  "body": "200-word article body in plain text, with paragraph breaks."
+  "body": "600-word article body in plain text, divided into 4–6 short paragraphs."
+
 }
 HARD RULES (very important):
 - DO NOT copy or quote sentences from the source; write *original* language. Avoid near-paraphrasing of unique phrases.
 - Keep neutral, factual tone; verify claims within the provided context only.
-- Title 70–80 chars; Summary 60–80 words; Body ~200 words (2–3 paragraphs), plain text.
+- Title 70–80 chars; Summary 60–80 words; Body around 600 words (roughly 4–6 paragraphs), plain text with paragraph breaks.
+
 - Category: use the provided default if given, else choose best from: Sports, Politics, Tech, Business, Entertainment, World, Science, Health.
 - Tags: 3–6 short topical keywords (no hashtags).
 - Slug: kebab-case; ensure uniqueness by appending 6 random digits if needed.
@@ -244,15 +274,17 @@ tagsHint=${Array.isArray(defaults.tagsHint) ? defaults.tagsHint.join(", ") : "(n
       "HTTP-Referer": meta.referer,
       "X-Title": "TimelyVoice Automation",
     },
-    body: JSON.stringify({
-      model: useModel,
-      temperature: 0.3,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: user },
-      ],
-    }),
+   body: JSON.stringify({
+    model: useModel,
+    temperature: 0.3,
+    response_format: { type: "json_object" },
+    max_tokens: XGEN_MAX_TOKENS, // ensure enough room for ~600 words
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ],
+  }),
+
   });
 
   if (!res.ok) {
@@ -286,7 +318,7 @@ module.exports = {
   // Generic low-level caller (your other features can keep using it)
   callOpenRouter,
 
-  // Existing flow (official sources)
+  // Existing flow (official sources) — now length-configurable
   generateJSONDraft,
 
   // New dedicated automation flow (Claude 3 Haiku)

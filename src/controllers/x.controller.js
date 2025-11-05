@@ -376,13 +376,13 @@ exports.generateXItem = async (req, res) => {
     const extractText = (item.extract?.text || "").trim();
 
     const draft = await generateJSONDraft({
-      tweetText,
-      extractText,
-      defaults,
-      sources: item.extract?.sources || [],
-      model: modelForXGen,
-    });
-
+   tweetText,
+   extractText,
+   defaults,
+   sources: item.extract?.sources || [],
+   model: modelForXGen,
+   targetWords: parseInt(process.env.XGEN_TARGET_WORDS || "600", 10)
+ });
     // Harden required fields
     if (!draft.title || !draft.title.trim()) {
       draft.title = (extractText || tweetText || `Update from ${item.handle}`)

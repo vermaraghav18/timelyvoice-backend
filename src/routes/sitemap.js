@@ -29,10 +29,11 @@ function markSitemapDirty() {
 /* -------------------------------------------
    Utils
 -------------------------------------------- */
-const ORIGIN =
+const ORIGIN = (
   process.env.FRONTEND_BASE_URL ||
   process.env.SITE_URL ||
-  'http://localhost:5173';
+  'http://localhost:5173'
+).replace(/\/+$/, '').replace(/^http:\/\//, 'https://');
 
 const PUBLICATION_NAME = process.env.PUBLICATION_NAME || 'My News';
 const PUBLICATION_LANGUAGE = process.env.PUBLICATION_LANGUAGE || 'en';

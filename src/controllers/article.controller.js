@@ -102,23 +102,32 @@ exports.getBySlug = async (req, res) => {
     const raw = String(req.params.slug || '').trim();
     if (!raw) return res.status(400).json({ error: 'bad_slug' });
 
-    // Only show published & already-live (publishedAt <= now)
     const publishedFilter = { status: 'published', publishedAt: { $lte: new Date() } };
 
     // 1) Exact match
     let doc = await Article.findOne({ slug: raw, ...publishedFilter }).lean();
     if (doc) return res.json(doc);
 
-    // 2) Fallback: match base OR base-<number>
+    // 2) “base → base-<n>” fallback (your existing behavior)
     const rx = new RegExp(`^${escRegex(raw)}(?:-\\d+)?$`, 'i');
     doc = await Article
       .findOne({ slug: rx, ...publishedFilter })
       .sort({ publishedAt: -1, createdAt: -1 })
       .lean();
+    if (doc) return res.status(308).json({ redirectTo: `/article/${doc.slug}` });
 
-    if (doc) {
-      // Tell client the canonical slug. Your Article.jsx already handles 308 + redirectTo
-      return res.status(308).json({ redirectTo: `/article/${doc.slug}` });
+    // 3) NEW: “base-<randomDigits> → base or base-<n>” fallback
+    //    If client appended a number that doesn’t exist, strip it and find closest.
+    const base = raw.replace(/-\d+$/, '');
+    if (base && base !== raw) {
+      const rxBase = new RegExp(`^${escRegex(base)}(?:-\\d+)?$`, 'i');
+      const doc2 = await Article
+        .findOne({ slug: rxBase, ...publishedFilter })
+        .sort({ publishedAt: -1, createdAt: -1 })
+        .lean();
+      if (doc2) {
+        return res.status(308).json({ redirectTo: `/article/${doc2.slug}` });
+      }
     }
 
     return res.status(404).json({ error: 'not_found' });
@@ -127,6 +136,7 @@ exports.getBySlug = async (req, res) => {
     return res.status(500).json({ error: 'server_error' });
   }
 };
+
 
 exports.create = async (req, res) => {
   try {
