@@ -378,9 +378,15 @@ const loginLimiter = rateLimit({
   message: { error: 'Too many login attempts. Try again later.' }
 });
 
-// Limit only the collector endpoint
-app.use('/analytics/collect', collectLimiter);
-app.use('/analytics', analyticsRouter);
+app.use('/api/analytics/collect', collectLimiter);
+app.use('/api/analytics', analyticsRouter);
+
+// ✅ Simple collector endpoint for frontend pings
+app.post('/api/analytics/collect', (req, res) => {
+  // Accept even if body is empty
+  res.status(204).end();
+});
+
 
 /* -------------------- ENV -------------------- */
 const {
