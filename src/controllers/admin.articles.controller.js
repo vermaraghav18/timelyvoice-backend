@@ -222,6 +222,23 @@ exports.createOne = async (req, res) => {
     finalizeImageFields(article);
 
     const saved = await Article.create(article);
+
+    // ── Telegram auto-post: immediately after save
+    try {
+      const { postArticle } = require('../services/telegram.service');
+      const imageUrl = saved.ogImage || saved.thumbImage || saved.imageUrl || null;
+
+      await postArticle({
+        title: saved.title,
+        summary: saved.excerpt || saved.summary || '',
+        url: `${process.env.SITE_URL || 'https://timelyvoice.com'}/article/${saved.slug}`,
+        imageUrl,
+      });
+    } catch (e) {
+      console.warn('[telegram] post failed (non-blocking):', e?.response?.data || e.message);
+    }
+    // ── End Telegram block
+
     return res.json({ ok: true, id: saved._id, slug: saved.slug });
   } catch (err) {
     console.error('[admin.articles] createOne error:', err);
@@ -265,6 +282,23 @@ exports.importMany = async (req, res) => {
         finalizeImageFields(article);
 
         const saved = await Article.create(article);
+
+        // ── Telegram auto-post per imported item (inside loop, after save)
+        try {
+          const { postArticle } = require('../services/telegram.service');
+          const imageUrl = saved.ogImage || saved.thumbImage || saved.imageUrl || null;
+
+          await postArticle({
+            title: saved.title,
+            summary: saved.excerpt || saved.summary || '',
+            url: `${process.env.SITE_URL || 'https://timelyvoice.com'}/article/${saved.slug}`,
+            imageUrl,
+          });
+        } catch (e) {
+          console.warn('[telegram] post failed (non-blocking):', e?.response?.data || e.message);
+        }
+        // ── End Telegram block
+
         results.push({ ok: true, id: saved._id, slug: saved.slug });
       } catch (e) {
         const errMsg = String(e?.message || e);

@@ -1,46 +1,28 @@
-// backend/src/models/XItem.js
-"use strict";
-const mongoose = require("mongoose");
+const mongoose = require('mongoose');
 
-const XItemSchema = new mongoose.Schema(
-  {
-    xId: { type: String, required: true, index: true }, // tweet id
-    handle: { type: String, required: true, index: true }, // e.g. "MEAIndia"
-    tweetedAt: { type: Date, index: true },
+const xItemSchema = new mongoose.Schema({
+  handle: { type: String, index: true },
+  xId: { type: String, unique: true, index: true }, // tweet id
+  text: { type: String, default: '' },
+  tweetedAt: { type: Date, index: true },
+  urls: { type: [String], default: [] },
+  media: { type: [Object], default: [] },
 
-    text: { type: String, default: "" },
-    html: { type: String, default: "" },
+  // Manual pipeline states: new -> extracted -> generated -> drafted
+  status: { type: String, enum: ['new', 'extracted', 'generated', 'drafted'], default: 'new', index: true },
 
-    media: [{ type: { type: String }, url: String }], // optional
-    urls: { type: [String], default: [] },            // expanded URLs in tweet (if any)
+  // Step data
+  extractedText: { type: String, default: '' },    // after Extract
+  generated: {
+    title: String,
+    summary: String,
+    body: String,
+    tags: [String],
+    category: String
+  },                                               // after Generate
 
-    status: {
-      type: String,
-      enum: ["new", "extracted", "generated", "ready", "drafted", "skipped"],
-      default: "new",
-      index: true,
-    },
+  // Link to created article (after Draft)
+  articleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Article' }
+}, { timestamps: true });
 
-    extract: {
-      text: String,
-      html: String,
-      sources: [
-        {
-          url: String,
-          score: Number,
-          why: String,
-          title: String,
-          publishedAt: Date,
-        },
-      ],
-    },
-
-    generated: { type: Object, default: null }, // your JSON draft
-    articleId: { type: mongoose.Schema.Types.ObjectId, ref: "Article" },
-
-    error: { type: String, default: "" },
-  },
-  { timestamps: true }
-);
-
-module.exports = mongoose.model("XItem", XItemSchema);
+module.exports = mongoose.models.XItem || mongoose.model('XItem', xItemSchema);

@@ -13,6 +13,7 @@ const fetch = global.fetch || require("node-fetch");
 const FeedSource = require("../models/FeedSource");
 const FeedItem = require("../models/FeedItem");
 const Article = require("../models/Article");
+const XSource = require("../models/XSource"); // <-- NEW
 
 const { chooseHeroImage } = require("../services/imagePicker");
 const { finalizeArticleImages } = require("../services/finalizeArticleImages");
@@ -175,7 +176,54 @@ exports.pingAutomation = async (_req, res) => {
   }
 };
 
-/* -------------------- Endpoints -------------------- */
+/* -------------------- X Sources (CRUD) -------------------- */
+
+// GET /api/automation/x/sources
+exports.listXSources = async (_req, res) => {
+  const items = await XSource.find().sort({ createdAt: -1 }).lean();
+  res.json({ items });
+};
+
+// POST /api/automation/x/sources
+exports.createXSource = async (req, res) => {
+  const body = req.body || {};
+  const handle = String(body.handle || "").replace(/^@/, "").trim().toLowerCase();
+  if (!handle) return res.status(400).json({ error: "handle_required" });
+
+  const doc = await XSource.findOneAndUpdate(
+    { handle },
+    {
+      $setOnInsert: {
+        handle,
+        label: body.label || "",
+        enabled: body.enabled !== false,
+        defaultAuthor: body.defaultAuthor || "Desk",
+        defaultCategory: body.defaultCategory || "General",
+      },
+    },
+    { new: true, upsert: true }
+  );
+  res.status(201).json(doc);
+};
+
+// PATCH /api/automation/x/sources/:id
+exports.updateXSource = async (req, res) => {
+  const body = { ...(req.body || {}) };
+  if (typeof body.handle === "string") {
+    body.handle = body.handle.replace(/^@/, "").trim().toLowerCase();
+  }
+  const doc = await XSource.findByIdAndUpdate(req.params.id, body, { new: true });
+  if (!doc) return res.status(404).json({ error: "not_found" });
+  res.json(doc);
+};
+
+// DELETE /api/automation/x/sources/:id
+exports.deleteXSource = async (req, res) => {
+  const r = await XSource.deleteOne({ _id: req.params.id });
+  res.json({ ok: true, deleted: r?.deletedCount || 0 });
+};
+
+/* -------------------- Feeds -------------------- */
 
 // GET /api/automation/feeds
 exports.getFeeds = async (_req, res) => {
@@ -282,7 +330,7 @@ exports._fetchSingleFeedInternal = async (feedDoc) => {
   const rss = await parser.parseURL(feedDoc.url);
   let created = 0, skipped = 0;
 
-  for (const item of rss.items || []) {
+  for (const item of (rss.items || [])) {
     const link = item.link || item.guid;
     if (!link) { skipped++; continue; }
 
@@ -338,6 +386,8 @@ exports.fetchAllFeeds = async (_req, res) => {
   }
   res.json({ ok: true, feeds: feeds.length, created: totalCreated, skipped: totalSkipped, results: perFeed });
 };
+
+/* -------------------- Items -------------------- */
 
 // GET /api/automation/items
 exports.listItems = async (req, res) => {
@@ -590,7 +640,7 @@ exports.createDraft = async (req, res) => {
     category: g.category || "General",
     status: "draft",
     publishAt: toValidDate(g.publishAt || Date.now()),
-    imageUrl: g.imageUrl || null,         // normalize empties
+    imageUrl: g.imageUrl || null,
     imagePublicId: g.imagePublicId || null,
     imageAlt: g.imageAlt || g.title || "",
     metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
@@ -603,7 +653,6 @@ exports.createDraft = async (req, res) => {
     sourceUrl: item.link,
   };
 
-  // ← This call guarantees publicId + hero + og + thumb even if imageUrl is empty
   const fin = await finalizeArticleImages({
     title: payload.title,
     summary: payload.summary,

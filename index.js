@@ -1,18 +1,29 @@
-// Top of file (only if Node < 18)
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-require('./src/lib/cloudinary'); 
+// backend/index.js — top of file
+
+// 1) Load env FIRST
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+
+// 2) Polyfill fetch for Node < 18
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
+// 3) Single configured Cloudinary instance
+const cloudinary = require('./src/lib/cloudinary');
+
+// 4) Core deps
 const slugify = require('slugify');
 const express = require('express');
 const compression = require('compression');
+const jwt = require('jsonwebtoken');
+
+const rateLimit = require('express-rate-limit');
+const cors = require('cors');          // ✅ keep only this one
+const mongoose = require('mongoose');
+
+// 5) Middleware & routers
 const analyticsBotFilter = require('./middleware/analyticsBotFilter');
 const analyticsRouter = require('./routes/analytics');
-const jwt = require('jsonwebtoken');
-const rateLimit = require('express-rate-limit');
-const robotsRoute = require("./src/routes/robots");
-
-
+const robotsRoute = require('./src/routes/robots');
 
 const {
   router: sitemapRouter,
@@ -20,35 +31,56 @@ const {
   setModels: setSitemapModels
 } = require('./src/routes/sitemap');
 
-
-const mongoose = require('mongoose');
-const cloudinary = require('cloudinary').v2;
-
 const geoMiddleware = require('./middleware/geo');
 const breakingRoutes = require('./routes/breaking');
 const tickerRoutes = require('./routes/ticker');
 
-// ✅ ADD THIS LINE (so the Article model is registered first)
-const Article = require('./src/models/Article');
-
-// keep routes below
 const sectionsRouter = require('./src/routes/sections');
-const sectionsV2 = require("./src/routes/sectionsV2");
-const adminAdsRouter = require("./src/routes/admin.ads.routes");
+const sectionsV2 = require('./src/routes/sectionsV2');
+const adminAdsRouter = require('./src/routes/admin.ads.routes');
 
-require('./cron'); // periodic rollup jobs
-
-const automationRoutes = require("./src/routes/automation.routes");
-const xRoutes = require("./src/routes/x");
-const automationX = require("./src/routes/automation/x");
-const automationController = require("./src/controllers/automation.controller");
 const planImageRoutes = require('./src/routes/planImage.routes');
 
-// === MEDIA step imports ===
+
+// 6) Models registered early
+const Article = require('./src/models/Article');
+const cookieParser = require("cookie-parser");
+
+const XSource = require('./src/models/XSource');  // <-- ADD
+const XItem   = require('./src/models/XItem');    // <-- ADD
+
+// 7) Cron jobs
+require('./cron');
+
+// 8) Upload utils
 const multer = require('multer');
 const stream = require('stream');
 
+// 9) App init
 const app = express();
+app.use(cookieParser());
+
+
+
+
+// --- Admin auth guard for protected routes (JWT, role=admin) ---
+function auth(req, res, next) {
+  const { JWT_SECRET } = process.env;
+
+  let token = null;
+  const h = req.headers.authorization || "";
+  if (h.startsWith("Bearer ")) token = h.slice(7);
+  if (!token && req.cookies) token = req.cookies.token || null;
+
+  try {
+    const payload = jwt.verify(token || "", JWT_SECRET);
+    if (!payload || payload.role !== "admin") throw new Error("bad");
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+}
+
 
 /* -------------------- Tiny in-memory cache for hot GET endpoints -------------------- */
 const cache = new Map(); // key -> { data, exp }
@@ -83,7 +115,6 @@ function cacheRoute(ttlMs = 60_000) {
 }
 
 /* -------------------- CORS (unified) -------------------- */
-const cors = require('cors');
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -199,6 +230,8 @@ app.use((req, res, next) => {
    limit: '10mb'
  }));
 
+ const xAutoRoutes = require("./src/automation/x/x.routes");
+app.use("/api/automation/x", xAutoRoutes); 
 
 
 
@@ -219,7 +252,7 @@ const adminArticlesRouter = require('./src/routes/admin.articles.routes');
 // [ADMIN_ARTICLES_ROUTE_MOUNT] Add this near other app.use(...) mounts
 app.use('/api/admin/articles', adminArticlesRouter);
 
-app.options(/.*/, cors(corsOptions)); // ensure preflight OPTIONS succeeds
+
 app.use("/", robotsRoute);
 // Cached versions of high-traffic endpoints
 app.use('/api/breaking',  cacheRoute(30_000), breakingRoutes);
@@ -227,8 +260,9 @@ app.use('/api/ticker',    cacheRoute(30_000), tickerRoutes);
 app.use('/api/sections',  cacheRoute(60_000), sectionsRouter);
 app.use('/api/top-news',  cacheRoute(30_000), require("./src/routes/topnews"));
 
-app.use("/api/automation", automationRoutes);  
-app.use('/api/articles', planImageRoutes);
+
+
+app.use('/api/plan-image', planImageRoutes);
 
 
 function clearCache(prefix = '') {
@@ -289,25 +323,9 @@ app.use(async (req, res, next) => {
 
 
 
-// --- Simple automation poller (pulls enabled feeds periodically) ---
-const AUTO_ENABLED = String(process.env.AUTMOTION_ENABLED || 'false') === 'true';
-const AUTO_INTERVAL = Math.max(parseInt(process.env.AUTMOTION_INTERVAL_SECONDS || '300', 10), 60) * 1000;
-
-if (AUTO_ENABLED) {
-  console.log(`[automation] enabled; polling every ${AUTO_INTERVAL / 1000}s`);
-  setInterval(async () => {
-    try {
-      await automationController.fetchAllFeeds({}, { json: () => {} });
-      console.log('[automation] fetchAllFeeds ok');
-    } catch (e) {
-      console.error('[automation] fetchAllFeeds error', e?.message || e);
-    }
-  }, AUTO_INTERVAL);
-}
 
 
-app.use("/api/x", xRoutes);
-app.use("/api/automation/x", automationX);
+
 app.use("/api/admin/ads", adminAdsRouter);
 
 
@@ -430,6 +448,16 @@ app.get('/api/dev/echo-geo', (req, res) => {
   res.json({ geo: req.geo });
 });
 
+app.get('/api/dev/cloudinary-config', (_req, res) => {
+  const cfg = require('./src/lib/cloudinary').config();
+  res.json({
+    cloud_name: cfg.cloud_name || null,
+    has_key: !!cfg.api_key,
+    secure: cfg.secure === true
+  });
+});
+
+
 app.get('/api/dev/test-image-pick', async (req, res) => {
   const title    = String(req.query.title || '');
   const tags     = String(req.query.tags || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -437,6 +465,19 @@ app.get('/api/dev/test-image-pick', async (req, res) => {
 
   const picked = await pickBestImageForArticle({ title, tags, category });
   res.json({ title, tags, category, picked });
+});
+
+// Quick Nitter RSS probe: /api/dev/nitter-probe?handle=narendramodi
+app.get('/api/dev/nitter-probe', async (req, res) => {
+  try {
+    const handle = String(req.query.handle || '').replace(/^@/, '');
+    if (!handle) return res.status(400).json({ ok: false, error: 'handle required' });
+    const { debugFetchTimeline } = require('./src/services/x.fetch');
+    const out = await debugFetchTimeline({ handle, limit: 5 });
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 
@@ -559,7 +600,7 @@ const mediaSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 mediaSchema.index({ createdAt: -1 });
-mediaSchema.index({ publicId: 1 }, { unique: true });
+
 
 const Media    = mongoose.models.Media    || mongoose.model('Media', mediaSchema);
 
@@ -752,6 +793,18 @@ async function normalizeIncomingArticle(input = {}) {
     ogImage,
   } = input || {};
 
+  // normalize status early
+const allowedStatus = new Set(['draft', 'published']);
+const normalizedStatus = allowedStatus.has(String(status || 'draft').toLowerCase())
+  ? String(status).toLowerCase()
+  : 'draft';
+
+// compute publishAt/publishedAt based on normalizedStatus
+const finalPublishAt =
+  publishAt ? new Date(publishAt)
+            : (normalizedStatus === 'published' ? new Date() : undefined);
+
+
   if (!title || !summary || !author || !body) {
     throw new Error('Missing fields: title, summary, author, body are required');
   }
@@ -803,32 +856,37 @@ async function normalizeIncomingArticle(input = {}) {
   }
 
   const doc = {
-    title,
-    slug,
-    summary,
-    author,
-    body,
-    category: categoryName,
-    tags: tagsByName,
+  title,
+  slug,
+  summary,
+  author,
+  body,
+  category: categoryName,
+  tags: tagsByName,
 
-    // ✅ Apply autopick results when available
-    imageUrl: finalImageUrl || imageUrl || '',
-    imagePublicId: finalImagePublicId || imagePublicId || '',
-    ogImage: finalOgImage || ogImage || '',
+  // ✅ Apply autopick results when available
+  imageUrl: finalImageUrl || imageUrl || '',
+  imagePublicId: finalImagePublicId || imagePublicId || '',
+  ogImage: finalOgImage || ogImage || '',
 
-    imageAlt: (imageAlt || title || ''),
-    metaTitle: (metaTitle || '').slice(0, 80),
-    metaDesc: (metaDesc || '').slice(0, 200),
+  imageAlt: (imageAlt || title || ''),
+  metaTitle: (metaTitle || '').slice(0, 80),
+  metaDesc: (metaDesc || '').slice(0, 200),
 
-    readingTime: estimateReadingTime(body),
+  readingTime: estimateReadingTime(body),
 
-    status,
-    publishAt: publishAt ? new Date(publishAt) : new Date(),
-    publishedAt: new Date(),
+  status: normalizedStatus,
+  publishAt: finalPublishAt,
 
-    geoMode: sanitizedGeoMode,
-    geoAreas: sanitizedGeoAreas
-  };  
+  geoMode: sanitizedGeoMode,
+  geoAreas: sanitizedGeoAreas
+};
+
+// only set publishedAt if actually published
+if (normalizedStatus === 'published') {
+  doc.publishedAt = new Date();
+}
+
 
    // 🔽 add this line
   await ensureArticleHasImage(doc);
@@ -1155,6 +1213,13 @@ app.post('/api/articles', auth, async (req, res) => {
     ogImage,
   } = req.body || {};
 
+    // normalize status
+  const allowedStatus = new Set(['draft', 'published']);
+  const normalizedStatus = allowedStatus.has(String(status || 'draft').toLowerCase())
+    ? String(status).toLowerCase()
+    : 'draft';
+
+
   if (!title || !summary || !author || !body) {
     return res.status(400).json({ error: 'Missing fields' });
   }
@@ -1199,10 +1264,10 @@ app.post('/api/articles', auth, async (req, res) => {
     }
   }
 
-  // decide publishAt
 const finalPublishAt =
   publishAt ? new Date(publishAt)
-            : (String(status) === 'published' ? new Date() : undefined);
+            : (normalizedStatus === 'published' ? new Date() : undefined);
+
 
 const baseDoc = {
   title, slug, summary, author, body,
@@ -1219,7 +1284,7 @@ const baseDoc = {
 
   readingTime: estimateReadingTime(body),
 
-  status,
+  status: normalizedStatus,
   publishAt: finalPublishAt,
 
   geoMode: sanitizedGeoMode,
@@ -1231,7 +1296,7 @@ const baseDoc = {
 // 🔽 add this
 await ensureArticleHasImage(baseDoc);
 
-if (String(status) === 'published') {
+if (normalizedStatus === 'published') {
   baseDoc.publishedAt = new Date();
 } else {
   baseDoc.publishedAt = undefined;
@@ -1413,11 +1478,15 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
   }
 
   // If moving to published, ensure publishAt/publishedAt exist
-if (status !== undefined && String(status) === 'published') {
-  if (!update.publishAt && !existing.publishAt) {
-    update.publishAt = new Date();      // ✅ makes it visible now
+if (status !== undefined) {
+  const s = String(status).toLowerCase();
+  update.status = (s === 'published') ? 'published' : 'draft';
+  if (s === 'published') {
+    if (!update.publishAt && !existing.publishAt) {
+      update.publishAt = new Date();
+    }
+    update.publishedAt = new Date();
   }
-  update.publishedAt = new Date();      // ✅ for sorting/feeds/SSR
 }
 
 
