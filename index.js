@@ -59,12 +59,16 @@ const stream = require('stream');
 const app = express();
 
 
-app.use('/assets',
-  express.static(path.join(__dirname, '../frontend/dist/assets'), {
-    maxAge: '1y',
-    immutable: true,
-  })
-);
+// ✅ Safe static assets mount (won’t crash if frontend/dist doesn’t exist)
+const fs = require('fs');
+const distAssets = path.join(__dirname, '../frontend/dist/assets');
+if (fs.existsSync(distAssets)) {
+  app.use('/assets', express.static(distAssets, { maxAge: '1y', immutable: true }));
+  console.log('[static] Serving /assets from', distAssets);
+} else {
+  console.warn('[static] frontend dist assets not found, skipping /assets mount');
+}
+
 app.use(cookieParser());
 
 const urlNormalize = require('./url-normalize');
