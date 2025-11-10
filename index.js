@@ -172,9 +172,72 @@ if (String(process.env.TRUST_PROXY || 'true') === 'true') {
 // Compress all responses (JSON, HTML, etc.)
 app.use(compression({ threshold: 0 }));
 
-// ✅ Enforce canonical domain and HTTPS
-const canonicalHost = require('./src/middleware/canonicalHost');
-app.use(canonicalHost());
+
+// ✅ Only enforce canonical domain/https in production
+if (process.env.NODE_ENV === 'production') {
+  const canonicalHost = require('./src/middleware/canonicalHost');
+  app.use(canonicalHost());
+}
+
+// === Canonical URL normalizer (301 redirects) ===
+// Only for GET/HEAD. Skip API/SSR/assets/robots/sitemap/etc.
+// In dev, you can disable this entirely by gating on NODE_ENV.
+app.use((req, res, next) => {
+  try {
+    // Only normalize real page navigations
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+
+    const p = req.path || '';
+    // Never touch API or non-page paths
+    const skip =
+      p.startsWith('/api/') ||
+      p.startsWith('/ssr/') ||
+      p.startsWith('/rss') ||
+      p.startsWith('/assets') ||
+      p === '/robots.txt' ||
+      p.startsWith('/sitemap');
+    if (skip) return next();
+
+    const host  = req.get('host');
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http');
+    const u = new URL(`${proto}://${host}${req.originalUrl}`);
+
+    const beforePath   = u.pathname;
+    const beforeSearch = u.search; // includes leading "?" when present
+
+    // 1) strip tracking params
+    ['utm_source','utm_medium','utm_campaign','utm_term','utm_content','fbclid','gclid']
+      .forEach(k => u.searchParams.delete(k));
+
+    // 2) normalize path:
+    //    - no trailing slash (except root)
+    //    - lower-case slug for /category|/tag|/author/:slug
+    let newPath = beforePath;
+    if (newPath !== '/' && newPath.endsWith('/')) newPath = newPath.replace(/\/+$/, '');
+    newPath = newPath.replace(
+      /^\/(category|tag|author)\/([^\/]+)(.*)$/,
+      (_m, seg, slug, rest) => `/${seg}/${slug.toLowerCase()}${rest || ''}`
+    );
+
+    // Rebuild search from params
+    const searchStr = u.searchParams.toString();
+    const newSearch = searchStr ? `?${searchStr}` : '';
+
+    const changed = (newPath !== beforePath) || (newSearch !== beforeSearch);
+
+    if (changed) {
+      u.pathname = newPath;
+      u.search   = newSearch;
+      // redirect to path+query only (same host)
+      return res.redirect(301, u.pathname + u.search);
+    }
+    return next();
+  } catch {
+    return next();
+  }
+});
+
+// ===============================================
 
 
 // Strong ETags let browsers/CDNs validate cached JSON quickly
@@ -2364,6 +2427,30 @@ function cleanSummary(str = '') {
     .replace(/\[oaicite:.*?\]/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+// --- Safe renderable image resolver (for old or missing Cloudinary links) ---
+function ensureRenderableImage(a) {
+  const FALLBACK =
+    process.env.SITE_FALLBACK_IMG ||
+    'https://res.cloudinary.com/damjdyqj2/image/upload/f_auto,q_auto,w_640/news-images/defaults/fallback-hero';
+
+  // prefer explicit ogImage → cloudinary publicId → imageUrl → fallback
+  if (a.ogImage && /^https?:\/\//i.test(a.ogImage)) return a.ogImage;
+
+  if (a.imagePublicId) {
+    const cloudinary = require('./src/lib/cloudinary');
+    return cloudinary.url(a.imagePublicId, {
+      width: 640,
+      crop: 'fill',
+      format: 'jpg',
+      secure: true,
+    });
+  }
+
+  if (a.imageUrl && /^https?:\/\//i.test(a.imageUrl)) return a.imageUrl;
+
+  return FALLBACK;
 }
 
 // --- OpenRouter key sanity ping (returns model list on success) ---
