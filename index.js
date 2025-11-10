@@ -1,6 +1,5 @@
 // backend/index.js — top of file
 
-// 1) Load env FIRST
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
@@ -58,10 +57,26 @@ const stream = require('stream');
 
 // 9) App init
 const app = express();
+
+
+app.use('/assets',
+  express.static(path.join(__dirname, '../frontend/dist/assets'), {
+    maxAge: '1y',
+    immutable: true,
+  })
+);
 app.use(cookieParser());
 
+const urlNormalize = require('./url-normalize');
+app.use(urlNormalize);
 
 
+
+app.get('/ads.txt', (_req, res) => {
+  res.type('text/plain').send(
+    'google.com, pub-8472487092329023, DIRECT, f08c47fec0942fa0'
+  );
+});
 
 // --- Admin auth guard for protected routes (JWT, role=admin) ---
 function auth(req, res, next) {
@@ -180,62 +195,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // === Canonical URL normalizer (301 redirects) ===
-// Only for GET/HEAD. Skip API/SSR/assets/robots/sitemap/etc.
-// In dev, you can disable this entirely by gating on NODE_ENV.
-app.use((req, res, next) => {
-  try {
-    // Only normalize real page navigations
-    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
 
-    const p = req.path || '';
-    // Never touch API or non-page paths
-    const skip =
-      p.startsWith('/api/') ||
-      p.startsWith('/ssr/') ||
-      p.startsWith('/rss') ||
-      p.startsWith('/assets') ||
-      p === '/robots.txt' ||
-      p.startsWith('/sitemap');
-    if (skip) return next();
-
-    const host  = req.get('host');
-    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http');
-    const u = new URL(`${proto}://${host}${req.originalUrl}`);
-
-    const beforePath   = u.pathname;
-    const beforeSearch = u.search; // includes leading "?" when present
-
-    // 1) strip tracking params
-    ['utm_source','utm_medium','utm_campaign','utm_term','utm_content','fbclid','gclid']
-      .forEach(k => u.searchParams.delete(k));
-
-    // 2) normalize path:
-    //    - no trailing slash (except root)
-    //    - lower-case slug for /category|/tag|/author/:slug
-    let newPath = beforePath;
-    if (newPath !== '/' && newPath.endsWith('/')) newPath = newPath.replace(/\/+$/, '');
-    newPath = newPath.replace(
-      /^\/(category|tag|author)\/([^\/]+)(.*)$/,
-      (_m, seg, slug, rest) => `/${seg}/${slug.toLowerCase()}${rest || ''}`
-    );
-
-    // Rebuild search from params
-    const searchStr = u.searchParams.toString();
-    const newSearch = searchStr ? `?${searchStr}` : '';
-
-    const changed = (newPath !== beforePath) || (newSearch !== beforeSearch);
-
-    if (changed) {
-      u.pathname = newPath;
-      u.search   = newSearch;
-      // redirect to path+query only (same host)
-      return res.redirect(301, u.pathname + u.search);
-    }
-    return next();
-  } catch {
-    return next();
-  }
-});
 
 // ===============================================
 
@@ -739,29 +699,33 @@ async function ensureUniqueTagSlug(name, desired) {
   return s;
 }
 
-/* -------------------- Auth helpers -------------------- */
+// keep ONE copy of these helpers in a single place
 function signToken() { return jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '6h' }); }
+
 function auth(req, res, next) {
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing token' });
+  let token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token && req.cookies) token = req.cookies.token || null;
+
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token || '', JWT_SECRET);
     if (decoded.role !== 'admin') throw new Error('not admin');
     req.user = { role: 'admin' };
     next();
   } catch {
-    res.status(401).json({ error: 'Invalid or expired token' });
+    res.status(401).json({ error: 'Invalid or missing token' });
   }
 }
+
 function optionalAuth(req, _res, next) {
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return next();
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded.role === 'admin') req.user = { role: 'admin' };
-  } catch { /* ignore */ }
+  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.cookies?.token || null);
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded.role === 'admin') req.user = { role: 'admin' };
+    } catch { /* ignore */ }
+  }
   next();
 }
 
@@ -2474,6 +2438,10 @@ app.get("/api/automation/_debug/openrouter/ping", async (req, res) => {
   }
 });
 
+// ---- SPA catch-all with server-side canonical injection (MUST be last) ----
+const canonicalMiddleware = require('./canonical');
+app.use(canonicalMiddleware);
+
 // --- Surface server errors in JSON so the Admin can see the real cause ---
 app.use((err, req, res, next) => {
   console.error("[SERVER ERROR]", err);
@@ -2485,6 +2453,9 @@ app.use((err, req, res, next) => {
 process.on("unhandledRejection", (err) => {
   console.error("[UNHANDLED REJECTION]", err);
 });
+
+
+
 
 
 
