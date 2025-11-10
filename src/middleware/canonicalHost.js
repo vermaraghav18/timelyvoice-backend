@@ -1,18 +1,11 @@
 // backend/src/middleware/canonicalHost.js
 /**
- * ---------------------------------------------------------------------
- * Canonical Host Middleware
- * ---------------------------------------------------------------------
- * Enforces:
- *   - HTTPS
- *   - Apex (no www)
- *   - Skips APIs, assets, and backend routes
- *   - Never redirects localhost/dev
- * ---------------------------------------------------------------------
+ * Canonical Host Middleware (safe for bots & feeds)
+ * - Force HTTPS + apex host ONLY for real HTML pageviews
+ * - Never touch XML/TXT/RSS/API/uploads/static etc.
+ * - Never redirect localhost/dev
  */
-
 module.exports = function canonicalHost() {
-  // Normalize apex URL (no trailing slash)
   const FRONTEND_BASE_URL =
     process.env.FRONTEND_BASE_URL ||
     process.env.SITE_URL ||
@@ -22,27 +15,37 @@ module.exports = function canonicalHost() {
   const APEX_HOST = APEX.replace(/^https?:\/\//, ''); // e.g. timelyvoice.com
   const IS_PROD = (process.env.NODE_ENV || '').toLowerCase() === 'production';
 
-  // Paths to skip redirection entirely (non-HTML or API)
-  const SKIP_PATH_PREFIXES = [
+  // Prefixes we never redirect (non-HTML or backend-y)
+  const SKIP_PREFIXES = [
     '/api/',
     '/analytics',
-    '/rss',
     '/ssr',
     '/favicon',
     '/logo',
-    '/robots',
-    '/sitemap',
     '/manifest',
     '/static',
     '/assets',
     '/uploads',
   ];
 
+  // Exact files to skip
+  const SKIP_EXACT = new Set([
+    '/sitemap.xml',
+    '/news-sitemap.xml',
+    '/robots.txt',
+    '/rss.xml',
+  ]);
+
+  // Extensions to skip
+  const SKIP_EXT_RE = /\.(xml|txt|json|webmanifest)$/i;
+
   return function canonicalHostMiddleware(req, res, next) {
     const hostHeader = (req.headers.host || '').toLowerCase();
     const originalUrl = req.originalUrl || req.url || '/';
+    const pathOnly = (req.path || originalUrl.split('?')[0]) || '/';
+    const accept = String(req.headers.accept || '');
 
-    // 1️⃣ Skip in development or localhost
+    // 1) Never enforce in dev/localhost
     if (
       !IS_PROD ||
       hostHeader.startsWith('localhost') ||
@@ -52,28 +55,36 @@ module.exports = function canonicalHost() {
       return next();
     }
 
-    // 2️⃣ Skip backend or non-HTML paths
-    if (SKIP_PATH_PREFIXES.some((prefix) => originalUrl.startsWith(prefix))) {
+    // 2) Skip backend/non-HTML resources
+    if (
+      SKIP_PREFIXES.some((p) => pathOnly.startsWith(p)) ||
+      SKIP_EXACT.has(pathOnly) ||
+      SKIP_EXT_RE.test(pathOnly)
+    ) {
       return next();
     }
 
-    // 3️⃣ Determine if redirect is needed
+    // 3) Only consider canonical redirects for real HTML navigations
+    const wantsHtml = req.method === 'GET' && accept.includes('text/html');
+    if (!wantsHtml) return next();
+
+    // 4) Enforce HTTPS + apex host; avoid redirecting to the same thing
     const isHttps =
       req.secure || req.headers['x-forwarded-proto'] === 'https';
-
     const isWWW = hostHeader.startsWith('www.');
     const cleanHost = isWWW ? hostHeader.slice(4) : hostHeader;
 
     const needsHttps = !isHttps;
     const needsApex = cleanHost !== APEX_HOST;
 
-    // 4️⃣ Redirect if either HTTPS or host mismatch
     if (needsHttps || needsApex) {
-      const redirectUrl = `https://${APEX_HOST}${originalUrl}`;
-      return res.redirect(301, redirectUrl);
+      const dest = `https://${APEX_HOST}${originalUrl}`;
+      // If we're already at the final dest, don't loop
+      if (hostHeader === APEX_HOST && isHttps) return next();
+      return res.redirect(308, dest); // 308 keeps method/body; fine for HTML GET
     }
 
-    // ✅ Otherwise proceed
-    next();
+    // 5) Good to go
+    return next();
   };
 };
