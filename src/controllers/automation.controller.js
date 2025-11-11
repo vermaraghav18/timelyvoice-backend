@@ -24,6 +24,7 @@ const { cleanseHtml } = require("../services/sanitize.service");
 const {
   generateAutomationArticleDraft,
   callOpenRouter, // for debug ping
+    generateRSSRewriteJSON,   // <-- ADD THIS
 } = require("../services/openrouter.service");
 
 /* -------------------- Config & helpers -------------------- */
@@ -154,6 +155,127 @@ async function fetchHTML(url) {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return await res.text();
 }
+/** Generate SHORT form (title + 90 words + 300 words, same language) for a single item */
+exports.generateItemShort = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const item = await FeedItem.findById(id);
+    if (!item) return res.status(404).json({ ok: false, error: "Item not found" });
+
+    // If already has the short-form, skip
+    if (item.generated?.summary90 && item.generated?.body300) {
+      return res.json({ ok: true, message: "Already has short-form", id: item._id });
+    }
+
+    const { model, parsed, tokens } = await generateRSSRewriteJSON({
+      sourceName: item.sourceName,
+      rawTitle: item.rawTitle,
+      rawSummary: item.rawSummary,
+      url: item.link,
+    });
+
+    const { title, summary90, body300, language } = parsed || {};
+    if (!title || !summary90 || !body300) {
+      item.status = 'failed';
+      await item.save();
+      return res.status(500).json({ ok: false, error: "Short-form generation returned incomplete fields" });
+    }
+
+    item.generated = {
+      ...(item.generated || {}),
+      title,
+      summary90,
+      body300,
+      language: language || 'auto',
+      model,
+      tokens,
+      costUSD: 0,
+      at: new Date(),
+    };
+
+    // Mark as generated if it wasn't already in a later stage
+    if (!['gen','ready','drafted'].includes(item.status)) {
+      item.status = 'gen';
+    }
+
+    await item.save();
+    res.json({ ok: true, id: item._id, status: item.status });
+  } catch (e) {
+    console.error("[generateItemShort] error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+};
+
+/** Bulk-generate SHORT form: by feedId (optional), only items currently 'fetched' by default */
+exports.bulkGenerateShort = async (req, res) => {
+  try {
+    const { feedId, limit = 20, statuses } = req.body || {};
+    // Default behavior: only pick fresh items; you can pass statuses to widen scope
+    const q = { status: { $in: Array.isArray(statuses) && statuses.length ? statuses : ['fetched'] } };
+    if (feedId) q.feedId = feedId;
+
+    const items = await FeedItem.find(q).sort({ publishedAt: -1 }).limit(Number(limit));
+    let ok = 0, fail = 0;
+    const result = [];
+
+    for (const item of items) {
+      try {
+        // Skip if already has short-form fields
+        if (item.generated?.summary90 && item.generated?.body300) {
+          result.push({ id: String(item._id), skipped: true, reason: 'already_has_short_form' });
+          continue;
+        }
+
+        const { model, parsed, tokens } = await generateRSSRewriteJSON({
+          sourceName: item.sourceName,
+          rawTitle: item.rawTitle,
+          rawSummary: item.rawSummary,
+          url: item.link,
+        });
+
+        const { title, summary90, body300, language } = parsed || {};
+        if (!title || !summary90 || !body300) {
+          item.status = 'failed';
+          await item.save();
+          fail++;
+          result.push({ id: String(item._id), ok: false, error: "incomplete_fields" });
+          continue;
+        }
+
+        item.generated = {
+          ...(item.generated || {}),
+          title,
+          summary90,
+          body300,
+          language: language || 'auto',
+          model,
+          tokens,
+          costUSD: 0,
+          at: new Date(),
+        };
+
+        if (!['gen','ready','drafted'].includes(item.status)) {
+          item.status = 'gen';
+        }
+
+        await item.save();
+        ok++;
+        result.push({ id: String(item._id), ok: true });
+      } catch (e) {
+        console.warn("[bulkGenerateShort] item failed:", item._id, e.message);
+        item.status = 'failed';
+        await item.save();
+        fail++;
+        result.push({ id: String(item._id), ok: false, error: e.message });
+      }
+    }
+
+    res.json({ ok: true, processed: items.length, success: ok, failed: fail, results: result });
+  } catch (e) {
+    console.error("[bulkGenerateShort] error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+};
 
 /* -------------------- Debug -------------------- */
 exports.pingAutomation = async (_req, res) => {

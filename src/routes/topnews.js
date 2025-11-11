@@ -2,7 +2,16 @@
 const router = require("express").Router();
 const Article = require("../models/Article");
 
-/** small helpers copied from sectionsPlan.service.js */
+// Category model (exists in this project)
+let Category;
+try {
+  Category = require("../models/Category");
+} catch (e) {
+  // If model path differs, adjust require accordingly.
+  Category = null;
+}
+
+/** ------- helpers ------- */
 function normalizeMedia(a) {
   const cover = a.cover;
   const imageUrl =
@@ -19,7 +28,74 @@ function normalizeMedia(a) {
 
   return { imageUrl, imageAlt };
 }
-function stripArticleFields(a) {
+
+const HEX24 = /^[a-f0-9]{24}$/i;
+
+// category map cache (refresh every 60s)
+const catCache = {
+  ts: 0,
+  map: new Map(), // idStr -> { name, slug }
+};
+async function getCategoryMap() {
+  // If no Category model, just return existing (may be empty)
+  if (!Category) return catCache.map;
+
+  const now = Date.now();
+  if (now - catCache.ts > 60 * 1000 || catCache.map.size === 0) {
+    const rows = await Category.find({})
+      .select("_id name slug")
+      .lean();
+
+    const m = new Map();
+    for (const c of rows) {
+      const id = (c._id && c._id.toString()) || "";
+      m.set(id, { name: c.name || c.slug || "General", slug: c.slug || c.name || "general" });
+    }
+    catCache.map = m;
+    catCache.ts = now;
+  }
+  return catCache.map;
+}
+
+function resolveCategoryLabel(cat, catMap) {
+  // string name
+  if (typeof cat === "string") {
+    // If it's an ObjectId-looking string, try to resolve
+    if (HEX24.test(cat)) {
+      const hit = catMap.get(cat);
+      if (hit) return hit.name;
+      return "General";
+    }
+    // otherwise it is already a human label
+    return cat;
+  }
+
+  // object with name/slug
+  if (cat && typeof cat === "object") {
+    // mongoose ObjectId instance
+    if (cat._bsontype === "ObjectId" || typeof cat.toString === "function") {
+      const id = cat.toString();
+      if (HEX24.test(id)) {
+        const hit = catMap.get(id);
+        if (hit) return hit.name;
+        return "General";
+      }
+    }
+    // embedded doc { id|_id, name, slug }
+    const name = cat.name || cat.slug;
+    if (name) return name;
+    const id = cat.id || cat._id;
+    if (id) {
+      const idStr = id.toString();
+      const hit = catMap.get(idStr);
+      if (hit) return hit.name;
+    }
+  }
+
+  return "General";
+}
+
+function stripArticleFields(a, catMap) {
   const { imageUrl, imageAlt } = normalizeMedia(a);
   return {
     id: a._id,
@@ -30,27 +106,14 @@ function stripArticleFields(a) {
     imageAlt,
     publishedAt: a.publishedAt,
     author: a.author,
-    category: a.category,
+    category: resolveCategoryLabel(a.category, catMap), // <-- always a clean string
   };
 }
-
-// Only main heads (exclude cities/states)
-const MAIN_CATEGORIES = [
-  "World",
-  "Politics",
-  "Business",
-  "Entertainment",
-  "General",
-  "Health",
-  "Science",
-  "Sports",
-  "Tech",
-];
 
 /**
  * GET /api/top-news
  * query: ?limit=50&page=1
- * Returns newest-first across MAIN_CATEGORIES.
+ * Newest first by publishedAt (with fallbacks).
  */
 router.get("/", async (req, res, next) => {
   try {
@@ -61,20 +124,28 @@ router.get("/", async (req, res, next) => {
     const q = {
       status: "published",
       publishedAt: { $ne: null },
-      category: { $in: MAIN_CATEGORIES },
     };
 
-    const rows = await Article.find(q)
-      .select("title slug summary imageUrl imageAlt cover publishedAt author category")
-      .sort({ publishedAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
+    const [catMap, rows] = await Promise.all([
+      getCategoryMap(),
+      Article.find(q)
+        .select(
+          "title slug summary imageUrl imageAlt cover publishedAt updatedAt author category"
+        )
+        .sort({ publishedAt: -1, updatedAt: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+    ]);
+
+    // avoid stale for breaking news page
+    res.set("Cache-Control", "no-store");
 
     res.json({
-      items: rows.map(stripArticleFields),
+      items: rows.map((a) => stripArticleFields(a, catMap)),
       page,
       limit,
+      total: rows.length,
     });
   } catch (err) {
     next(err);

@@ -3,8 +3,10 @@
 /**
  * OpenRouter service (Node 18+)
  * - Keeps your existing official-sources generator (generateJSONDraft)
- * - Adds a dedicated RSS automation generator (generateAutomationArticleDraft)
- * - Supports a separate model/key for automation so it doesn't touch your other models
+ * - Keeps dedicated RSS automation long-form generator (generateAutomationArticleDraft)
+ * - ADDS a short-form RSS rewrite helper (generateRSSRewriteJSON) that returns:
+ *     { model, parsed: { title, summary90, body300, language }, tokens }
+ *   This is intended for the “90 words + 300 words in source language” flow.
  */
 
 // Polyfill fetch for Node < 18 (Node 18+ already has global fetch)
@@ -68,13 +70,15 @@ function safeParseJSON(raw) {
   return JSON.parse(last);
 }
 
-/** Low-level OpenRouter caller that allows model/key overrides */
+/** Low-level OpenRouter caller that allows model/key overrides.
+ *  NOTE: returns ONLY parsed JSON content (no token usage). Keep as-is for existing flows.
+ */
 async function callOpenRouter({
   messages,
   model,
   apiKey,
   temperature = 0.3,
-  max_tokens, // NEW: allow caller to set token budget
+  max_tokens, // allow caller to set token budget
 }) {
   const key =
     (apiKey ||
@@ -127,8 +131,8 @@ async function generateJSONDraft({
   defaults,
   sources,
   model,
-  targetWords,   // NEW: optional override; falls back to env
-  maxTokens,     // NEW: optional override; falls back to env
+  targetWords,   // optional override; falls back to env
+  maxTokens,     // optional override; falls back to env
 }) {
   // Model resolution: prefer explicit override, then xgen env, then default
   const useModel = model || process.env.OPENROUTER_MODEL_XGEN || DEFAULT_MODEL;
@@ -194,7 +198,7 @@ geo.mode=${defaults?.geo?.mode}
 }
 
 // -------------------------------
-// 2) NEW FUNCTION — dedicated to RSS automation pipeline
+// 2) EXISTING FUNCTION — dedicated to RSS automation pipeline (long-form)
 // -------------------------------
 async function generateAutomationArticleDraft({
   extractedText,   // cleaned text from parsed article page(s)
@@ -274,17 +278,16 @@ tagsHint=${Array.isArray(defaults.tagsHint) ? defaults.tagsHint.join(", ") : "(n
       "HTTP-Referer": meta.referer,
       "X-Title": "TimelyVoice Automation",
     },
-   body: JSON.stringify({
-    model: useModel,
-    temperature: 0.3,
-    response_format: { type: "json_object" },
-    max_tokens: XGEN_MAX_TOKENS, // ensure enough room for ~600 words
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: user },
-    ],
-  }),
-
+    body: JSON.stringify({
+      model: useModel,
+      temperature: 0.3,
+      response_format: { type: "json_object" },
+      max_tokens: XGEN_MAX_TOKENS, // ensure enough room for ~600 words
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user },
+      ],
+    }),
   });
 
   if (!res.ok) {
@@ -312,6 +315,106 @@ tagsHint=${Array.isArray(defaults.tagsHint) ? defaults.tagsHint.join(", ") : "(n
 }
 
 // -------------------------------
+// 3) NEW FUNCTION — short-form rewrite for RSS items
+//    Produces JSON: { title, summary90 (~90 words), body300 (~300 words), language }
+//    Returns { model, parsed, tokens } so caller can store token usage if needed.
+// -------------------------------
+async function generateRSSRewriteJSON({
+  sourceName,   // e.g. "BBC World"
+  rawTitle,     // feed item title
+  rawSummary,   // feed item summary/description
+  url,          // original article URL (for reference only)
+  model,        // optional override model
+  apiKey,       // optional override API key
+  maxTokens = 1200, // enough for ~400–600 tokens completion plus overhead
+  temperature = 0.3,
+}) {
+  const key = (apiKey ||
+    process.env.OPENROUTER_API_KEY_AUTOMATION ||
+    process.env.OPENROUTER_API_KEY ||
+    "").trim();
+
+  if (!key) {
+    throw new Error("Missing OpenRouter key for automation (OPENROUTER_API_KEY[_AUTOMATION]).");
+  }
+
+  const useModel = model || AUTOMATION_MODEL;
+  const meta = getHeaderMeta();
+
+  const sys = `You are a newsroom rewrites assistant.
+You must:
+- Detect the article's original language and keep the same language.
+- Create four fields:
+  1) "title": a concise, punchy headline that is accurate and NOT verbatim.
+  2) "summary90": ~90 words (neutral tone).
+  3) "body300": ~300 words, well-structured, neutral, not derivative of the original phrasing.
+  4) "language": ISO language name (e.g., "English", "हिन्दी").
+- Avoid copying phrases from the source; write fresh wording to reduce copyright risk.
+- Do not invent facts. If unsure, keep it generic.
+- Output strictly as a JSON object with keys: title, summary90, body300, language.`;
+
+  const user = `Source: ${sourceName || "(unknown source)"} 
+URL (do not quote): ${url || "n/a"}
+
+Original Title:
+${rawTitle || ""}
+
+Original Summary/Description:
+${rawSummary || ""}
+
+Return JSON only.`;
+
+  const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": meta.referer,
+      "X-Title": meta.title,
+    },
+    body: JSON.stringify({
+      model: useModel,
+      temperature,
+      response_format: { type: "json_object" },
+      max_tokens: maxTokens,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`OpenRouter error ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content ?? "";
+  const parsed = safeParseJSON(content);
+
+  // Optional: soft validation
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("Model returned invalid JSON.");
+  }
+  const must = ["title", "summary90", "body300", "language"];
+  for (const k of must) {
+    if (!parsed[k]) throw new Error(`Model output missing field: ${k}`);
+  }
+
+  const usage = data?.usage || {};
+  return {
+    model: useModel,
+    parsed,
+    tokens: {
+      prompt: usage?.prompt_tokens || 0,
+      completion: usage?.completion_tokens || 0,
+      total: usage?.total_tokens || 0,
+    },
+  };
+}
+
+// -------------------------------
 // Exports
 // -------------------------------
 module.exports = {
@@ -321,6 +424,9 @@ module.exports = {
   // Existing flow (official sources) — now length-configurable
   generateJSONDraft,
 
-  // New dedicated automation flow (Claude 3 Haiku)
+  // Existing dedicated automation flow (long-form article)
   generateAutomationArticleDraft,
+
+  // NEW: Short-form RSS rewrite (title + 90w summary + 300w body, same language)
+  generateRSSRewriteJSON,
 };

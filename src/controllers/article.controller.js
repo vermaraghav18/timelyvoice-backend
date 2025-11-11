@@ -19,12 +19,68 @@ function normalizeEmptyImages(obj = {}) {
   return o;
 }
 
+/** Detect a 24-char hex Mongo ObjectId string */
+function looksLikeObjectId(val) {
+  return typeof val === 'string' && /^[a-f0-9]{24}$/i.test(val);
+}
+
+/**
+ * Normalize the category field on articles so the client always gets:
+ *   category: { id, name, slug } | null
+ *
+ * Works for:
+ *  - Article.category as ObjectId (ref)
+ *  - Article.category as populated object
+ *  - Article.category as string name
+ */
+function normalizeArticlesWithCategories(items, categoriesMapById = new Map(), categoriesMapByName = new Map()) {
+  return items.map((it) => {
+    const a = { ...it };
+
+    // If already populated object with _id/name/slug
+    if (a.category && typeof a.category === 'object' && (a.category._id || a.category.id || a.category.name)) {
+      const id = String(a.category._id || a.category.id || '');
+      const name = a.category.name || null;
+      const slug = a.category.slug || (name ? slugify(name, { lower: true, strict: true }) : null);
+      a.category = name || id ? { id: id || null, name, slug } : null;
+      return a;
+    }
+
+    // If it's an ObjectId string → look up by id
+    if (looksLikeObjectId(a.category)) {
+      const c = categoriesMapById.get(String(a.category));
+      if (c) {
+        a.category = { id: String(c._id), name: c.name || null, slug: c.slug || (c.name ? slugify(c.name, { lower: true, strict: true }) : null) };
+      } else {
+        a.category = { id: String(a.category), name: null, slug: null };
+      }
+      return a;
+    }
+
+    // If it's a plain string (assumed name) → keep as name; try to find slug from name map
+    if (typeof a.category === 'string' && a.category.trim()) {
+      const name = a.category.trim();
+      const c = categoriesMapByName.get(name) || null;
+      a.category = {
+        id: c ? String(c._id) : null,
+        name,
+        slug: c?.slug || slugify(name, { lower: true, strict: true })
+      };
+      return a;
+    }
+
+    // No category
+    a.category = null;
+    return a;
+  });
+}
+
 /**
  * GET /api/articles
  * Query params:
  *   q        - search text (safe regex on title/summary/slug)
  *   status   - defaults to 'published'
- *   category - slug or name; stored as Category.name in Article
+ *   category - slug or name; stored as Category.name in Article (or ref id)
  *   tag      - exact tag match
  *   page     - 1-based page number
  *   limit    - requested page size (hard-capped)
@@ -40,18 +96,29 @@ exports.list = async (req, res) => {
 
     if (req.query.category) {
       const raw = String(req.query.category);
+      // Allow filtering by slug/name even if Article.category is an ObjectId:
+      // - If we find a Category doc, filter by either that doc's _id OR its name (to support both schemas)
+      // - Else fall back to raw name equality (string schema)
       const catDoc = await Category
         .findOne({ $or: [{ slug: raw }, { slug: slugify(raw) }, { name: raw }] })
-        .select('name')
+        .select('_id name')
         .lean();
-      q.category = catDoc ? catDoc.name : raw;
+
+      if (catDoc) {
+        q.$or = [
+          { category: catDoc.name },   // string category schema
+          { category: catDoc._id },    // ref category schema
+        ];
+      } else {
+        q.category = raw; // fallback if name-based only
+      }
     }
 
     if (req.query.tag) q.tags = req.query.tag;
 
     if (req.query.q && String(req.query.q).trim()) {
       const rx = new RegExp(escRegex(String(req.query.q).trim()), 'i');
-      q.$or = [{ title: rx }, { summary: rx }, { slug: rx }];
+      q.$or = (q.$or || []).concat([{ title: rx }, { summary: rx }, { slug: rx }]);
     }
 
     // Show only already-published items when status=published
@@ -66,18 +133,42 @@ exports.list = async (req, res) => {
 
     const SORT = { publishedAt: -1, _id: -1 };
 
+    // Try to populate if Article.category is a ref; if schema uses a string, populate is harmless.
     const cursor = Article
       .find(q, PROJECTION)
       .sort(SORT)
       .skip((page - 1) * limit)
       .limit(limit)
+      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
       .lean({ getters: true })
       .maxTimeMS(5000);
 
-    const [items, total] = await Promise.all([
+    const [rawItems, total] = await Promise.all([
       cursor.exec(),
       Article.countDocuments(q),
     ]);
+
+    // Build lookup maps for any still-unresolved categories (ObjectIds or names)
+    const idSet = new Set();
+    const nameSet = new Set();
+
+    for (const it of rawItems) {
+      const c = it.category;
+      if (!c) continue;
+      if (typeof c === 'object' && (c._id || c.id)) continue; // already populated
+      if (looksLikeObjectId(c)) idSet.add(String(c));
+      else if (typeof c === 'string' && c.trim()) nameSet.add(c.trim());
+    }
+
+    const [docsById, docsByName] = await Promise.all([
+      idSet.size ? Category.find({ _id: { $in: Array.from(idSet) } }).select('_id name slug').lean() : [],
+      nameSet.size ? Category.find({ name: { $in: Array.from(nameSet) } }).select('_id name slug').lean() : [],
+    ]);
+
+    const categoriesMapById = new Map((docsById || []).map(d => [String(d._id), d]));
+    const categoriesMapByName = new Map((docsByName || []).map(d => [d.name, d]));
+
+    const items = normalizeArticlesWithCategories(rawItems, categoriesMapById, categoriesMapByName);
 
     res.json({ page, pageSize: items.length, total, items });
   } catch (err) {
@@ -85,11 +176,6 @@ exports.list = async (req, res) => {
     res.status(500).json({ error: 'Failed to list/search articles' });
   }
 };
-
-/**
- * POST /api/articles
- * Creates an article and guarantees image fields via finalizeArticleImages.
- */
 
 /**
  * GET /api/articles/slug/:slug
@@ -104,9 +190,16 @@ exports.getBySlug = async (req, res) => {
 
     const publishedFilter = { status: 'published', publishedAt: { $lte: new Date() } };
 
-    // 1) Exact match
-    let doc = await Article.findOne({ slug: raw, ...publishedFilter }).lean();
-    if (doc) return res.json(doc);
+    // 1) Exact match (try populate)
+    let doc = await Article.findOne({ slug: raw, ...publishedFilter })
+      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .lean();
+
+    if (doc) {
+      // normalize single doc's category
+      let norm = normalizeArticlesWithCategories([doc]);
+      return res.json(norm[0]);
+    }
 
     // 2) “base → base-<n>” fallback (your existing behavior)
     const rx = new RegExp(`^${escRegex(raw)}(?:-\\d+)?$`, 'i');
@@ -117,7 +210,6 @@ exports.getBySlug = async (req, res) => {
     if (doc) return res.status(308).json({ redirectTo: `/article/${doc.slug}` });
 
     // 3) NEW: “base-<randomDigits> → base or base-<n>” fallback
-    //    If client appended a number that doesn’t exist, strip it and find closest.
     const base = raw.replace(/-\d+$/, '');
     if (base && base !== raw) {
       const rxBase = new RegExp(`^${escRegex(base)}(?:-\\d+)?$`, 'i');
@@ -134,6 +226,85 @@ exports.getBySlug = async (req, res) => {
   } catch (e) {
     console.error('GET /api/articles/slug/* error:', e);
     return res.status(500).json({ error: 'server_error' });
+  }
+};
+
+/**
+ * GET /api/admin/articles
+ * Admin list:
+ * - No default "published" filter (you can pass status if you want)
+ * - Always normalizes category to { id, name, slug }
+ */
+exports.listAdmin = async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const limitReq = Math.max(parseInt(req.query.limit || '0', 10), 0);
+    const limit = Math.min(limitReq || 20, 50);
+
+    const q = {};
+    if (req.query.status) q.status = String(req.query.status).toLowerCase();
+
+    if (req.query.category) {
+      const raw = String(req.query.category);
+      const catDoc = await Category
+        .findOne({ $or: [{ slug: raw }, { slug: slugify(raw) }, { name: raw }] })
+        .select('_id name')
+        .lean();
+      if (catDoc) {
+        q.$or = [{ category: catDoc.name }, { category: catDoc._id }];
+      } else {
+        q.category = raw;
+      }
+    }
+
+    if (req.query.tag) q.tags = req.query.tag;
+
+    if (req.query.q && String(req.query.q).trim()) {
+      const rx = new RegExp(escRegex(String(req.query.q).trim()), 'i');
+      q.$or = (q.$or || []).concat([{ title: rx }, { summary: rx }, { slug: rx }, { body: rx }]);
+    }
+
+    const PROJECTION = { bodyHtml: 0 }; // keep body if your admin preview needs it
+    const SORT = { updatedAt: -1, _id: -1 };
+
+    const cursor = Article.find(q, PROJECTION)
+      .sort(SORT)
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .lean({ getters: true })
+      .maxTimeMS(5000);
+
+    const [rawItems, total] = await Promise.all([
+      cursor.exec(),
+      Article.countDocuments(q),
+    ]);
+
+    // Build lookup maps for any unresolved categories
+    const idSet = new Set();
+    const nameSet = new Set();
+    for (const it of rawItems) {
+      const c = it.category;
+      if (!c) continue;
+      if (typeof c === 'object' && (c._id || c.id)) continue;
+      if (looksLikeObjectId(c)) idSet.add(String(c));
+      else if (typeof c === 'string' && c.trim()) nameSet.add(c.trim());
+    }
+
+    const [docsById, docsByName] = await Promise.all([
+      idSet.size ? Category.find({ _id: { $in: Array.from(idSet) } }).select('_id name slug').lean() : [],
+      nameSet.size ? Category.find({ name: { $in: Array.from(nameSet) } }).select('_id name slug').lean() : [],
+    ]);
+
+    const categoriesMapById = new Map((docsById || []).map(d => [String(d._id), d]));
+    const categoriesMapByName = new Map((docsByName || []).map(d => [d.name, d]));
+
+    const items = normalizeArticlesWithCategories(rawItems, categoriesMapById, categoriesMapByName);
+
+    res.json({ page, pageSize: items.length, total, items });
+  } catch (err) {
+    console.error('GET /api/admin/articles listAdmin error:', err);
+    res.status(500).json({ error: 'Failed to list admin articles' });
   }
 };
 
@@ -235,7 +406,6 @@ exports.update = async (req, res) => {
     }
 
     // 3) Manual image override handling:
-    // If the patch included a new imageUrl and NO imagePublicId, prefer the URL and clear publicId.
     const manualUrlProvided =
       Object.prototype.hasOwnProperty.call(patch, 'imageUrl') &&
       typeof patch.imageUrl === 'string' &&
@@ -244,7 +414,7 @@ exports.update = async (req, res) => {
 
     if (manualUrlProvided) {
       // ensure we use the manual URL
-      doc.imagePublicId = null; // so downstream won't re-override URL with a Cloudinary public id
+      doc.imagePublicId = null;
     }
 
     // If tags were cleared/missing after patch, auto-generate tags again

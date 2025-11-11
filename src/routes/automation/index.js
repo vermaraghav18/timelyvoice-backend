@@ -1,37 +1,31 @@
-// routes/automation/index.js
-const express = require('express');
-const ctrl = require('../../controllers/automation.controller');
-
-
+// backend/src/routes/automation/index.js
+const express = require("express");
 const router = express.Router();
+const ctrl = require("../../controllers/automation.controller");
 
-// Feeds
-router.get('/feeds', ctrl.getFeeds);
-router.post('/feeds', ctrl.createFeed);
-router.patch('/feeds/:id', ctrl.updateFeed);
-router.delete('/feeds/:id', ctrl.deleteFeed);
-router.post('/feeds/:id/fetch', ctrl.fetchFeed);
+// ---------- Feeds ----------
+router.get("/feeds", ctrl.getFeeds);
+router.post("/feeds", ctrl.createFeed);
+router.patch("/feeds/:id", ctrl.updateFeed);
+router.delete("/feeds/:id", ctrl.deleteFeed);
+router.post("/feeds/:id/fetch", ctrl.fetchFeed);
 
-// Items
-router.get('/items', ctrl.listItems);
-router.post('/items/:id/extract', ctrl.extractItem);
-router.post('/items/:id/generate', ctrl.generateItem);
-router.post('/items/:id/mark-ready', ctrl.markReady);
-router.post('/items/:id/draft', ctrl.createDraft);
+// ---------- Items ----------
+router.get("/items", ctrl.listItems);
+router.post("/items/:id/extract", ctrl.extractItem);
+router.post("/items/:id/generate", ctrl.generateItem);
+router.post("/items/:id/mark-ready", ctrl.markReady);
+router.post("/items/:id/draft", ctrl.createDraft);
 
-// X/Twitter automation
-router.use('/x', require('./x'));
+// ---------- X / Twitter automation ----------
+router.use("/x", require("./x"));
 
-
-// === Global controls: Start / Stop / Status / Run Now ===
+// ---------- Global controls (Start / Stop / Run / Status) ----------
 const { startAutmotion, stopAutmotion, runOnceNow, getStatus } = require("../../jobs/autmotion");
 
-// NOTE: Use your existing admin auth middleware here.
-// If you have `auth` in your index.js, import something like requireAuthAdmin:
-let requireAuthAdmin = (_req, _res, next) => next(); // fallback no-op if missing
+let requireAuthAdmin = (_req, _res, next) => next(); // fallback no-op
 try {
-  // If your project exposes admin auth middleware elsewhere, require it here.
-  // Example:
+  // Uncomment if you have admin middleware:
   // const { requireAuthAdmin: r } = require("../../middleware/auth");
   // requireAuthAdmin = r;
 } catch (_) {}

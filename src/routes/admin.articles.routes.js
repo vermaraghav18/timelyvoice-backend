@@ -6,6 +6,7 @@ const router = express.Router();
 
 // Models
 const Article = require('../models/Article');
+const Category = require('../models/Category');
 
 // Image strategy + variants
 const { decideAndAttach } = require('../services/imageStrategy');
@@ -86,6 +87,84 @@ function finalizeImageFields(article) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
+// CATEGORY NORMALIZATION (so admin never sees ObjectId in UI)
+
+const slugify = require('slugify');
+
+function looksLikeObjectId(val) {
+  return typeof val === 'string' && /^[a-f0-9]{24}$/i.test(val);
+}
+
+function normalizeArticlesWithCategories(items, categoriesMapById = new Map(), categoriesMapByName = new Map()) {
+  return items.map((it) => {
+    const a = { ...it };
+
+    // Already populated object?
+    if (a.category && typeof a.category === 'object' && (a.category._id || a.category.id || a.category.name)) {
+      const id = String(a.category._id || a.category.id || '');
+      const name = a.category.name || null;
+      const slug = a.category.slug || (name ? slugify(name, { lower: true, strict: true }) : null);
+      a.category = name || id ? { id: id || null, name, slug } : null;
+      return a;
+    }
+
+    // ObjectId string
+    if (looksLikeObjectId(a.category)) {
+      const c = categoriesMapById.get(String(a.category));
+      if (c) {
+        a.category = { id: String(c._id), name: c.name || null, slug: c.slug || (c.name ? slugify(c.name, { lower: true, strict: true }) : null) };
+      } else {
+        a.category = { id: String(a.category), name: null, slug: null };
+      }
+      return a;
+    }
+
+    // Plain string name
+    if (typeof a.category === 'string' && a.category.trim()) {
+      const name = a.category.trim();
+      const c = categoriesMapByName.get(name) || null;
+      a.category = {
+        id: c ? String(c._id) : null,
+        name,
+        slug: c?.slug || slugify(name, { lower: true, strict: true })
+      };
+      return a;
+    }
+
+    a.category = null;
+    return a;
+  });
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// CLOUDINARY PUBLIC ID DERIVER (for pasted image URLs)
+
+function deriveCloudinaryPublicIdFromUrl(url = '') {
+  if (typeof url !== 'string' || !url.includes('/image/upload/')) return null;
+  try {
+    // Example: https://res.cloudinary.com/<cloud>/image/upload/c_fill,w_800/v1723456/folder/name/file.jpg
+    const afterUpload = url.split('/image/upload/')[1];
+    if (!afterUpload) return null;
+
+    const clean = afterUpload.split(/[?#]/)[0]; // strip query/hash
+    const segs = clean.split('/');
+
+    let i = 0;
+    // skip transformation segments (contain commas or colon)
+    while (i < segs.length && (segs[i].includes(',') || segs[i].includes(':'))) i++;
+    // skip version like v12345
+    if (i < segs.length && /^v\d+$/i.test(segs[i])) i++;
+
+    const publicPath = segs.slice(i).join('/');
+    if (!publicPath) return null;
+
+    return publicPath.replace(/\.[a-z0-9]+$/i, '') || null; // drop extension
+  } catch {
+    return null;
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
 // CREATE (single) — POST /api/admin/articles
 router.post('/', ctrl.createOne);
 
@@ -105,11 +184,32 @@ router.get('/drafts', async (req, res) => {
       ]
     };
 
-    const drafts = await Article.find(q)
+    const rawDrafts = await Article.find(q)
       .select('_id title category slug status summary imageUrl imagePublicId createdAt updatedAt')
       .sort({ createdAt: -1 })
       .limit(200)
       .lean();
+
+    // normalize categories for drafts as well
+    const idSet = new Set();
+    const nameSet = new Set();
+    for (const it of rawDrafts) {
+      const c = it.category;
+      if (!c) continue;
+      if (typeof c === 'object' && (c._id || c.id)) continue;
+      if (looksLikeObjectId(c)) idSet.add(String(c));
+      else if (typeof c === 'string' && c.trim()) nameSet.add(c.trim());
+    }
+
+    const [docsById, docsByName] = await Promise.all([
+      idSet.size ? Category.find({ _id: { $in: Array.from(idSet) } }).select('_id name slug').lean() : [],
+      nameSet.size ? Category.find({ name: { $in: Array.from(nameSet) } }).select('_id name slug').lean() : [],
+    ]);
+
+    const categoriesMapById = new Map((docsById || []).map(d => [String(d._id), d]));
+    const categoriesMapByName = new Map((docsByName || []).map(d => [d.name, d]));
+
+    const drafts = normalizeArticlesWithCategories(rawDrafts, categoriesMapById, categoriesMapByName);
 
     res.json(drafts);
   } catch (err) {
@@ -117,7 +217,6 @@ router.get('/drafts', async (req, res) => {
     res.status(500).json({ error: 'failed_to_list_drafts' });
   }
 });
-
 
 // DELETE — DELETE /api/admin/articles/:id
 router.delete('/:id', async (req, res) => {
@@ -139,15 +238,27 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-
 // LIST — GET /api/admin/articles
 router.get('/', async (req, res) => {
   try {
     const { status, category, q, page = 1, limit = 20 } = req.query;
 
     const and = [];
-    if (status) and.push({ status });
-    if (category) and.push({ $or: [{ 'category.slug': category }, { category }] });
+    if (status) and.push({ status: String(status).toLowerCase() });
+
+    if (category) {
+      // allow filtering by slug or name when Article.category may be id or name
+      const raw = String(category);
+      const catDoc = await Category
+        .findOne({ $or: [{ slug: raw }, { slug: slugify(raw) }, { name: raw }] })
+        .select('_id name')
+        .lean();
+      if (catDoc) {
+        and.push({ $or: [{ category: catDoc.name }, { category: catDoc._id }] });
+      } else {
+        and.push({ $or: [{ 'category.slug': raw }, { category: raw }] });
+      }
+    }
 
     if (q) {
       const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
@@ -160,15 +271,37 @@ router.get('/', async (req, res) => {
     const perPage = Math.max(1, Math.min(200, parseInt(limit, 10) || 20));
     const skip = (pageNum - 1) * perPage;
 
-    const [items, total] = await Promise.all([
+    const [rawItems, total] = await Promise.all([
       Article.find(query)
-        .select('_id title slug status category summary publishAt updatedAt imageUrl imagePublicId ogImage thumbImage tags')
+        .select('_id title slug status category summary publishedAt updatedAt imageUrl imagePublicId ogImage thumbImage tags')
         .sort({ updatedAt: -1, createdAt: -1 })
         .skip(skip)
         .limit(perPage)
+        .populate({ path: 'category', select: 'name slug', options: { lean: true } })
         .lean(),
       Article.countDocuments(query),
     ]);
+
+    // normalize categories
+    const idSet = new Set();
+    const nameSet = new Set();
+    for (const it of rawItems) {
+      const c = it.category;
+      if (!c) continue;
+      if (typeof c === 'object' && (c._id || c.id)) continue;
+      if (looksLikeObjectId(c)) idSet.add(String(c));
+      else if (typeof c === 'string' && c.trim()) nameSet.add(c.trim());
+    }
+
+    const [docsById, docsByName] = await Promise.all([
+      idSet.size ? Category.find({ _id: { $in: Array.from(idSet) } }).select('_id name slug').lean() : [],
+      nameSet.size ? Category.find({ name: { $in: Array.from(nameSet) } }).select('_id name slug').lean() : [],
+    ]);
+
+    const categoriesMapById = new Map((docsById || []).map(d => [String(d._id), d]));
+    const categoriesMapByName = new Map((docsByName || []).map(d => [d.name, d]));
+
+    const items = normalizeArticlesWithCategories(rawItems, categoriesMapById, categoriesMapByName);
 
     res.json({ items, total, page: pageNum, limit: perPage });
   } catch (err) {
@@ -177,13 +310,16 @@ router.get('/', async (req, res) => {
   }
 });
 
-
 // GET ONE — GET /api/admin/articles/:id
 router.get('/:id', async (req, res) => {
   try {
-    const article = await Article.findById(req.params.id).lean();
-    if (!article) return res.status(404).json({ error: 'not_found' });
-    res.json(article);
+    const raw = await Article.findById(req.params.id)
+      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .lean();
+    if (!raw) return res.status(404).json({ error: 'not_found' });
+
+    const items = normalizeArticlesWithCategories([raw]);
+    res.json(items[0]);
   } catch (err) {
     console.error('[admin.articles] get error', err);
     res.status(500).json({ error: 'failed_to_get_article' });
@@ -203,6 +339,8 @@ router.patch('/:id', async (req, res) => {
       'imageUrl',
       'imagePublicId',
       'imageAlt',
+      'ogImage',          // ✅ added
+      'thumbImage',       // ✅ added
       'status',
       'tags',
       'body',
@@ -232,18 +370,39 @@ router.patch('/:id', async (req, res) => {
       delete patch.imagePublicId; // treat as unset
     }
 
-    // 4) load current, merge, then apply strategy and rebuild URLs
+    // 4) load current, merge
     const current = await Article.findById(req.params.id).lean();
     if (!current) return res.status(404).json({ error: 'not_found' });
 
     const merged = { ...current, ...patch };
 
+    // If a manual URL was provided and no publicId, try to derive one from the URL
+    const manualUrlProvided =
+      Object.prototype.hasOwnProperty.call(patch, 'imageUrl') &&
+      typeof patch.imageUrl === 'string' &&
+      patch.imageUrl.trim() !== '' &&
+      !patch.imagePublicId;
+
+    if (manualUrlProvided && !merged.imagePublicId) {
+      const maybePid = deriveCloudinaryPublicIdFromUrl(merged.imageUrl);
+      if (maybePid) {
+        merged.imagePublicId = maybePid;
+      }
+    }
+
     // ensure we always end up with a valid image (match or default)
     await decideAndAttach(merged, { imageStrategy: 'cloudinary', fallbacks: ['stock'] });
     finalizeImageFields(merged);
 
+    // If still no variants (e.g. non-Cloudinary URL), fall back so admin preview works
+    if (!merged.thumbImage && merged.imageUrl) merged.thumbImage = merged.imageUrl;
+    if (!merged.ogImage && merged.imageUrl) merged.ogImage = merged.imageUrl;
+
     // 5) persist merged (only known keys)
-    const toSaveKeys = allowed.concat(['publishedAt', 'ogImage', 'thumbImage']);
+    const toSaveKeys = [
+      'title','slug','category','summary','imageUrl','imagePublicId','imageAlt',
+      'status','tags','body','bodyHtml','author','publishedAt','ogImage','thumbImage'
+    ];
     const toSave = {};
     for (const k of toSaveKeys) {
       if (merged[k] !== undefined) toSave[k] = merged[k];
@@ -253,10 +412,15 @@ router.patch('/:id', async (req, res) => {
       req.params.id,
       { $set: toSave },
       { new: true }
-    ).lean();
+    )
+      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .lean();
 
     if (!updated) return res.status(404).json({ error: 'not_found' });
-    res.json(updated);
+
+    // normalize category in patch response too
+    const items = normalizeArticlesWithCategories([updated]);
+    res.json(items[0]);
   } catch (err) {
     console.error('[admin.articles] patch error', err);
     res.status(500).json({ error: 'failed_to_update_article' });
@@ -270,17 +434,19 @@ router.post('/:id/publish', async (req, res) => {
       req.params.id,
       { $set: { status: 'published', publishedAt: new Date() } },
       { new: true }
-    ).lean();
+    )
+      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .lean();
 
     if (!updated) return res.status(404).json({ error: 'not_found' });
 
-    // respond immediately to the client
-    res.json(updated);
+    // respond immediately to the client (normalized)
+    const items = normalizeArticlesWithCategories([updated]);
+    res.json(items[0]);
 
     // fire-and-forget social posting (does not block the response)
     try {
       const { publishEverywhere } = require('../services/socialPublisher');
-      // run in background; ignore errors
       Promise.resolve().then(() => publishEverywhere(updated)).catch(() => {});
     } catch (_) {
       // swallow module-load errors silently to avoid breaking publish

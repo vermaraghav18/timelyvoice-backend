@@ -11,9 +11,10 @@ const XItem = require("../models/XItem");
 const Article = require("../models/Article");
 
 // Services
-const { userByUsername, userTweets } = require("../services/x.api");
+const { userByUsername, userTweets, userTweetsViaNitter } = require("../services/x.api");
 const { isGovUrl } = require("../services/govWhitelist");
 const { generateJSONDraft } = require("../services/openrouter.service");
+const { uploadRemoteImage } = require("../services/cloudinary.service"); // ⬅️ NEW
 
 // Node 18+ has global fetch; polyfill if not
 const fetch = global.fetch || require("node-fetch");
@@ -103,13 +104,25 @@ exports.fetchXSource = async (req, res) => {
     const src = await XSource.findById(id);
     if (!src) return res.status(404).json({ ok: false, error: "not found" });
 
-    // Resolve user id from handle
-    const userResp = await userByUsername(src.handle);
-    const userId = userResp?.data?.id;
-    if (!userId) return res.status(400).json({ ok: false, error: "user not found" });
+    // Resolve via official API; fallback to Nitter if auth/rate limits block us
+    let usedFallback = false;
+    let tw;
 
-    // Pull tweets since last seen id (if any)
-    const tw = await userTweets(userId, src.sinceId || "");
+    try {
+      const userResp = await userByUsername(src.handle);
+      const userId = userResp?.data?.id;
+      if (!userId) return res.status(400).json({ ok: false, error: "user not found" });
+      tw = await userTweets(userId, src.sinceId || "");
+    } catch (e) {
+      if ([401, 403, 429].includes(e?.status)) {
+        console.warn(`[fetchXSource] ${src.handle}: ${e.message} — trying Nitter fallback`);
+        tw = await userTweetsViaNitter(src.handle);
+        usedFallback = true;
+      } else {
+        throw e;
+      }
+    }
+
     const data = tw?.data || [];
     const media = tw?.includes?.media || [];
 
@@ -122,7 +135,11 @@ exports.fetchXSource = async (req, res) => {
 
     for (const t of data) {
       const xId = t.id;
-      if (!maxId || BigInt(xId) > BigInt(maxId)) maxId = xId;
+
+      // Only advance sinceId when using official API (Nitter IDs can be synthetic)
+      if (!usedFallback && xId && (!maxId || BigInt(xId) > BigInt(maxId))) {
+        maxId = xId;
+      }
 
       // URLs in entities
       const urls = (t.entities?.urls || [])
@@ -145,10 +162,10 @@ exports.fetchXSource = async (req, res) => {
 
       await XItem.create({
         xId,
-        handle: src.handle,                 // stored without '@'
+        handle: src.handle, // stored without '@'
         tweetedAt: new Date(t.created_at),
         text: t.text || "",
-        html: "",                           // optional rendering later
+        html: "", // optional rendering later
         media: medias,
         urls,
         status: "new",
@@ -156,30 +173,43 @@ exports.fetchXSource = async (req, res) => {
       createdCount++;
     }
 
-    // Advance sinceId checkpoint
-    if (maxId && maxId !== src.sinceId) {
+    // Advance sinceId checkpoint only if we used real X API
+    if (!usedFallback && maxId && maxId !== src.sinceId) {
       src.sinceId = maxId;
       await src.save();
     }
 
-    res.json({ ok: true, created: createdCount });
+    res.json({ ok: true, created: createdCount, fallback: usedFallback ? "nitter" : undefined });
   } catch (e) {
     console.error("[fetchXSource] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
+    const code = e?.status || 500;
+    res.status(code).json({ ok: false, error: e.message || "fetchXSource failed" });
   }
 };
-
 
 // --- helper to fetch by source id (no HTTP response plumbing) ---
 async function fetchSourceById(srcId) {
   const src = await XSource.findById(srcId);
   if (!src) throw new Error("source not found");
 
-  const userResp = await userByUsername(src.handle);
-  const userId = userResp?.data?.id;
-  if (!userId) throw new Error("user not found");
+  let usedFallback = false;
+  let tw;
 
-  const tw = await userTweets(userId, src.sinceId || "");
+  try {
+    const userResp = await userByUsername(src.handle);
+    const userId = userResp?.data?.id;
+    if (!userId) throw new Error("user not found");
+    tw = await userTweets(userId, src.sinceId || "");
+  } catch (e) {
+    if ([401, 403, 429].includes(e?.status)) {
+      console.warn(`[fetch-all/fetchSourceById] ${src.handle}: ${e.message} — trying Nitter fallback`);
+      tw = await userTweetsViaNitter(src.handle);
+      usedFallback = true;
+    } else {
+      throw e;
+    }
+  }
+
   const data = tw?.data || [];
   const media = tw?.includes?.media || [];
 
@@ -191,15 +221,21 @@ async function fetchSourceById(srcId) {
 
   for (const t of data) {
     const xId = t.id;
-    if (!maxId || BigInt(xId) > BigInt(maxId)) maxId = xId;
 
-    const urls = (t.entities?.urls || []).map(u => u.expanded_url).filter(Boolean);
+    if (!usedFallback && xId && (!maxId || BigInt(xId) > BigInt(maxId))) {
+      maxId = xId;
+    }
+
+    const urls = (t.entities?.urls || []).map((u) => u.expanded_url).filter(Boolean);
 
     const mks = t.attachments?.media_keys || [];
-    const medias = mks.map(k => mediaIndex[k]).filter(Boolean).map(m => ({
-      type: m.type,
-      url: m.url || m.preview_image_url || "",
-    }));
+    const medias = mks
+      .map((k) => mediaIndex[k])
+      .filter(Boolean)
+      .map((m) => ({
+        type: m.type,
+        url: m.url || m.preview_image_url || "",
+      }));
 
     const exists = await XItem.findOne({ xId });
     if (exists) continue;
@@ -217,7 +253,7 @@ async function fetchSourceById(srcId) {
     createdCount++;
   }
 
-  if (maxId && maxId !== src.sinceId) {
+  if (!usedFallback && maxId && maxId !== src.sinceId) {
     src.sinceId = maxId;
     await src.save();
   }
@@ -240,7 +276,8 @@ exports.fetchAllXSources = async (req, res) => {
     res.json({ ok: true, sources: sources.length, created: totalCreated });
   } catch (e) {
     console.error("[fetchAllXSources] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
+    const code = e?.status || 500;
+    res.status(code).json({ ok: false, error: e.message || "fetchAllXSources failed" });
   }
 };
 
@@ -315,6 +352,14 @@ exports.extractXItem = async (req, res) => {
       try {
         const html = await fetchHTML(u);
         const text = extractReadableText(html);
+
+        // NEW: try to capture og:image (best-effort)
+        let ogImage = "";
+        try {
+          const $ = cheerio.load(html);
+          ogImage = $('meta[property="og:image"]').attr("content")?.trim() || "";
+        } catch (_) {}
+
         sources.push({
           url: u,
           score: 1.0,
@@ -322,8 +367,9 @@ exports.extractXItem = async (req, res) => {
           title: "",
           publishedAt: null,
           text,
+          ogImage, // keep for later
         });
-      } catch (_e) {
+      } catch {
         // ignore a single URL failure; continue
       }
     }
@@ -336,12 +382,13 @@ exports.extractXItem = async (req, res) => {
     item.extract = {
       text: combinedText,
       html: "",
-      sources: sources.map(({ url, score, why, title, publishedAt }) => ({
+      sources: sources.map(({ url, score, why, title, publishedAt, ogImage }) => ({
         url,
         score,
         why,
         title,
         publishedAt,
+        ogImage: ogImage || "",
       })),
     };
     item.status = "extracted";
@@ -376,13 +423,14 @@ exports.generateXItem = async (req, res) => {
     const extractText = (item.extract?.text || "").trim();
 
     const draft = await generateJSONDraft({
-   tweetText,
-   extractText,
-   defaults,
-   sources: item.extract?.sources || [],
-   model: modelForXGen,
-   targetWords: parseInt(process.env.XGEN_TARGET_WORDS || "600", 10)
- });
+      tweetText,
+      extractText,
+      defaults,
+      sources: item.extract?.sources || [],
+      model: modelForXGen,
+      targetWords: parseInt(process.env.XGEN_TARGET_WORDS || "600", 10),
+    });
+
     // Harden required fields
     if (!draft.title || !draft.title.trim()) {
       draft.title = (extractText || tweetText || `Update from ${item.handle}`)
@@ -397,6 +445,12 @@ exports.generateXItem = async (req, res) => {
     if (!draft.sourceUrl) {
       draft.sourceUrl = (item.urls || []).find((u) => isGovUrl(u)) || "";
     }
+
+    // ⬅️ NEW: try to pick a good image (tweet photo → og:image)
+    const fromTweet = (item.media || []).find(m => m?.type === "photo" && m?.url)?.url || "";
+    const fromOg = (item.extract?.sources || []).map(s => s.ogImage).find(Boolean) || "";
+    const chosen = fromTweet || fromOg || "";
+    if (chosen && !draft.imageUrl) draft.imageUrl = chosen;
 
     item.generated = draft;
     item.status = "generated";
@@ -434,6 +488,26 @@ exports.createDraftFromXItem = async (req, res) => {
 
     const g = item.generated;
 
+    // ⬅️ NEW: upload the selected image (if any) to Cloudinary now
+    let imageUrl = "";
+    let imagePublicId = "";
+
+    const candidate =
+      (g.imageUrl) ||
+      ((item.media || []).find(m => m?.type === "photo" && m?.url)?.url) ||
+      ((item.extract?.sources || []).map(s => s.ogImage).find(Boolean)) ||
+      "";
+
+    if (candidate) {
+      try {
+        const up = await uploadRemoteImage(candidate, {});
+        imageUrl = up.url;
+        imagePublicId = up.public_id;
+      } catch (e) {
+        console.warn("[createDraftFromXItem] Cloudinary upload failed, continuing:", e.message);
+      }
+    }
+
     const art = await Article.create({
       title: g.title || "Untitled",
       slug:
@@ -445,8 +519,11 @@ exports.createDraftFromXItem = async (req, res) => {
       category: g.category || "Politics",
       status: "Draft",
       publishedAt: g.publishAt ? new Date(g.publishAt) : null,
-      imageUrl: "",            // will be finalized by your image pipeline
-      imagePublicId: "",
+
+      // ⬅️ NEW
+      imageUrl: imageUrl || "",
+      imagePublicId: imagePublicId || "",
+
       seo: g.seo || {},
       geo: g.geo || { mode: "Global", areas: [] },
       sourceUrl: g.sourceUrl || "",

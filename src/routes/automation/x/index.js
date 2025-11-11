@@ -1,20 +1,22 @@
-// backend/src/routes/automation/x/index.js
 "use strict";
-
 const express = require("express");
 const router = express.Router();
 
+// ✅ Correct path (3 levels up from /x)
+const automationCtrl = require("../../../controllers/automation.controller");
 const x = require("../../../controllers/x.controller");
 
-// ---------- Sources ----------
+// ---------- Forwarded automation items ----------
+router.get("/items", automationCtrl.listItems);
+
+// ---------- X Sources ----------
 router.get("/sources", x.listXSources);
 router.post("/sources", x.createXSource);
 router.patch("/sources/:id", x.updateXSource);
 router.delete("/sources/:id", x.deleteXSource);
 router.post("/sources/:id/fetch", x.fetchXSource);
 
-// ---------- Items ----------
-router.get("/items", x.listXItems);
+// ---------- X Items ----------
 router.post("/items/:id/extract", x.extractXItem);
 router.post("/items/:id/generate", x.generateXItem);
 router.post("/items/:id/ready", x.markReadyXItem);

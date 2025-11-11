@@ -14,9 +14,12 @@ const slugify = require('slugify');
 const express = require('express');
 const compression = require('compression');
 const jwt = require('jsonwebtoken');
+const listEndpoints = require('express-list-endpoints');
+
 
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');          // ✅ keep only this one
+
 const mongoose = require('mongoose');
 
 // 5) Middleware & routers
@@ -39,7 +42,7 @@ const sectionsV2 = require('./src/routes/sectionsV2');
 const adminAdsRouter = require('./src/routes/admin.ads.routes');
 
 const planImageRoutes = require('./src/routes/planImage.routes');
-
+const articlesRouter = require('./src/routes/articles');
 
 // 6) Models registered early
 const Article = require('./src/models/Article');
@@ -82,23 +85,6 @@ app.get('/ads.txt', (_req, res) => {
   );
 });
 
-// --- Admin auth guard for protected routes (JWT, role=admin) ---
-function auth(req, res, next) {
-  const { JWT_SECRET } = process.env;
-
-  let token = null;
-  const h = req.headers.authorization || "";
-  if (h.startsWith("Bearer ")) token = h.slice(7);
-  if (!token && req.cookies) token = req.cookies.token || null;
-
-  try {
-    const payload = jwt.verify(token || "", JWT_SECRET);
-    if (!payload || payload.role !== "admin") throw new Error("bad");
-    return next();
-  } catch (e) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-}
 
 
 /* -------------------- Tiny in-memory cache for hot GET endpoints -------------------- */
@@ -164,8 +150,11 @@ const corsOptions = {
 
     if (ok) return cb(null, true);
 
-    console.warn('[CORS] blocked origin:', origin, 'allowed:', allowedOrigins);
-    return cb(new Error('CORS not allowed for ' + origin), false);
+  if (process.env.NODE_ENV !== 'production') {
+  console.warn('[CORS] blocked origin:', origin, 'allowed:', allowedOrigins);
+}
+return cb(new Error('CORS not allowed for ' + origin), false);
+
   },
   credentials: true,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
@@ -257,8 +246,8 @@ app.use((req, res, next) => {
    limit: '10mb'
  }));
 
- const xAutoRoutes = require("./src/automation/x/x.routes");
-app.use("/api/automation/x", xAutoRoutes); 
+const automationRouter = require("./src/routes/automation");
+app.use("/api/automation", automationRouter);
 
 
 
@@ -287,7 +276,7 @@ app.use('/api/ticker',    cacheRoute(30_000), tickerRoutes);
 app.use('/api/sections',  cacheRoute(60_000), sectionsRouter);
 app.use('/api/top-news',  cacheRoute(30_000), require("./src/routes/topnews"));
 
-
+app.use('/api/articles', articlesRouter);
 
 app.use('/api/plan-image', planImageRoutes);
 
@@ -325,6 +314,16 @@ function ssrCacheSet(key, html, ttlMs = 60_000) { // 60s cache
 // --- Serve SSR (server-side rendered) pages to crawlers ---
 app.use(async (req, res, next) => {
   if (!req.path.startsWith("/article/")) return next();
+    // Try SSR cache for bots early
+  if (isBot(req)) {
+    const slugForCache = req.path.slice("/article/".length);
+    const cached = ssrCacheGet(`ssr:article:${slugForCache}`);
+    if (cached) {
+      res.setHeader('Cache-Control','public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+      return res.status(200).type('html').send(cached);
+    }
+  }
+
 
   if (!isBot(req)) return next(); // humans → SPA
 
@@ -439,6 +438,13 @@ const {
   CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CLOUDINARY_FOLDER = 'news-site',
   PUBLICATION_NAME = 'My News'
 } = process.env;
+
+// Frontend canonical base (used by SSR/feeds)
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://timelyvoice.com';
+const SITE_URL = FRONTEND_BASE_URL; // kept for backward-compat code
+// Fallback image for feeds (also used by ensureRenderableImage)
+const SITE_LOGO = process.env.SITE_LOGO || `${SITE_URL.replace(/\/$/, '')}/logo-192.png`;
+
 
 /* -------------------- Admin-only guard for X-Geo-Preview-Country -------------------- */
 app.use((req, _res, next) => {
@@ -971,22 +977,26 @@ async function searchCloudinaryByKeywords(keywords = []) {
   if (!keywords.length) return [];
   const folder = process.env.CLOUDINARY_FOLDER || 'news-images';
 
-  // Build a search expression like:
-  //  folder=news-images AND resource_type:image AND (tags=modi OR public_id:modi OR filename=modi OR ...)
   const ors = keywords.map(k => `(tags=${k} OR public_id:${k} OR filename:${k})`);
   const expr = `folder=${folder} AND resource_type:image AND (${ors.join(' OR ')})`;
 
-  // Cloudinary Search API
   const max = parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || '40', 10);
-  const res = await cloudinary.search
-    .expression(expr)
-    .sort_by('uploaded_at','desc')
-    .with_field('tags')
-    .max_results(Math.min(100, Math.max(10, max)))
-    .execute();
 
-  return Array.isArray(res?.resources) ? res.resources : [];
+  try {
+    const res = await cloudinary.search
+      .expression(expr)
+      .sort_by('uploaded_at','desc')
+      .with_field('tags')
+      .max_results(Math.min(100, Math.max(10, max)))
+      .execute();
+
+    return Array.isArray(res?.resources) ? res.resources : [];
+  } catch (e) {
+    console.warn('[cloudinary.search] failed:', e?.message || e);
+    return [];
+  }
 }
+
 
 /**
  * Score an image for our keywords (simple overlap + a small bonus for larger width).
@@ -1701,7 +1711,9 @@ app.get('/api/public/categories/:slug/articles', async (req, res) => {
   const visible = items.filter(a => isAllowedForGeoDoc(a, geo)
 );
 
-  res.json({ category: { name: cat.name, slug: cat.slug }, items: visible, page, pageSize: limit, total, totalPages: Math.ceil(total / limit) });
+  res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+return res.json({ category: { name: cat.name, slug: cat.slug }, items: visible, page, pageSize: limit, total, totalPages: Math.ceil(total / limit) });
+
 });
 
 app.get('/api/public/tags/:slug/articles', async (req, res) => {
@@ -1718,7 +1730,9 @@ app.get('/api/public/tags/:slug/articles', async (req, res) => {
   const visible = items.filter(a => isAllowedForGeoDoc(a, geo)
 );
 
-  res.json({ tag: { name: tag.name, slug: tag.slug }, items: visible, page, pageSize: limit, total, totalPages: Math.ceil(total / limit) });
+  res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+return res.json({ tag: { name: tag.name, slug: tag.slug }, items: visible, page, pageSize: limit, total, totalPages: Math.ceil(total / limit) });
+
 });
 
 /* -------------------- MEDIA endpoints -------------------- */
@@ -1896,12 +1910,6 @@ app.get('/api/export/articles', async (_req, res) => {
 
 /* -------------------- SEO helpers for feeds/SSR -------------------- */
 const PORT = process.env.PORT || 4000;
-
-const FRONTEND_BASE_URL =
-  process.env.FRONTEND_BASE_URL || 'https://timelyvoice.com';
-const SITE_URL = FRONTEND_BASE_URL; // keep old name for rest of code
-// Fallback image for RSS when an article has no image set
-const SITE_LOGO = process.env.SITE_LOGO || `${SITE_URL.replace(/\/$/, '')}/logo-192.png`;
 
 function xmlEscape(s = '') {
   return String(s)
@@ -2219,7 +2227,8 @@ app.get('/rss.xml', async (req, res) => {
   const category = a.category || 'General';
 
   // Prefer article image; fallback to site logo (so media:content is always present)
-  const image = (a.ogImage && a.ogImage.trim()) || (a.imageUrl && a.imageUrl.trim()) || SITE_LOGO;
+  const image = ensureRenderableImage(a);
+
 
   const summary =
     (a.summary && a.summary.trim()) ||
@@ -2459,6 +2468,10 @@ process.on("unhandledRejection", (err) => {
 });
 
 
+// Dev: list all routes so we can find the exact automation path
+app.get('/api/dev/routes', (req, res) => {
+  res.json(listEndpoints(app));
+});
 
 
 
