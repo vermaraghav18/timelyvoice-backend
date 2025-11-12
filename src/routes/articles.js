@@ -55,7 +55,7 @@ router.get(
       category: z.string().optional(),
       tag: z.string().optional(),
       page: z.coerce.number().min(1).optional(),
-      limit: z.coerce.number().min(1).max(100).optional(),
+      limit: z.coerce.number().min(1).max(300).optional(),
     }),
     'query'
   ),
