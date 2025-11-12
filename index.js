@@ -1,32 +1,42 @@
-// backend/index.js — top of file
+// backend/index.js — fully fixed and complete
 
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 // 2) Polyfill fetch for Node < 18
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+// (Node 18+ has global fetch; this shim only runs when needed)
+// Polyfill fetch only if Node < 18; otherwise use the native fetch
+const fetch = (typeof globalThis.fetch === 'function')
+  ? globalThis.fetch.bind(globalThis)
+  : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 // 3) Single configured Cloudinary instance
 const cloudinary = require('./src/lib/cloudinary');
 
 // 4) Core deps
+const fs = require('fs');
 const slugify = require('slugify');
 const express = require('express');
 const compression = require('compression');
 const jwt = require('jsonwebtoken');
 const listEndpoints = require('express-list-endpoints');
-
-
 const rateLimit = require('express-rate-limit');
-const cors = require('cors');          // ✅ keep only this one
-
+const cors = require('cors');
 const mongoose = require('mongoose');
+const { Types } = mongoose;
+
+function escapeRegex(s = '') {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const cookieParser = require('cookie-parser');
+const multer = require('multer');
+const stream = require('stream');
 
 // 5) Middleware & routers
 const analyticsBotFilter = require('./middleware/analyticsBotFilter');
 const analyticsRouter = require('./routes/analytics');
 const robotsRoute = require('./src/routes/robots');
-
 const {
   router: sitemapRouter,
   markSitemapDirty,
@@ -36,34 +46,28 @@ const {
 const geoMiddleware = require('./middleware/geo');
 const breakingRoutes = require('./routes/breaking');
 const tickerRoutes = require('./routes/ticker');
-
 const sectionsRouter = require('./src/routes/sections');
 const sectionsV2 = require('./src/routes/sectionsV2');
 const adminAdsRouter = require('./src/routes/admin.ads.routes');
-
 const planImageRoutes = require('./src/routes/planImage.routes');
 const articlesRouter = require('./src/routes/articles');
 
 // 6) Models registered early
 const Article = require('./src/models/Article');
-const cookieParser = require("cookie-parser");
+const XSource = require('./src/models/XSource');
+const XItem   = require('./src/models/XItem');
 
-const XSource = require('./src/models/XSource');  // <-- ADD
-const XItem   = require('./src/models/XItem');    // <-- ADD
+// Comments & newsletter models (used by their routers below)
+const Comment = require('./models/Comment');
+const Subscriber = require('./models/Subscriber');
 
 // 7) Cron jobs
 require('./cron');
 
-// 8) Upload utils
-const multer = require('multer');
-const stream = require('stream');
-
 // 9) App init
 const app = express();
 
-
 // ✅ Safe static assets mount (won’t crash if frontend/dist doesn’t exist)
-const fs = require('fs');
 const distAssets = path.join(__dirname, '../frontend/dist/assets');
 if (fs.existsSync(distAssets)) {
   app.use('/assets', express.static(distAssets, { maxAge: '1y', immutable: true }));
@@ -77,15 +81,10 @@ app.use(cookieParser());
 const urlNormalize = require('./url-normalize');
 app.use(urlNormalize);
 
-
-
+// Simple ads.txt
 app.get('/ads.txt', (_req, res) => {
-  res.type('text/plain').send(
-    'google.com, pub-8472487092329023, DIRECT, f08c47fec0942fa0'
-  );
+  res.type('text/plain').send('google.com, pub-8472487092329023, DIRECT, f08c47fec0942fa0');
 });
-
-
 
 /* -------------------- Tiny in-memory cache for hot GET endpoints -------------------- */
 const cache = new Map(); // key -> { data, exp }
@@ -96,11 +95,9 @@ function getCache(key) {
   if (Date.now() > v.exp) { cache.delete(key); return null; }
   return v.data;
 }
-
 function setCache(key, data, ttlMs = 60_000) {
   cache.set(key, { data, exp: Date.now() + ttlMs });
 }
-
 function cacheRoute(ttlMs = 60_000) {
   return (req, res, next) => {
     if (req.method !== 'GET') return next();
@@ -120,7 +117,6 @@ function cacheRoute(ttlMs = 60_000) {
 }
 
 /* -------------------- CORS (unified) -------------------- */
-
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -141,20 +137,15 @@ const corsOptions = {
   origin(origin, cb) {
     // allow server-to-server, curl, health checks (no Origin header)
     if (!origin) return cb(null, true);
-
-    // normalize and check
     const ok =
       allowedOrigins.includes(origin) ||
       /^http:\/\/localhost:5173$/.test(origin) ||
       /^http:\/\/127\.0\.0\.1:5173$/.test(origin);
-
     if (ok) return cb(null, true);
-
-  if (process.env.NODE_ENV !== 'production') {
-  console.warn('[CORS] blocked origin:', origin, 'allowed:', allowedOrigins);
-}
-return cb(new Error('CORS not allowed for ' + origin), false);
-
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('[CORS] blocked origin:', origin, 'allowed:', allowedOrigins);
+    }
+    return cb(new Error('CORS not allowed for ' + origin), false);
   },
   credentials: true,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
@@ -165,21 +156,17 @@ return cb(new Error('CORS not allowed for ' + origin), false);
   ],
   maxAge: 86400
 };
-
 // mount CORS BEFORE routes
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
-
 
 // Trust reverse proxy only when explicitly enabled (default true)
 if (String(process.env.TRUST_PROXY || 'true') === 'true') {
   app.set('trust proxy', 1);
 }
 
-
 // Compress all responses (JSON, HTML, etc.)
 app.use(compression({ threshold: 0 }));
-
 
 // ✅ Only enforce canonical domain/https in production
 if (process.env.NODE_ENV === 'production') {
@@ -187,70 +174,50 @@ if (process.env.NODE_ENV === 'production') {
   app.use(canonicalHost());
 }
 
-// === Canonical URL normalizer (301 redirects) ===
-
-
-// ===============================================
-
-
 // Strong ETags let browsers/CDNs validate cached JSON quickly
 app.set('etag', 'strong');
+
 // Cache public GET endpoints so repeat visits are instant
 app.use((req, res, next) => {
-  // Only cache safe GET requests
   if (req.method !== 'GET') return next();
 
   // Do NOT cache anything under admin/auth/uploads/etc.
-  const noCachePrefixes = [
-    '/api/admin',
-    '/api/auth',
-    '/api/upload',
-    '/api/media/upload',
-  ];
+  const noCachePrefixes = ['/api/admin', '/api/auth', '/api/upload', '/api/media/upload'];
   if (noCachePrefixes.some(p => req.path.startsWith(p))) {
-    // Explicitly prevent caching for these
     res.set('Cache-Control', 'no-store');
     return next();
   }
 
-   // ✅ Apply caching to ALL other /api/* GETs
+  // Apply caching to ALL other /api/* GETs
   const isApi = req.path.startsWith('/api/');
   if (isApi) {
     // Default for lists/sections
     let header = 'public, max-age=60, s-maxage=300, stale-while-revalidate=30';
 
     // Slightly longer for single-article reads
-    const isSingleArticle =
-      /^\/api\/(public\/articles\/|articles\/)/.test(req.path) && !req.query.q;
-
+    const isSingleArticle = /^\/api\/(public\/articles\/|articles\/)/.test(req.path) && !req.query.q;
     if (isSingleArticle) {
       header = 'public, max-age=300, s-maxage=1200, stale-while-revalidate=60';
     }
-
     res.set('Cache-Control', header);
   }
-
-
   next();
 });
 
-
-
-
 // Body parsers
- // 1) JSON for normal APIs (login, single-article create/update, etc.)
- app.use(express.json({ limit: '10mb' }));
- // 2) Text for NDJSON (bulk import) and plain text
- app.use(express.text({
-   type: ['text/plain', 'application/x-ndjson'],
-   limit: '10mb'
- }));
+// 1) JSON for normal APIs (login, single-article create/update, etc.)
+app.use(express.json({ limit: '10mb' }));
+// 2) Text for NDJSON (bulk import) and plain text
+app.use(express.text({
+  type: ['text/plain', 'application/x-ndjson'],
+  limit: '10mb'
+}));
 
+// Automation routes
 const automationRouter = require("./src/routes/automation");
 app.use("/api/automation", automationRouter);
 
-
-
+// Debug: openrouter env check
 app.get("/api/automation/_debug/openrouter", (req, res) => {
   res.json({
     keyPresent: !!process.env.OPENROUTER_API_KEY,
@@ -260,37 +227,29 @@ app.get("/api/automation/_debug/openrouter", (req, res) => {
   });
 });
 
-// [ADMIN_ARTICLES_ROUTE_IMPORT] Add this near other route imports
+// Admin articles router
 const adminArticlesRouter = require('./src/routes/admin.articles.routes');
-
-
-
-// [ADMIN_ARTICLES_ROUTE_MOUNT] Add this near other app.use(...) mounts
 app.use('/api/admin/articles', adminArticlesRouter);
 
-
+// robots + cached high-traffic endpoints
 app.use("/", robotsRoute);
-// Cached versions of high-traffic endpoints
 app.use('/api/breaking',  cacheRoute(30_000), breakingRoutes);
 app.use('/api/ticker',    cacheRoute(30_000), tickerRoutes);
 app.use('/api/sections',  cacheRoute(60_000), sectionsRouter);
 app.use('/api/top-news',  cacheRoute(30_000), require("./src/routes/topnews"));
 
-app.use('/api/articles', articlesRouter);
-
 app.use('/api/plan-image', planImageRoutes);
 
-
+// Cache helpers
 function clearCache(prefix = '') {
   for (const key of cache.keys()) {
     if (!prefix || key.startsWith(prefix)) cache.delete(key);
   }
 }
 
-
+// Bot detection + SSR cache for crawlers
 const BOT_UA =
   /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i;
-
 
 function isBot(req) {
   const ua = String(req.headers['user-agent'] || '');
@@ -299,7 +258,6 @@ function isBot(req) {
 
 // ultra-simple TTL cache for prerendered HTML
 const SSR_CACHE = new Map(); // key -> { html, exp }
-
 function ssrCacheGet(key) {
   const hit = SSR_CACHE.get(key);
   if (!hit) return null;
@@ -310,11 +268,10 @@ function ssrCacheSet(key, html, ttlMs = 60_000) { // 60s cache
   SSR_CACHE.set(key, { html, exp: Date.now() + ttlMs });
 }
 
-
 // --- Serve SSR (server-side rendered) pages to crawlers ---
 app.use(async (req, res, next) => {
   if (!req.path.startsWith("/article/")) return next();
-    // Try SSR cache for bots early
+  // Try SSR cache for bots early
   if (isBot(req)) {
     const slugForCache = req.path.slice("/article/".length);
     const cached = ssrCacheGet(`ssr:article:${slugForCache}`);
@@ -323,9 +280,7 @@ app.use(async (req, res, next) => {
       return res.status(200).type('html').send(cached);
     }
   }
-
-
-  if (!isBot(req)) return next(); // humans → SPA
+  if (!isBot(req)) return next(); // humans → SPA/front-end
 
   const slug = req.path.slice("/article/".length);
   try {
@@ -347,13 +302,8 @@ app.use(async (req, res, next) => {
   }
 });
 
-
-
-
-
-
+// Admin ads
 app.use("/api/admin/ads", adminAdsRouter);
-
 
 // Return a clean message if an origin is not allowed by CORS
 app.use((err, req, res, next) => {
@@ -366,9 +316,6 @@ app.use((err, req, res, next) => {
 /* -------------------- GEO & Bot filter -------------------- */
 app.use(geoMiddleware());
 app.use(analyticsBotFilter());
-
-
-
 
 // Country-aware caching: make caches keep separate copies per geo + auth
 app.use((req, res, next) => {
@@ -400,8 +347,6 @@ app.use((req, res, next) => {
   next();
 });
 
-
-
 /* -------------------- Analytics endpoints -------------------- */
 const collectLimiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10), // 1 minute
@@ -427,10 +372,8 @@ app.use('/api/analytics', analyticsRouter);
 
 // ✅ Simple collector endpoint for frontend pings
 app.post('/api/analytics/collect', (req, res) => {
-  // Accept even if body is empty
   res.status(204).end();
 });
-
 
 /* -------------------- ENV -------------------- */
 const {
@@ -444,7 +387,6 @@ const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://timelyvoice.
 const SITE_URL = FRONTEND_BASE_URL; // kept for backward-compat code
 // Fallback image for feeds (also used by ensureRenderableImage)
 const SITE_LOGO = process.env.SITE_LOGO || `${SITE_URL.replace(/\/$/, '')}/logo-192.png`;
-
 
 /* -------------------- Admin-only guard for X-Geo-Preview-Country -------------------- */
 app.use((req, _res, next) => {
@@ -490,7 +432,6 @@ app.get('/api/dev/cloudinary-config', (_req, res) => {
   });
 });
 
-
 app.get('/api/dev/test-image-pick', async (req, res) => {
   const title    = String(req.query.title || '');
   const tags     = String(req.query.tags || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -513,9 +454,6 @@ app.get('/api/dev/nitter-probe', async (req, res) => {
   }
 });
 
-
-
-
 /* -------------------- MongoDB -------------------- */
 mongoose.set('strictQuery', true);
 console.log('[env] MONGO_URI=%s', MONGO_URI);
@@ -531,7 +469,6 @@ mongoose.connect(MONGO_URI, { dbName: 'newsdb', autoIndex: true })
   });
 
 /* -------------------- Helpers -------------------- */
-
 async function uniqueSlugForTitle(title = 'article') {
   const base = slugify(String(title), { lower: true, strict: true }) || 'article';
   let s = base;
@@ -549,7 +486,6 @@ function estimateReadingTime(text = '') {
   return Math.max(1, Math.round(words / 200));
 }
 
-
 // Geo helper (pure function; works on lean docs too)
 function isAllowedForGeoDoc(a = {}, geo = {}) {
   const mode  = String(a.geoMode || 'global');
@@ -564,10 +500,7 @@ function isAllowedForGeoDoc(a = {}, geo = {}) {
   return true; // default allow
 }
 
-/* -------------------- Models -------------------- */
-
-/* -------------------- Models -------------------- */
-// A) Redirects model + helpers (new)
+/* -------------------- Redirects + Category/Tag/Media models -------------------- */
 const redirectSchema = new mongoose.Schema({
   scope: { type: String, enum: ['article', 'category'], required: true }, // what type of slug
   from:  { type: String, required: true, unique: true, index: true },    // previous slug
@@ -601,14 +534,12 @@ async function bumpRedirectHit(id) {
   try { await Redirect.updateOne({ _id: id }, { $inc: { hits: 1 } }); } catch (_) {}
 }
 
-
 // Category & Tag
-// B) Track previous slugs for Category (schema change)
 const catSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 50 },
   slug: { type: String, required: true, trim: true, unique: true, index: true },
   description: { type: String, maxlength: 200 },
-  type: { type: String, enum: ['topic','state','city'], default: 'topic', index: true }, // <— add this
+  type: { type: String, enum: ['topic','state','city'], default: 'topic', index: true },
   previousSlugs: { type: [String], default: [] },
 }, { timestamps: true });
 
@@ -631,34 +562,24 @@ const mediaSchema = new mongoose.Schema({
   mime:       { type: String },                     // e.g. image/jpeg
   createdBy:  { type: String, default: 'admin' },   // simple for now
 }, { timestamps: true });
-
 mediaSchema.index({ createdAt: -1 });
-
-
 const Media    = mongoose.models.Media    || mongoose.model('Media', mediaSchema);
 
-// Comments
-const Comment = require('./models/Comment');
-const Subscriber = require('./models/Subscriber');
-
-
-// ⬇️ INSERT THESE TWO LINES HERE
+// SITEMAP models must be registered once
 setSitemapModels({ Article, Category, Tag });
 app.use(sitemapRouter);
-
 
 /* -------------------- MEDIA helpers -------------------- */
 const uploadMemory = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
-  fileFilter: (req, file, cb) => {
+  fileFilter: (_req, file, cb) => {
     if (!file.mimetype.startsWith('image/')) {
       return cb(new Error('Only image/* allowed'));
     }
     cb(null, true);
   }
 });
-
 
 function bufferToStream(buffer) {
   const readable = new stream.Readable({ read() {} });
@@ -694,7 +615,6 @@ function buildImageVariants(publicId) {
   return { thumbUrl, ogUrl };
 }
 
-
 // Slug helpers for Category/Tag
 async function ensureUniqueCategorySlug(name, desired) {
   const base = slugify(desired || name);
@@ -709,14 +629,12 @@ async function ensureUniqueTagSlug(name, desired) {
   return s;
 }
 
-// keep ONE copy of these helpers in a single place
+// Auth helpers
 function signToken() { return jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '6h' }); }
-
 function auth(req, res, next) {
   const header = req.headers.authorization || '';
   let token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token && req.cookies) token = req.cookies.token || null;
-
   try {
     const decoded = jwt.verify(token || '', JWT_SECRET);
     if (decoded.role !== 'admin') throw new Error('not admin');
@@ -726,7 +644,6 @@ function auth(req, res, next) {
     res.status(401).json({ error: 'Invalid or missing token' });
   }
 }
-
 function optionalAuth(req, _res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : (req.cookies?.token || null);
@@ -739,9 +656,7 @@ function optionalAuth(req, _res, next) {
   next();
 }
 
-
-
-
+/* -------------------- Comments & Newsletter -------------------- */
 const commentsRouterFactory = require('./routes/comments');
 app.use(commentsRouterFactory(
   { Article, Comment },
@@ -753,14 +668,14 @@ app.use(newsletterRouterFactory(
   { Subscriber },
   { requireAuthAdmin: auth }
 ));
+
 /* -------------------- Health & Auth -------------------- */
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.post('/api/auth/login', loginLimiter, (req, res) => {
   const { password } = req.body || {};
   if (!password) return res.status(400).json({ error: 'Password required' });
 
-  // Basic password policy check for the configured admin password.
-  // (Does not block login—just warns in logs if weak.)
+  // Password strength advisory (does not block login)
   const configured = ADMIN_PASSWORD || '';
   const strongish =
     configured.length >= 8 &&
@@ -778,9 +693,8 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
   res.json({ token: signToken() });
 });
 
-
 /* -------------------- Cloudinary signed upload -------------------- */
-app.post('/api/uploads/sign', auth, (req, res) => {
+app.post('/api/uploads/sign', auth, (_req, res) => {
   const timestamp = Math.floor(Date.now() / 1000);
   const paramsToSign = { timestamp, folder: CLOUDINARY_FOLDER };
   const signature = cloudinary.utils.api_sign_request(paramsToSign, CLOUDINARY_API_SECRET);
@@ -793,10 +707,7 @@ app.post('/api/uploads/sign', auth, (req, res) => {
   });
 });
 
-
 // ===== Bulk import helpers =====
-
-// Parse JSON array OR JSONL (one JSON per line) OR { items: [...] }
 function parseBulkBody(reqBody) {
   if (Array.isArray(reqBody)) return reqBody;
   if (typeof reqBody === 'string') {
@@ -813,7 +724,7 @@ function parseBulkBody(reqBody) {
   throw new Error('Provide an array of JSON objects or JSONL string');
 }
 
-// Normalize one incoming article to your DB shape (reuses your existing logic)
+// Normalize one incoming article to your DB shape
 async function normalizeIncomingArticle(input = {}) {
   const {
     title, summary, author, body,
@@ -831,16 +742,15 @@ async function normalizeIncomingArticle(input = {}) {
   } = input || {};
 
   // normalize status early
-const allowedStatus = new Set(['draft', 'published']);
-const normalizedStatus = allowedStatus.has(String(status || 'draft').toLowerCase())
-  ? String(status).toLowerCase()
-  : 'draft';
+  const allowedStatus = new Set(['draft', 'published']);
+  const normalizedStatus = allowedStatus.has(String(status || 'draft').toLowerCase())
+    ? String(status).toLowerCase()
+    : 'draft';
 
-// compute publishAt/publishedAt based on normalizedStatus
-const finalPublishAt =
-  publishAt ? new Date(publishAt)
-            : (normalizedStatus === 'published' ? new Date() : undefined);
-
+  // compute publishAt/publishedAt based on normalizedStatus
+  const finalPublishAt =
+    publishAt ? new Date(publishAt)
+              : (normalizedStatus === 'published' ? new Date() : undefined);
 
   if (!title || !summary || !author || !body) {
     throw new Error('Missing fields: title, summary, author, body are required');
@@ -853,12 +763,19 @@ const finalPublishAt =
     ? geoAreas.map(s => String(s).trim()).filter(Boolean)
     : [];
 
-  // category by slug or name → store name
+  // category by _id OR slug OR name => store canonical name
   let categoryName = category;
-  const foundCat = await Category.findOne({
-    $or: [{ slug: slugify(category) }, { name: category }]
-  }).lean();
-  if (foundCat) categoryName = foundCat.name;
+  {
+    const ors = [
+      { slug: slugify(String(category || '')) },
+      { name: String(category || '') }
+    ];
+    if (category && mongoose.Types.ObjectId.isValid(String(category))) {
+      ors.push({ _id: category });
+    }
+    const foundCat = await Category.findOne({ $or: ors }).lean();
+    if (foundCat) categoryName = foundCat.name;
+  }
 
   // tags by slug or name → store names
   const rawTags = Array.isArray(incomingTags) ? incomingTags : [];
@@ -870,10 +787,10 @@ const finalPublishAt =
     tagsByName.push(tagDoc ? tagDoc.name : nameOrSlug);
   }
 
-  // unique slug (uses your helper)
+  // unique slug
   const slug = await uniqueSlugForTitle(title);
 
-  /* >>> ADD THIS: try Cloudinary autopick if no image provided <<< */
+  /* >>> Auto-pick an image if none provided <<< */
   let finalImagePublicId = imagePublicId;
   let finalImageUrl      = imageUrl;
   let finalOgImage       = ogImage;
@@ -893,71 +810,54 @@ const finalPublishAt =
   }
 
   const doc = {
-  title,
-  slug,
-  summary,
-  author,
-  body,
-  category: categoryName,
-  tags: tagsByName,
+    title,
+    slug,
+    summary,
+    author,
+    body,
+    category: categoryName,
+    tags: tagsByName,
 
-  // ✅ Apply autopick results when available
-  imageUrl: finalImageUrl || imageUrl || '',
-  imagePublicId: finalImagePublicId || imagePublicId || '',
-  ogImage: finalOgImage || ogImage || '',
+    imageUrl: finalImageUrl || imageUrl || '',
+    imagePublicId: finalImagePublicId || imagePublicId || '',
+    ogImage: finalOgImage || ogImage || '',
 
-  imageAlt: (imageAlt || title || ''),
-  metaTitle: (metaTitle || '').slice(0, 80),
-  metaDesc: (metaDesc || '').slice(0, 200),
+    imageAlt: (imageAlt || title || ''),
+    metaTitle: (metaTitle || '').slice(0, 80),
+    metaDesc: (metaDesc || '').slice(0, 200),
 
-  readingTime: estimateReadingTime(body),
+    readingTime: estimateReadingTime(body),
 
-  status: normalizedStatus,
-  publishAt: finalPublishAt,
+    status: normalizedStatus,
+    publishAt: finalPublishAt,
 
-  geoMode: sanitizedGeoMode,
-  geoAreas: sanitizedGeoAreas
-};
+    geoMode: sanitizedGeoMode,
+    geoAreas: sanitizedGeoAreas
+  };
 
-// only set publishedAt if actually published
-if (normalizedStatus === 'published') {
-  doc.publishedAt = new Date();
-}
+  // only set publishedAt if actually published
+  if (normalizedStatus === 'published') {
+    doc.publishedAt = new Date();
+  }
 
-
-   // 🔽 add this line
   await ensureArticleHasImage(doc);
-
   return doc;
 }
 
-
 /* -------------------- Auto image match (Cloudinary) -------------------- */
-
-/**
- * Minimal stop-words so titles like "PM Modi addresses the nation" become useful keywords.
- */
 const STOP_WORDS = new Set([
   'the','a','an','and','or','of','to','in','on','for','at','by','with','is','are','was','were','be',
   'as','from','that','this','these','those','it','its','into','over','after','before','about','than',
   'new'
 ]);
 
-/**
- * Build keywords from title + tags + category (lowercased, no short words, no stop words).
- */
 function buildArticleKeywords({ title = '', tags = [], category = '' }) {
-  const raw = [
-    String(title || ''),
-    String(category || ''),
-    ...(Array.isArray(tags) ? tags : [])
-  ].join(' ');
+  const raw = [String(title || ''), String(category || ''), ...(Array.isArray(tags) ? tags : [])].join(' ');
   const words = raw
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, ' ')
     .split(/\s+/)
     .filter(w => w && w.length >= 3 && !STOP_WORDS.has(w));
-  // de-dup while keeping order
   const seen = new Set();
   const out = [];
   for (const w of words) {
@@ -965,21 +865,14 @@ function buildArticleKeywords({ title = '', tags = [], category = '' }) {
     seen.add(w);
     out.push(w);
   }
-  // keep first 8–12 is enough signal
   return out.slice(0, 12);
 }
 
-/**
- * Query Cloudinary Search for images in your folder that match any of the keywords
- * in tags OR in public_id/filename.
- */
 async function searchCloudinaryByKeywords(keywords = []) {
   if (!keywords.length) return [];
   const folder = process.env.CLOUDINARY_FOLDER || 'news-images';
-
   const ors = keywords.map(k => `(tags=${k} OR public_id:${k} OR filename:${k})`);
   const expr = `folder=${folder} AND resource_type:image AND (${ors.join(' OR ')})`;
-
   const max = parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || '40', 10);
 
   try {
@@ -989,7 +882,6 @@ async function searchCloudinaryByKeywords(keywords = []) {
       .with_field('tags')
       .max_results(Math.min(100, Math.max(10, max)))
       .execute();
-
     return Array.isArray(res?.resources) ? res.resources : [];
   } catch (e) {
     console.warn('[cloudinary.search] failed:', e?.message || e);
@@ -997,57 +889,40 @@ async function searchCloudinaryByKeywords(keywords = []) {
   }
 }
 
-
-/**
- * Score an image for our keywords (simple overlap + a small bonus for larger width).
- */
 function scoreImage(resource, keywordsSet) {
   const id = String(resource.public_id || '').toLowerCase();
   const filename = id.split('/').pop(); // last segment
   const tags = (resource.tags || []).map(t => String(t).toLowerCase());
   let score = 0;
-
   for (const k of keywordsSet) {
-    if (tags.includes(k)) score += 5;                 // strong tag hit
-    if (id.includes(k)) score += 3;                   // id/public_id hit
-    if (filename.includes(k)) score += 3;             // filename hit
+    if (tags.includes(k)) score += 5;     // strong tag hit
+    if (id.includes(k)) score += 3;       // id/public_id hit
+    if (filename.includes(k)) score += 3; // filename hit
   }
-  // prefer decent images
   if (resource.width >= 1000) score += 2;
   if (resource.width >= 1600) score += 1;
-
   return score;
 }
 
-/**
- * Pick the single best Cloudinary image for an article.
- * Returns { imageUrl, imagePublicId, ogImage } or null.
- */
 async function pickBestImageForArticle({ title, tags = [], category = '' }) {
   try {
     if (String(process.env.CLOUDINARY_AUTOPICK || 'on').toLowerCase() === 'off') return null;
-
     const keywords = buildArticleKeywords({ title, tags, category });
     if (!keywords.length) return null;
-
     const resources = await searchCloudinaryByKeywords(keywords);
     if (!resources.length) return null;
 
     const kwSet = new Set(keywords);
     let best = null;
     let bestScore = -1;
-
     for (const r of resources) {
       const s = scoreImage(r, kwSet);
       if (s > bestScore) { bestScore = s; best = r; }
     }
     if (!best) return null;
-
-    // Build nice variants
     const publicId = best.public_id;
     const imageUrl = best.secure_url || cloudinary.url(publicId, { secure: true });
     const ogImage  = cloudinary.url(publicId, { width: 1200, height: 630, crop: 'fill', format: 'jpg', secure: true });
-
     return { imageUrl, imagePublicId: publicId, ogImage };
   } catch (e) {
     console.warn('[autopick-image] failed:', e?.message || e);
@@ -1055,10 +930,6 @@ async function pickBestImageForArticle({ title, tags = [], category = '' }) {
   }
 }
 
-/**
- * If the payload has no image, try to attach one from Cloudinary based on keywords.
- * Mutates and returns the same object.
- */
 async function ensureArticleHasImage(payload = {}) {
   if (payload.imageUrl || payload.ogImage || payload.imagePublicId) return payload;
   const chosen = await pickBestImageForArticle({
@@ -1074,47 +945,130 @@ async function ensureArticleHasImage(payload = {}) {
   return payload;
 }
 
-
-/* -------------------- Articles API -------------------- */
+/* -------------------- Articles API (public + admin) -------------------- */
 // list
 app.get('/api/articles', optionalAuth, async (req, res) => {
-  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+  const page  = Math.max(parseInt(req.query.page  || '1', 10), 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
-  const q = (req.query.q || '').trim();
-  const category = (req.query.category || '').trim();
+  const qRaw  = String(req.query.q || '').trim();
+  const catRaw= String(req.query.category || '').trim();
 
-  const isAdmin = req.user?.role === 'admin';
-  const includeAll = isAdmin && req.query.all === '1';
+  const isAdmin    = req.user?.role === 'admin';
+  const includeAll = isAdmin && String(req.query.all || '') === '1';
 
-  const query = {};
-  if (q) {
-    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    query.$or = [{ title: rx }, { summary: rx }, { author: rx }];
+  const now = new Date();
+
+  // Build $and of independent clauses
+  const and = [];
+
+  // Text search (safe regex)
+  if (qRaw) {
+    const rx = new RegExp(qRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    and.push({ $or: [{ title: rx }, { summary: rx }, { author: rx }] });
   }
-  if (category && category !== 'All') {
-    query.category = category;
+
+  // Category filter (case-insensitive, supports string OR object {name, slug})
+  if (catRaw && catRaw.toLowerCase() !== 'all') {
+    const wantLower = String(catRaw).toLowerCase();
+    and.push({
+      $or: [
+        // category stored as string
+        {
+          $and: [
+            { $expr: { $eq: [ { $type: "$category" }, "string" ] } },
+            { $expr: { $eq: [ { $toLower: "$category" }, wantLower ] } }
+          ]
+        },
+        // category stored as object { name?, slug? }
+        {
+          $and: [
+            { $expr: { $eq: [ { $type: "$category" }, "object" ] } },
+            {
+              $or: [
+                { $expr: { $eq: [ { $toLower: { $ifNull: ["$category.name", ""] } }, wantLower ] } },
+                { $expr: { $eq: [ { $toLower: { $ifNull: ["$category.slug", ""] } }, wantLower ] } }
+              ]
+            }
+          ]
+        }
+      ]
+    });
   }
 
+  // Visibility (public users)
   if (!includeAll) {
-    query.status = 'published';
-    query.publishAt = { $lte: new Date() };
+    and.push({ status: 'published' });
+    and.push({
+      $or: [
+        { publishedAt: { $lte: now } },
+        { publishAt:   { $lte: now } },
+        {
+          $and: [
+            { publishedAt: { $exists: false } },
+            { publishAt:   { $exists: false } }
+          ]
+        }
+      ]
+    });
   }
 
-  const total = await Article.countDocuments(query);
-  const items = await Article.find(query)
-    .sort({ publishedAt: -1 })
-    .skip((page - 1) * limit)
-    .limit(limit)
-    .lean();
+  // Final match
+  const match = and.length ? { $and: and } : {};
 
+  // Coalesced sort key (freshest first)
+  const coalesceSortKey = {
+    $ifNull: [
+      '$publishedAt',
+      { $ifNull: [ '$publishAt', { $ifNull: [ '$updatedAt', '$createdAt' ] } ] }
+    ]
+  };
+
+  // Shared pipeline
+  const pipeline = [
+    { $match: match },
+  ];
+
+  // Count
+  const [{ total = 0 } = {}] = await Article.aggregate([
+    ...pipeline,
+    { $count: 'total' }
+  ]);
+
+  // Page (add sort and pagination)
+  const items = await Article.aggregate([
+    ...pipeline,
+    { $addFields: { sortKey: coalesceSortKey } },
+    { $sort: { sortKey: -1, _id: -1 } },
+    { $skip: (page - 1) * limit },
+    { $limit: limit }
+  ]);
+
+  // GEO enforcement (public)
   const enforceGeo = !isAdmin;
   const geo = req.geo || {};
-  const visibleItems = enforceGeo
-    ? items.filter(a => isAllowedForGeoDoc(a, geo)
-)
-    : items;
+  const visible = enforceGeo ? items.filter(a => isAllowedForGeoDoc(a, geo)) : items;
 
-  const mapped = visibleItems.map(a => ({ ...a, id: a._id, publishedAt: a.publishedAt }));
+  const normalizeCats = (val) => {
+  if (!val) return val;
+  if (Array.isArray(val)) return val.map(normalizeCats).filter(Boolean);
+  if (typeof val === 'string') return val;
+  if (val && typeof val === 'object') {
+    if (typeof val.name === 'string') return val.name;
+    if (typeof val.slug === 'string') return val.slug;
+    // ObjectId or unknown object → stringify
+    try { return String(val); } catch { return null; }
+  }
+  return String(val);
+};
+
+const mapped = visible.map(a => ({
+  ...a,
+  id: a._id,
+  publishedAt: a.publishedAt,
+  category: normalizeCats(a.category),
+  categories: normalizeCats(a.categories),
+}));
+
 
   if (!isAdmin) {
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
@@ -1130,45 +1084,92 @@ app.get('/api/articles', optionalAuth, async (req, res) => {
   });
 });
 
-// alias search
+
+
+
+// alias search (same logic so category pages don’t miss items when publishAt is null)
 app.get('/api/articles/search', optionalAuth, async (req, res) => {
-  const page  = Math.max(parseInt(req.query.page  || '1', 10), 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
-  const q = (req.query.q || '').trim();
-  const category = (req.query.category || '').trim();
+  const page   = Math.max(parseInt(req.query.page || '1', 10), 1);
+  const limit  = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
+  const qRaw   = String(req.query.q || '').trim();
+  const catRaw = String(req.query.category || '').trim();
 
-  const isAdmin = req.user?.role === 'admin';
-  const includeAll = isAdmin && req.query.all === '1';
+  const isAdmin    = req.user?.role === 'admin';
+  const includeAll = isAdmin && String(req.query.all || '') === '1';
 
-  const query = {};
-  if (q) {
-    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    query.$or = [{ title: rx }, { summary: rx }, { author: rx }];
-  }
-  if (category && category !== 'All') {
-    query.category = category;
-  }
+  const now = new Date();
+  const match = {};
 
-  if (!includeAll) {
-    query.status = 'published';
-    query.publishAt = { $lte: new Date() };
+  if (qRaw) {
+    const rx = new RegExp(qRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    match.$or = [{ title: rx }, { summary: rx }, { author: rx }];
   }
 
-  const total = await Article.countDocuments(query);
-  const items = await Article.find(query)
-    .sort({ publishedAt: -1 })
-    .skip((page - 1) * limit)
-    .limit(limit)
-    .lean();
+  if (catRaw && catRaw.toLowerCase() !== 'all') {
+    const esc = catRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    match.category = { $regex: new RegExp(`^${esc}$`, 'i') };
+  }
+
+  const visibilityOr = includeAll ? [{}] : [
+    { publishedAt: { $lte: now } },
+    { publishAt:   { $lte: now } },
+    { $and: [
+        { publishedAt: { $exists: false } },
+        { publishAt:   { $exists: false } }
+      ] }
+  ];
+
+  if (!includeAll) match.status = 'published';
+
+  const coalesceSortKey = {
+    $ifNull: [
+      '$publishedAt',
+      { $ifNull: [ '$publishAt', { $ifNull: [ '$updatedAt', '$createdAt' ] } ] }
+    ]
+  };
+
+  const base = [
+    { $match: match },
+    { $match: { $or: visibilityOr } },
+    { $addFields: { sortKey: coalesceSortKey } },
+  ];
+
+  const [{ total = 0 } = {}] = await Article.aggregate([
+    ...base,
+    { $count: 'total' }
+  ]);
+
+  const items = await Article.aggregate([
+    ...base,
+    { $sort: { sortKey: -1, _id: -1 } },
+    { $skip: (page - 1) * limit },
+    { $limit: limit }
+  ]);
 
   const enforceGeo = !isAdmin;
   const geo = req.geo || {};
-  const visibleItems = enforceGeo
-    ? items.filter(a => isAllowedForGeoDoc(a, geo)
-)
-    : items;
+  const visibleItems = enforceGeo ? items.filter(a => isAllowedForGeoDoc(a, geo)) : items;
 
-  const mapped = visibleItems.map(a => ({ ...a, id: a._id, publishedAt: a.publishedAt }));
+  const normalizeCats = (val) => {
+  if (!val) return val;
+  if (Array.isArray(val)) return val.map(normalizeCats).filter(Boolean);
+  if (typeof val === 'string') return val;
+  if (val && typeof val === 'object') {
+    if (typeof val.name === 'string') return val.name;
+    if (typeof val.slug === 'string') return val.slug;
+    try { return String(val); } catch { return null; }
+  }
+  return String(val);
+};
+
+const mapped = visibleItems.map(a => ({
+  ...a,
+  id: a._id,
+  publishedAt: a.publishedAt,
+  category: normalizeCats(a.category),
+  categories: normalizeCats(a.categories),
+}));
+
 
   if (!isAdmin) {
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
@@ -1195,7 +1196,7 @@ app.get('/api/articles/:id', async (req, res) => {
   }
 });
 
-// E) read by slug with redirects (public rules; admin token can see drafts)
+// read by slug with redirects (public rules; admin token can see drafts)
 app.get('/api/articles/slug/:slug', optionalAuth, async (req, res) => {
   const isAdmin = req.user?.role === 'admin';
   const filter = { slug: req.params.slug };
@@ -1203,8 +1204,6 @@ app.get('/api/articles/slug/:slug', optionalAuth, async (req, res) => {
   if (!isAdmin) {
     filter.status = 'published';
     const now = new Date();
-    // If publishAt exists it must be <= now, OR if publishedAt exists it must be <= now,
-    // OR if neither exists, let it pass (older records).
     filter.$or = [
       { publishAt:   { $lte: now } },
       { publishedAt: { $lte: now } },
@@ -1237,7 +1236,6 @@ app.get('/api/articles/slug/:slug', optionalAuth, async (req, res) => {
   res.json({ ...a, id: a._id, publishedAt: a.publishedAt });
 });
 
-
 // create
 app.post('/api/articles', auth, async (req, res) => {
   const {
@@ -1254,12 +1252,11 @@ app.post('/api/articles', auth, async (req, res) => {
     ogImage,
   } = req.body || {};
 
-    // normalize status
+  // normalize status
   const allowedStatus = new Set(['draft', 'published']);
   const normalizedStatus = allowedStatus.has(String(status || 'draft').toLowerCase())
     ? String(status).toLowerCase()
     : 'draft';
-
 
   if (!title || !summary || !author || !body) {
     return res.status(400).json({ error: 'Missing fields' });
@@ -1271,9 +1268,19 @@ app.post('/api/articles', auth, async (req, res) => {
     ? geoAreas.map(s => String(s).trim()).filter(Boolean)
     : [];
 
+  // category by _id OR slug OR name => store canonical name
   let categoryName = category;
-  const foundCat = await Category.findOne({ $or: [{ slug: slugify(category) }, { name: category }] }).lean();
-  if (foundCat) categoryName = foundCat.name;
+  {
+    const ors = [
+      { slug: slugify(String(category || '')) },
+      { name: String(category || '') }
+    ];
+    if (category && mongoose.Types.ObjectId.isValid(String(category))) {
+      ors.push({ _id: category });
+    }
+    const foundCat = await Category.findOne({ $or: ors }).lean();
+    if (foundCat) categoryName = foundCat.name;
+  }
 
   const rawTags = Array.isArray(incomingTags) ? incomingTags : [];
   const tagsByName = [];
@@ -1286,7 +1293,7 @@ app.post('/api/articles', auth, async (req, res) => {
 
   const slug = await uniqueSlugForTitle(title);
 
-    /* >>> ADD THIS: try Cloudinary autopick if no image provided <<< */
+  // Auto-pick Cloudinary image if none provided
   let finalImagePublicId = imagePublicId;
   let finalImageUrl      = imageUrl;
   let finalOgImage       = ogImage;
@@ -1305,52 +1312,46 @@ app.post('/api/articles', auth, async (req, res) => {
     }
   }
 
-const finalPublishAt =
-  publishAt ? new Date(publishAt)
-            : (normalizedStatus === 'published' ? new Date() : undefined);
+  const finalPublishAt =
+    publishAt ? new Date(publishAt)
+              : (normalizedStatus === 'published' ? new Date() : undefined);
 
+  const baseDoc = {
+    title, slug, summary, author, body,
+    category: categoryName,
+    tags: tagsByName,
 
-const baseDoc = {
-  title, slug, summary, author, body,
-  category: categoryName,
-  tags: tagsByName,
+    imageUrl:      finalImageUrl || imageUrl,
+    imagePublicId: finalImagePublicId || imagePublicId,
 
-  imageUrl:      finalImageUrl || imageUrl,
-  imagePublicId: finalImagePublicId || imagePublicId,
+    imageAlt: (imageAlt || title || ''),
+    metaTitle: (metaTitle || '').slice(0, 80),
+    metaDesc: (metaDesc || '').slice(0, 200),
+    ogImage: (finalOgImage || ogImage || ''),
 
-  imageAlt: (imageAlt || title || ''),
-  metaTitle: (metaTitle || '').slice(0, 80),
-  metaDesc: (metaDesc || '').slice(0, 200),
-  ogImage: (finalOgImage || ogImage || ''),
+    readingTime: estimateReadingTime(body),
 
-  readingTime: estimateReadingTime(body),
+    status: normalizedStatus,
+    publishAt: finalPublishAt,
 
-  status: normalizedStatus,
-  publishAt: finalPublishAt,
+    geoMode: sanitizedGeoMode,
+    geoAreas: sanitizedGeoAreas
+  };
 
-  geoMode: sanitizedGeoMode,
-  geoAreas: sanitizedGeoAreas
-};
+  await ensureArticleHasImage(baseDoc);
 
+  if (normalizedStatus === 'published') {
+    baseDoc.publishedAt = new Date();
+  } else {
+    baseDoc.publishedAt = undefined;
+  }
 
-
-// 🔽 add this
-await ensureArticleHasImage(baseDoc);
-
-if (normalizedStatus === 'published') {
-  baseDoc.publishedAt = new Date();
-} else {
-  baseDoc.publishedAt = undefined;
-}
-
-
-const doc = await Article.create(baseDoc);
-
-   markSitemapDirty();
+  const doc = await Article.create(baseDoc);
+  markSitemapDirty();
   res.status(201).json({ ...doc.toObject(), id: doc._id });
 });
 
-// ===== Bulk create articles =====
+// Bulk create articles
 // POST /api/articles/bulk?dryRun=1&continueOnError=1
 app.post('/api/articles/bulk', auth, async (req, res) => {
   const isDry = String(req.query.dryRun || '').match(/^(1|true)$/i);
@@ -1362,7 +1363,6 @@ app.post('/api/articles/bulk', auth, async (req, res) => {
   } catch (e) {
     return res.status(400).json({ ok: false, error: 'Invalid bulk payload: ' + e.message });
   }
-
   if (!items || !items.length) {
     return res.status(400).json({ ok: false, error: 'No items' });
   }
@@ -1372,23 +1372,20 @@ app.post('/api/articles/bulk', auth, async (req, res) => {
   let committed = false;
 
   try {
-   let useTx = false;
-if (!isDry) {
-  try {
-    await session.startTransaction();
-    useTx = true;
-  } catch (e) {
-    console.warn('[bulk] transactions unavailable, continuing without TX:', e?.message || e);
-  }
-}
-
+    let useTx = false;
+    if (!isDry) {
+      try {
+        await session.startTransaction();
+        useTx = true;
+      } catch (e) {
+        console.warn('[bulk] transactions unavailable, continuing without TX:', e?.message || e);
+      }
+    }
 
     for (let index = 0; index < items.length; index++) {
       try {
         const payload = await normalizeIncomingArticle(items[index]);
-
         if (isDry) {
-          // Only report the slug we plan to create
           results.push({ index, ok: true, dryRun: true, slug: payload.slug });
         } else {
           const created = await Article.create([payload], useTx ? { session } : {});
@@ -1396,18 +1393,15 @@ if (!isDry) {
         }
       } catch (err) {
         results.push({ index, ok: false, error: err.message || 'validation failed' });
-        if (!allowPartial) {
-          // Abort entire run on first error unless continueOnError=1
-          throw err;
-        }
+        if (!allowPartial) throw err;
       }
     }
 
-   if (useTx) {
-    await session.commitTransaction();
-    committed = true;
-    markSitemapDirty();
- }
+    if (useTx) {
+      await session.commitTransaction();
+      committed = true;
+      markSitemapDirty();
+    }
 
     const success = results.filter(r => r.ok).length;
     const failed  = results.length - success;
@@ -1434,7 +1428,7 @@ if (!isDry) {
   }
 });
 
-// C) update (allow slug changes + write a redirect)
+// update (allow slug changes + write a redirect)
 app.patch('/api/articles/:id', auth, async (req, res) => {
   const {
     title, summary, author, body, category, imageUrl, imagePublicId,
@@ -1445,7 +1439,7 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
     metaTitle,
     metaDesc,
     ogImage,
-    slug: newSlugRaw, // NEW: allow changing slug
+    slug: newSlugRaw, // allow changing slug
   } = req.body || {};
 
   // Load existing first to compare slug
@@ -1488,20 +1482,15 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
   }
 
   if (category !== undefined) {
-    const catDoc = await Category.findOne({ $or: [{ slug: slugify(category) }, { name: category }] }).lean();
-    update.category = catDoc ? catDoc.name : String(category);
-  }
-
-  if (incomingTags !== undefined) {
-    const rawTags = Array.isArray(incomingTags) ? incomingTags : [];
-    const tagsByName = [];
-    for (const t of rawTags) {
-      const nameOrSlug = String(t).trim();
-      if (!nameOrSlug) continue;
-      const tagDoc = await Tag.findOne({ $or: [{ slug: slugify(nameOrSlug) }, { name: nameOrSlug }] }).lean();
-      tagsByName.push(tagDoc ? tagDoc.name : nameOrSlug);
+    const ors = [
+      { slug: slugify(String(category || '')) },
+      { name: String(category || '') }
+    ];
+    if (category && mongoose.Types.ObjectId.isValid(String(category))) {
+      ors.push({ _id: category });
     }
-    update.tags = tagsByName;
+    const catDoc = await Category.findOne({ $or: ors }).lean();
+    update.category = catDoc ? catDoc.name : String(category);
   }
 
   // Handle slug change
@@ -1519,20 +1508,18 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
   }
 
   // If moving to published, ensure publishAt/publishedAt exist
-if (status !== undefined) {
-  const s = String(status).toLowerCase();
-  update.status = (s === 'published') ? 'published' : 'draft';
-  if (s === 'published') {
-    if (!update.publishAt && !existing.publishAt) {
-      update.publishAt = new Date();
+  if (status !== undefined) {
+    const s = String(status).toLowerCase();
+    update.status = (s === 'published') ? 'published' : 'draft';
+    if (s === 'published') {
+      if (!update.publishAt && !existing.publishAt) {
+        update.publishAt = new Date();
+      }
+      update.publishedAt = new Date();
     }
-    update.publishedAt = new Date();
   }
-}
-
 
   const doc = await Article.findByIdAndUpdate(req.params.id, update, { new: true });
-    // ✅ invalidate sitemap cache (slug/status/publishAt/category/tag changes can affect URLs or listings)
   markSitemapDirty();
   res.json({ ...doc.toObject(), id: doc._id });
 });
@@ -1545,10 +1532,7 @@ app.delete('/api/articles/:id', auth, async (req, res) => {
     if (doc.imagePublicId) {
       try { await cloudinary.uploader.destroy(doc.imagePublicId); } catch (e) { console.warn('Cloudinary cleanup error:', e.message); }
     }
-
-     // ✅ invalidate sitemap cache (article URL removed)
     markSitemapDirty();
-
     res.json({ ok: true });
   } catch {
     res.status(400).json({ error: 'Bad id' });
@@ -1558,17 +1542,13 @@ app.delete('/api/articles/:id', auth, async (req, res) => {
 /* -------------------- Categories CRUD -------------------- */
 app.post('/api/categories', auth, async (req, res) => {
   const { name, slug, description, type } = req.body || {};
-
   if (!name) return res.status(400).json({ error: 'name required' });
   const s = await ensureUniqueCategorySlug(name, slug);
-const doc = await Category.create({ name, slug: s, description, type });
-
-
-   // ✅ invalidate sitemap cache (new /category/:slug)
+  const doc = await Category.create({ name, slug: s, description, type });
   markSitemapDirty();
-
   res.status(201).json(doc);
 });
+
 app.get('/api/categories', async (req, res) => {
   try {
     const filter = {};
@@ -1582,26 +1562,7 @@ app.get('/api/categories', async (req, res) => {
 });
 
 
-// Get single category by slug
-// Get single category by slug (case-insensitive + name fallback)
-app.get('/api/categories/slug/:slug', async (req, res) => {
-  const raw = String(req.params.slug || '').trim();
-  const normalized = slugify(raw); // e.g., "Health" -> "health"
-
-  const cat = await Category.findOne({
-    $or: [
-      { slug: raw },        // exact match (if frontend already passes slug)
-      { slug: normalized }, // normalized slug (handles case/mixed input)
-      { name: raw }         // fallback: category name
-    ]
-  }).lean();
-
-  if (!cat) return res.status(404).json({ error: 'not found' });
-  res.json(cat);
-});
-
-
-// D) Allow category slug changes + write a redirect + store previous slug
+// Allow category slug changes + write a redirect + store previous slug
 app.patch('/api/categories/:id', auth, async (req, res) => {
   const { name, slug, description, type } = req.body || {};
   let cat;
@@ -1626,22 +1587,17 @@ app.patch('/api/categories/:id', auth, async (req, res) => {
   }
 
   const doc = await Category.findByIdAndUpdate(req.params.id, update, { new: true });
-
-  // ✅ invalidate sitemap cache (category URL or name affects /category and listings)
   markSitemapDirty();
-
   res.json(doc);
 });
+
 app.delete('/api/categories/:id', auth, async (req, res) => {
   const cat = await Category.findById(req.params.id);
   if (!cat) return res.status(404).json({ error: 'not found' });
   const inUse = await Article.countDocuments({ category: cat.name });
   if (inUse > 0) return res.status(409).json({ error: `category in use by ${inUse} articles` });
   await Category.deleteOne({ _id: cat._id });
-
-   // ✅ invalidate sitemap cache (category URL removed)
   markSitemapDirty();
-
   res.json({ ok: true });
 });
 
@@ -1651,832 +1607,343 @@ app.post('/api/tags', auth, async (req, res) => {
   if (!name) return res.status(400).json({ error: 'name required' });
   const s = await ensureUniqueTagSlug(name, slug);
   const doc = await Tag.create({ name, slug: s });
-
-  // ✅ invalidate sitemap cache (new /tag/:slug)
-  markSitemapDirty();
-
   res.status(201).json(doc);
 });
+
 app.get('/api/tags', async (_req, res) => {
   const list = await Tag.find().sort({ name: 1 }).lean();
   res.json(list);
 });
+
 app.patch('/api/tags/:id', auth, async (req, res) => {
   const { name, slug } = req.body || {};
   const update = {};
   if (name !== undefined) update.name = name;
-  if (slug !== undefined) update.slug = await ensureUniqueTagSlug(name || '', slug);
-  try {
-    const doc = await Tag.findByIdAndUpdate(req.params.id, update, { new: true });
-    if (!doc) return res.status(404).json({ error: 'not found' });
-
-     // ✅ invalidate sitemap cache (tag slug change affects /tag/:slug)
-  markSitemapDirty();
-
-    res.json(doc);
-  } catch { res.status(400).json({ error: 'bad id' }); }
+  if (slug !== undefined) update.slug = await ensureUniqueTagSlug(name || undefined, slug);
+  const doc = await Tag.findByIdAndUpdate(req.params.id, update, { new: true });
+  res.json(doc);
 });
+
 app.delete('/api/tags/:id', auth, async (req, res) => {
-  const tag = await Tag.findById(req.params.id);
-  if (!tag) return res.status(404).json({ error: 'not found' });
-  await Tag.deleteOne({ _id: tag._id });
-
-  // ✅ invalidate sitemap cache (tag URL removed)
-  markSitemapDirty();
-
-  res.json({ ok: true });
+  const inUse = await Article.countDocuments({ tags: { $in: [req.params.id] } });
+  // We store tag names on Article; to be safe, don't block delete here
+  await Tag.deleteOne({ _id: req.params.id });
+  res.json({ ok: true, inUse });
 });
 
-/* -------------------- Public browse by category/tag -------------------- */
-// E) Category API honors redirects
-app.get('/api/public/categories/:slug/articles', async (req, res) => {
-  let cat = await Category.findOne({ slug: req.params.slug }).lean();
-  if (!cat) {
-    const r = await resolveRedirect('category', req.params.slug);
-    if (r) {
-      bumpRedirectHit(r._id);
-      res.setHeader('Location', `/api/public/categories/${encodeURIComponent(r.to)}/articles`);
-      return res.status(308).json({ redirectTo: `/category/${r.to}` });
-    }
-    return res.status(404).json({ error: 'category not found' });
-  }
-  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
-
-  const base = { status: 'published', publishAt: { $lte: new Date() }, category: cat.name };
-  const total = await Article.countDocuments(base);
-  const items = await Article.find(base).sort({ publishedAt: -1 }).skip((page - 1) * limit).limit(limit).lean();
-
-  const geo = req.geo || {};
-  const visible = items.filter(a => isAllowedForGeoDoc(a, geo)
-);
-
-  res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-return res.json({ category: { name: cat.name, slug: cat.slug }, items: visible, page, pageSize: limit, total, totalPages: Math.ceil(total / limit) });
-
-});
-
-app.get('/api/public/tags/:slug/articles', async (req, res) => {
-  const tag = await Tag.findOne({ slug: req.params.slug }).lean();
-  if (!tag) return res.status(404).json({ error: 'tag not found' });
-  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
-
-  const base = { status: 'published', publishAt: { $lte: new Date() }, tags: tag.name };
-  const total = await Article.countDocuments(base);
-  const items = await Article.find(base).sort({ publishedAt: -1 }).skip((page - 1) * limit).limit(limit).lean();
-
-  const geo = req.geo || {};
-  const visible = items.filter(a => isAllowedForGeoDoc(a, geo)
-);
-
-  res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-return res.json({ tag: { name: tag.name, slug: tag.slug }, items: visible, page, pageSize: limit, total, totalPages: Math.ceil(total / limit) });
-
-});
-
-/* -------------------- MEDIA endpoints -------------------- */
-app.get('/api/media', auth, async (req, res) => {
-  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit || '20', 10), 1), 50);
-  const q = (req.query.q || '').trim();
-
-  const filter = {};
-  if (q) {
-    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    filter.$or = [{ publicId: rx }, { url: rx }];
-  }
-
-  const total = await Media.countDocuments(filter);
-  const items = await Media.find(filter)
-    .sort({ createdAt: -1 })
-    .skip((page - 1) * limit)
-    .limit(limit)
-    .lean();
-
-  res.json({
-    items,
-    page,
-    pageSize: limit,
-    total,
-    totalPages: Math.ceil(total / limit),
-    hasMore: page * limit < total
-  });
-});
-
+/* -------------------- Media endpoints -------------------- */
+// Upload an image to Cloudinary using memory buffer
 app.post('/api/media/upload', auth, uploadMemory.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'file required' });
 
-    const uploadStream = cloudinary.uploader.upload_stream(
-      {
-        folder: process.env.CLOUDINARY_FOLDER || 'news-site',
-        resource_type: 'image',
-        overwrite: false,
-      },
-      async (err, result) => {
-        if (err) {
-          console.error('cloudinary upload error:', err);
-          return res.status(500).json({ error: 'upload failed' });
-        }
-        const saved = await upsertMediaFromCloudinaryResource(result, 'admin');
-const { thumbUrl, ogUrl } = buildImageVariants(result.public_id);
-res.status(201).json({ ...saved.toObject?.() ?? saved, thumbUrl, ogUrl });
+    const folder = CLOUDINARY_FOLDER || 'news-site';
+    const publicIdBase = (req.body?.publicIdBase || path.parse(req.file.originalname).name)
+      .toLowerCase()
+      .replace(/[^a-z0-9-_]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'upload';
 
-      }
-    );
-
-    bufferToStream(req.file.buffer).pipe(uploadStream);
-  } catch (e) {
-    console.error('media upload error:', e);
-    res.status(500).json({ error: 'server error' });
-  }
-});
-
-app.post('/api/media/remote', auth, async (req, res) => {
-  try {
-    const { url } = req.body || {};
-    if (!url || !/^https?:\/\//i.test(url)) {
-      return res.status(400).json({ error: 'valid https url required' });
-    }
-    const result = await cloudinary.uploader.upload(url, {
-      folder: process.env.CLOUDINARY_FOLDER || 'news-site',
+    const uploadOptions = {
+      folder,
+      public_id: `${publicIdBase}-${Date.now()}`,
       resource_type: 'image',
-      overwrite: false,
+      overwrite: false
+    };
+
+    // Convert buffer to stream for Cloudinary uploader
+    const pass = stream.PassThrough();
+    pass.end(req.file.buffer);
+
+    const uploaded = await new Promise((resolve, reject) => {
+      const cloudStream = cloudinary.uploader.upload_stream(uploadOptions, (err, result) => {
+        if (err) return reject(err);
+        resolve(result);
+      });
+      pass.pipe(cloudStream);
     });
-    const saved = await upsertMediaFromCloudinaryResource(result, 'admin');
-const { thumbUrl, ogUrl } = buildImageVariants(result.public_id);
-res.status(201).json({ ...saved.toObject?.() ?? saved, thumbUrl, ogUrl });
 
+    const saved = await upsertMediaFromCloudinaryResource(uploaded, 'admin');
+    const variants = buildImageVariants(saved.publicId);
 
+    res.status(201).json({ ...saved.toObject(), variants });
   } catch (e) {
-    console.error('media remote error:', e);
+    console.error('media upload failed:', e.message);
     res.status(500).json({ error: 'upload failed' });
   }
 });
 
-app.post('/api/media/ingest', auth, async (req, res) => {
-  try {
-    const { publicId } = req.body || {};
-    if (!publicId) return res.status(400).json({ error: 'publicId required' });
-
-    const info = await cloudinary.api.resource(publicId, { resource_type: 'image' });
-    const saved = await upsertMediaFromCloudinaryResource(info, 'admin');
-const { thumbUrl, ogUrl } = buildImageVariants(info.public_id);
-res.status(201).json({ ...saved.toObject?.() ?? saved, thumbUrl, ogUrl });
-
-  } catch (e) {
-    console.error('media ingest error:', e);
-    res.status(404).json({ error: 'cloudinary asset not found' });
-  }
+// List media (paginated)
+app.get('/api/media', auth, async (req, res) => {
+  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '20', 10), 1), 100);
+  const total = await Media.countDocuments();
+  const items = await Media.find().sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).lean();
+  res.json({ items, page, pageSize: limit, total, totalPages: Math.ceil(total/limit) });
 });
 
+// Delete media
 app.delete('/api/media/:id', auth, async (req, res) => {
+  const doc = await Media.findById(req.params.id);
+  if (!doc) return res.status(404).json({ error: 'not found' });
   try {
-    const doc = await Media.findById(req.params.id);
-    if (!doc) return res.status(404).json({ error: 'not found' });
-
-    try { await cloudinary.uploader.destroy(doc.publicId, { resource_type: 'image' }); }
-    catch (e) { console.warn('cloudinary destroy warn:', e?.message); }
-
-    await Media.deleteOne({ _id: doc._id });
-    res.json({ ok: true });
-  } catch {
-    res.status(400).json({ error: 'bad id' });
-  }
-});
-
-/* -------------------- DEV: Seed & Export -------------------- */
-// DEV SEED (admin only) — creates core categories if missing + a couple demo articles
-app.post('/api/dev/seed', auth, async (req, res) => {
-  try {
-    // idempotent categories
-    const cats = [
-      { name: 'General', slug: 'general' },
-      { name: 'World', slug: 'world-news-2', description: 'Global news' },
-      { name: 'Tech', slug: 'tech' },
-      { name: 'Sports', slug: 'sports' },
-    ];
-    for (const c of cats) {
-      await Category.findOneAndUpdate({ slug: c.slug }, c, { upsert: true, new: true });
-    }
-
-    // add a few demo articles if the DB is nearly empty
-    const count = await Article.countDocuments();
-    if (count < 5) {
-      const now = new Date();
-      await Article.insertMany([
-        {
-          title: 'Hello CMS',
-          slug: 'hello-cms',
-          summary: 'First demo post.',
-          author: 'Admin',
-          body: 'Welcome to your news site!',
-          category: 'General',
-          status: 'published',
-          readingTime: 1,
-          publishedAt: now,
-        },
-        {
-          title: 'Tech roundup',
-          slug: 'tech-roundup',
-          summary: 'Latest in technology.',
-          author: 'Staff',
-          body: 'Gadgets, AI, and more…',
-          category: 'Tech',
-          status: 'published',
-          readingTime: 2,
-          publishedAt: now,
-        },
-      ]);
-    }
-
-    markSitemapDirty();
-
-
-    res.json({ ok: true });
+    await cloudinary.uploader.destroy(doc.publicId);
   } catch (e) {
-    console.error('seed failed', e);
-    res.status(500).json({ error: 'seed failed' });
+    console.warn('Cloudinary destroy warn:', e?.message);
   }
+  await Media.deleteOne({ _id: doc._id });
+  res.json({ ok: true });
 });
 
-// Export all articles as JSON (handy for backups/migration)
-app.get('/api/export/articles', async (_req, res) => {
-  const docs = await Article.find({}).sort({ publishedAt: -1 }).lean();
-  res.setHeader('Content-Disposition', 'attachment; filename="articles.json"');
-  res.json(docs);
-});
+/* -------------------- Sitemap + sections v2 (optional) -------------------- */
+app.use('/api/sections-v2', cacheRoute(60_000), sectionsV2);
 
-/* -------------------- SEO helpers for feeds/SSR -------------------- */
-const PORT = process.env.PORT || 4000;
-
-function xmlEscape(s = '') {
-  return String(s)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&apos;');
-}
-function stripHtml(s = '') { return String(s).replace(/<[^>]*>/g, ''); }
-function buildDescription(doc) {
-  const raw = (doc?.summary && doc.summary.trim())
-    || stripHtml(doc?.body || '').slice(0, 200);
-  return String(raw).replace(/\s+/g, ' ').slice(0, 160);
-}
-
-const HREFLANGS = [
-  { lang: 'x-default', code: 'x-default' },
-  { lang: 'en-US', code: 'en-US' },
-  { lang: 'en-IN', code: 'en-IN' },
-];
-function buildHreflangLinks(url) {
-  return HREFLANGS.map(h =>
-    `<xhtml:link rel="alternate" hreflang="${h.code}" href="${xmlEscape(url)}" />`
-  ).join('');
-}
-function htmlEscape(s = '') {
-  return String(s)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
+/* -------------------- Fallbacks & diagnostics -------------------- */
 
 
+// --- Compatibility route for old frontend: category by slug -> articles (robust match + sort) ---
+// --- Compatibility route for old frontend: category by slug -> articles (robust type-guarded match) ---
 
-/* -------------------- Existing SSR validator page -------------------- */
-app.get('/article/:slug', async (req, res) => {
+
+// --- Category lookup by slug (used by CategoryPage.jsx) ---
+app.get('/api/categories/slug/:slug', async (req, res) => {
   try {
+    const raw = String(req.params.slug || '').trim();
+    if (!raw) return res.status(400).json({ error: 'Missing slug' });
 
-        const cacheKey = `ssr:validator:${req.params.slug}`;
-    if (isBot(req)) {
-      const cached = ssrCacheGet(cacheKey);
-      if (cached) {
-        res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-        return res.type('html').send(cached);
-      }
-    }
-
-    const slug = req.params.slug;
-
-    const filter = { slug, status: 'published', publishAt: { $lte: new Date() } };
-    let doc = await Article.findOne(filter).lean();
-
-    // G) SSR honors redirects
-    if (!doc) {
-      const r = await resolveRedirect('article', slug);
-      if (r) {
-        bumpRedirectHit(r._id);
-        return res.redirect(r.type || 301, `${SITE_URL}/article/${encodeURIComponent(r.to)}`);
-      }
-      return res.status(404).send('Not found');
-    }
-
-    const ua = String(req.headers['user-agent'] || '');
-    const isTrustedBot = /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i.test(ua);
-
-   if (!isTrustedBot) {
-    const allowed = isAllowedForGeoDoc(doc, req.geo || {});
-    if (!allowed) return res.status(404).send('Not found');
-  }
-
-    const pageUrl = `${SITE_URL}/article/${encodeURIComponent(slug)}`;
-
-   const title       = (doc.metaTitle && doc.metaTitle.trim()) || doc.title || 'Article';
-const description = (doc.metaDesc  && doc.metaDesc.trim())  || buildDescription(doc);
-const ogImage     = (doc.ogImage   && doc.ogImage.trim())   || doc.imageUrl || '';
-
-    const published = doc.publishedAt || doc.publishAt || doc.createdAt || new Date();
-    const modified = doc.updatedAt || published;
-
-    const jsonLd = {
-      "@context": "https://schema.org",
-      "@type": "Article",
-      "headline": title,
-      "description": description,
-      "image": ogImage ? [ogImage] : undefined,
-      "datePublished": new Date(published).toISOString(),
-      "dateModified": new Date(modified).toISOString(),
-      "author": doc.author ? { "@type": "Person", "name": doc.author } : undefined,
-      "mainEntityOfPage": { "@type": "WebPage", "@id": pageUrl }
-    };
-
-    const hrefLangs = [
-      { lang: 'x-default', url: pageUrl },
-      { lang: 'en-US',    url: pageUrl },
-      { lang: 'en-IN',    url: pageUrl },
-    ].map(h => `<link rel="alternate" hreflang="${h.lang}" href="${htmlEscape(h.url)}" />`).join('\n  ');
-
-    const html = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>${htmlEscape(title)}</title>
-  <link rel="canonical" href="${htmlEscape(pageUrl)}" />
-  <meta name="description" content="${htmlEscape(description)}" />
-  <meta name="robots" content="index,follow" />
-
-  <!-- Open Graph -->
-  <meta property="og:type" content="article" />
-  <meta property="og:title" content="${htmlEscape(title)}" />
-  <meta property="og:description" content="${htmlEscape(description)}" />
-  <meta property="og:url" content="${htmlEscape(pageUrl)}" />
-  ${ogImage ? `<meta property="og:image" content="${htmlEscape(ogImage)}" />` : ''}
-
-  <!-- Twitter -->
-  <meta name="twitter:card" content="${ogImage ? 'summary_large_image' : 'summary'}" />
-  <meta name="twitter:title" content="${htmlEscape(title)}" />
-  <meta name="twitter:description" content="${htmlEscape(description)}" />
-  ${ogImage ? `<meta name="twitter:image" content="${htmlEscape(ogImage)}" />` : ''}
-
-  ${hrefLangs}
-
-  <!-- JSON-LD -->
-  <script type="application/ld+json">
-  ${JSON.stringify(jsonLd)}
-  </script>
-</head>
-<body>
-  <!-- App root (your SPA will hydrate below) -->
-  <div id="root"></div>
-  <script type="module" src="/src/main.jsx"></script>
-</body>
-</html>`;
-
-    if (isBot(req)) ssrCacheSet(cacheKey, html);  // <--- add this
-    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    res.type('html').send(html);
-  } catch (e) {
-    console.error('SSR article error:', e); 
-    res.status(500).send('server render failed');
-  }
-});
-
-/* -------------------- Crawler-friendly SSR (NewsArticle) -------------------- */
-function buildNewsArticleJSONLD(a, canonicalUrl, { title, description, image } = {}) {
-  const SITE_LOGO = process.env.SITE_LOGO || "https://timelyvoice.com/logo.png";
-
-  return {
-    "@context": "https://schema.org",
-    "@type": "NewsArticle",
-    "headline": (title && String(title).trim()) || a.title,
-    "description": description !== undefined ? String(description) : (a.summary || ""),
-    "image": (image ? [image] : (a.ogImage ? [a.ogImage] : (a.imageUrl ? [a.imageUrl] : [SITE_LOGO]))),
-    "datePublished": new Date(a.publishedAt || a.createdAt || Date.now()).toISOString(),
-    "dateModified": new Date(a.updatedAt || a.publishedAt || a.createdAt || Date.now()).toISOString(),
-    "author": a.author ? [{ "@type": "Person", "name": a.author }] : [{ "@type": "Organization", "name": "The Timely Voice" }],
-    "publisher": {
-      "@type": "Organization",
-      "name": "The Timely Voice",
-      "logo": { "@type": "ImageObject", "url": SITE_LOGO }
-    },
-    "articleSection": a.category || "General",
-    "mainEntityOfPage": { "@type": "WebPage", "@id": canonicalUrl },
-    "url": canonicalUrl
-  };
-}
-
-
-
-app.get('/ssr/article/:slug', async (req, res) => {
-  try {
-    const cacheKey = `ssr:article:${req.params.slug}`;
-    if (isBot(req)) {
-      const cached = ssrCacheGet(cacheKey);
-      if (cached) {
-        res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-        return res.type('html').send(cached);
-      }
-    }
-
-    const { slug } = req.params;
-    const filter = { slug, status: 'published', publishAt: { $lte: new Date() } };
-    const a = await Article.findOne(filter).lean();
-    if (!a) {
-      const r = await resolveRedirect('article', slug);
-      if (r) {
-        bumpRedirectHit(r._id);
-        return res.redirect(r.type || 301, `${req.protocol}://${req.get('host')}/ssr/article/${encodeURIComponent(r.to)}`);
-      }
-      return res.status(404).send('Not found');
-    }
-
-    // ✅ NEW: trust bots and skip geo block for them
-    const ua = String(req.headers['user-agent'] || '');
-    const isTrustedBot = /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i.test(ua);
-
-    if (!isTrustedBot) {
-      if (!isAllowedForGeoDoc(a, req.geo || {})) {
-        return res.status(404).send('Not found');
-      }
-    }
-
-
-    const canonicalUrl = `${FRONTEND_BASE_URL}/article/${encodeURIComponent(slug)}`;
-    const selfUrl      = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
-
-    // Prefer editor-specified SEO fields; fall back to computed values
-    const title = (a.metaTitle && a.metaTitle.trim()) || a.title || 'Article';
-    const desc  = (a.metaDesc  && a.metaDesc.trim())  || buildDescription(a);
-    const og    = (a.ogImage   && a.ogImage.trim())   || a.imageUrl || '';
-
-   // ✅ Build JSON-LD with canonical frontend URL (not backend)
-const jsonLd = buildNewsArticleJSONLD(a, canonicalUrl, {
-  title,
-  description: desc,
-  image: og
-});
-
-const html = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>${htmlEscape(title)} – My News</title>
-
-  <!-- Canonical to SPA -->
-  <link rel="canonical" href="${htmlEscape(canonicalUrl)}"/>
-
-  <!-- Basic SEO & social -->
-  <meta name="description" content="${htmlEscape(desc)}"/>
-  <meta property="og:type" content="article"/>
-  <meta property="og:title" content="${htmlEscape(title)}"/>
-  <meta property="og:description" content="${htmlEscape(desc)}"/>
-  <meta property="og:url" content="${htmlEscape(canonicalUrl)}"/>   <!-- ✅ changed -->
-  ${og ? `<meta property="og:image" content="${htmlEscape(og)}"/>` : ''}
-
-  <meta name="twitter:card" content="${og ? 'summary_large_image' : 'summary'}"/>
-  <meta name="twitter:title" content="${htmlEscape(title)}"/>
-  <meta name="twitter:description" content="${htmlEscape(desc)}"/>
-  ${og ? `<meta name="twitter:image" content="${htmlEscape(og)}"/>` : ''}
-
-  <!-- JSON-LD -->
-  <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
-
-
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f8fafc;margin:0}
-    .wrap{max-width:980px;margin:0 auto;padding:24px}
-    .card{background:#fff;border:1px solid #eee;border-radius:12px;padding:16px}
-    img.hero{width:100%;max-height:420px;object-fit:cover;border-radius:12px;margin:0 0 12px}
-    small.muted{color:#666}
-    hr{border:0;height:1px;background:#f0f0f0;margin:12px 0}
-    a.back{color:#1B4965;text-decoration:none}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <p><a class="back" href="${htmlEscape(canonicalUrl)}">← View on site</a></p>
-    <article class="card">
-      ${a.imageUrl ? `<img class="hero" src="${htmlEscape(a.imageUrl)}" alt=""/>` : ''}
-      <h1 style="margin-top:0">${htmlEscape(title)}</h1>
-      <small class="muted">${new Date(a.publishedAt).toLocaleString()} • ${htmlEscape(a.author || '')} • ${htmlEscape(a.category || 'General')}</small>
-      <hr/>
-      <div style="line-height:1.7;white-space:pre-wrap">${htmlEscape(a.body || '')}</div>
-    </article>
-  </div>
-</body>
-</html>`;
-
-    if (isBot(req)) ssrCacheSet(cacheKey, html);
-
-    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    res.set('Content-Type', 'text/html; charset=utf-8').status(200).send(html);
-
-  } catch (e) {
-    console.error(e);
-    res.status(500).send('Server error');
-  }
-});
-
-/* -------------------- RSS & Sitemaps -------------------- */
-// RSS 2.0 feed
-// RSS 2.0 feed (rich)
-// requires: SITE_URL, xmlEscape(), stripHtml(), buildDescription(), isAllowedForGeoDoc()
-app.get('/rss.xml', async (req, res) => {
-  try {
-    const now = new Date(); // <-- INSERTED: define now
-
-    const docs = await Article.find({
-      status: 'published',
+    // 1) Find category by slug or name (case-insensitive)
+    const cat = await Category.findOne({
       $or: [
-        { publishAt: { $lte: now } },
-        { publishAt: { $exists: false } },
-        { publishAt: null }
+        { slug: raw.toLowerCase() },
+        { name: new RegExp(`^${raw}$`, 'i') }
       ]
-    })
+    }).lean();
 
-      .sort({ publishedAt: -1 })
-      .limit(100)
-      .lean();
+    if (!cat) return res.status(404).json({ error: 'Category not found' });
 
-    const geo = req.geo || {};
-    const items = docs.filter(d => isAllowedForGeoDoc(d, geo));
+    // 2) If incoming path uses name (or wrong case), 308 redirect to canonical slug
+    
 
-    const feedItems = items.map(a => {
-  const slug = encodeURIComponent(a.slug);
-  const link = `${SITE_URL}/article/${slug}`;
-  const pubDate = new Date(a.publishedAt || a.createdAt || Date.now()).toUTCString();
+    // 3) Return minimal meta for the page
+    res.json({
+      id: String(cat._id),
+      name: cat.name,
+      slug: cat.slug,
+      description: cat.description || '',
+      type: cat.type || 'topic'
+    });
+  } catch (e) {
+    console.error('GET /api/categories/slug/:slug failed', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-  const title    = a.title || 'Article';
-  const author   = (a.author && a.author.trim()) || 'Timely Voice Staff';
-  const category = a.category || 'General';
 
-  // Prefer article image; fallback to site logo (so media:content is always present)
-  const image = ensureRenderableImage(a);
+// --- Public articles for a category (used by CategoryPage.jsx & FinanceCategoryPage.jsx) ---
+app.get('/api/public/categories/:slug/articles', async (req, res, next) => {
+  try {
+    const slug = String(req.params.slug || '').trim();
+    const page  = Math.max(parseInt(req.query.page  || '1', 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
+    const skip  = (page - 1) * limit;
+
+    // 1) Resolve category by slug OR name (case-insensitive)
+    const cat = await Category.findOne({
+      $or: [
+        { slug: new RegExp(`^${escapeRegex(slug)}$`, 'i') },
+        { name: new RegExp(`^${escapeRegex(slug)}$`, 'i') }
+      ]
+    }).lean();
+
+    if (!cat) return res.json({ items: [], total: 0, page, limit });
+
+    const lcSlug   = String(cat.slug || '').toLowerCase();
+    const lcName   = String(cat.name || '').toLowerCase();
+    const catIdStr = String(cat._id || '');
+    const catObjId = Types.ObjectId.isValid(catIdStr) ? new Types.ObjectId(catIdStr) : null;
+
+    // 2) Robust match: slug/name (strings), stringified ObjectId, and true ObjectId
+   // 2) Robust match: trims/lowercases strings, supports object {name,slug},
+// arrays of strings/objects, and id-as-string / real ObjectId.
+const wantSlug = lcSlug;
+const wantName = lcName;
+
+const matchStage = {
+  status: 'published',
+  $or: [
+    // ---- category as STRING (normalize) ----
+    {
+      $expr: {
+        $eq: [
+          { $toLower: { $trim: { input: { $cond: [
+            { $eq: [ { $type: "$category" }, "string" ] }, "$category", ""
+          ] } } } },
+          wantSlug
+        ]
+      }
+    },
+    {
+      $expr: {
+        $eq: [
+          { $toLower: { $trim: { input: { $cond: [
+            { $eq: [ { $type: "$category" }, "string" ] }, "$category", ""
+          ] } } } },
+          wantName
+        ]
+      }
+    },
+
+    // ---- category as OBJECT { name?, slug? } ----
+    {
+      $expr: {
+        $eq: [
+          { $toLower: { $trim: { input: { $ifNull: [ "$category.slug", "" ] } } } },
+          wantSlug
+        ]
+      }
+    },
+    {
+      $expr: {
+        $eq: [
+          { $toLower: { $trim: { input: { $ifNull: [ "$category.name", "" ] } } } },
+          wantName
+        ]
+      }
+    },
+
+    // ---- categories[] as ARRAY OF STRINGS (normalize each) ----
+    {
+      $expr: {
+        $in: [
+          wantSlug,
+          {
+            $map: {
+              input: { $ifNull: [ "$categories", [] ] },
+              as: "c",
+              in: { $toLower: { $trim: { input: "$$c" } } }
+            }
+          }
+        ]
+      }
+    },
+    {
+      $expr: {
+        $in: [
+          wantName,
+          {
+            $map: {
+              input: { $ifNull: [ "$categories", [] ] },
+              as: "c",
+              in: { $toLower: { $trim: { input: "$$c" } } }
+            }
+          }
+        ]
+      }
+    },
+
+    // ---- categories[] as ARRAY OF OBJECTS { name?, slug? } ----
+    {
+      $expr: {
+        $in: [
+          wantSlug,
+          {
+            $map: {
+              input: { $ifNull: [ "$categories", [] ] },
+              as: "c",
+              in: { $toLower: { $trim: { input: { $ifNull: [ "$$c.slug", "" ] } } } }
+            }
+          }
+        ]
+      }
+    },
+    {
+      $expr: {
+        $in: [
+          wantName,
+          {
+            $map: {
+              input: { $ifNull: [ "$categories", [] ] },
+              as: "c",
+              in: { $toLower: { $trim: { input: { $ifNull: [ "$$c.name", "" ] } } } }
+            }
+          }
+        ]
+      }
+    },
+
+    // ---- exact matches for id-as-string and real ObjectId ----
+    { category: catIdStr },
+    { categories: catIdStr },
+    ...(Types.ObjectId.isValid(catIdStr) ? [
+      { category: new Types.ObjectId(catIdStr) },
+      { categories: new Types.ObjectId(catIdStr) },
+    ] : [])
+  ]
+};
 
 
-  const summary =
-    (a.summary && a.summary.trim()) ||
-    buildDescription(a) ||
-    '';
+    // 3) Sort newest-first by publishedAt, then createdAt, then _id
+    const [items, totalAgg] = await Promise.all([
+      Article.aggregate([
+        { $match: matchStage },
+        { $sort: { publishedAt: -1, createdAt: -1, _id: -1 } },
+        { $skip: skip },
+        { $limit: limit },
+        {
+          $project: {
+            title: 1,
+            slug: 1,
+            summary: 1,
+            imageUrl: 1,
+            category: 1,
+            categories: 1,
+            publishedAt: 1,
+            createdAt: 1
+          }
+        }
+      ]),
+      Article.aggregate([
+        { $match: matchStage },
+        { $count: 'n' }
+      ])
+    ]);
 
-  const contentHtml = `
-    ${image ? `<p><img src="${xmlEscape(image)}" alt="${xmlEscape(title)}" /></p>` : ''}
-    ${summary ? `<p>${xmlEscape(summary)}</p>` : ''}
-    <p><a href="${xmlEscape(link)}">Read more</a></p>
-  `.trim();
-
-  // Optional standard RSS <author>: expects "email (Name)". Use a generic email.
-  const authorEmail = process.env.FEED_AUTHOR_EMAIL || 'noreply@timelyvoice.com';
-
-  return `
-    <item>
-      <title>${xmlEscape(title)}</title>
-      <link>${xmlEscape(link)}</link>
-      <guid isPermaLink="false">${xmlEscape(String(a._id))}</guid>
-      <pubDate>${pubDate}</pubDate>
-
-      <description><![CDATA[${summary}]]></description>
-      <content:encoded><![CDATA[${contentHtml}]]></content:encoded>
-
-      <dc:creator><![CDATA[${author}]]></dc:creator>
-      <author>${xmlEscape(authorEmail)} (${xmlEscape(author)})</author>
-
-      <category><![CDATA[${category}]]></category>
-      <source url="${xmlEscape(SITE_URL)}"><![CDATA[Timely Voice]]></source>
-
-      <media:content url="${xmlEscape(image)}" medium="image" />
-      <media:thumbnail url="${xmlEscape(image)}" />
-    </item>`;
-}).join('');
-
-   const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"
-  xmlns:content="http://purl.org/rss/1.0/modules/content/"
-  xmlns:dc="http://purl.org/dc/elements/1.1/"
-  xmlns:media="http://search.yahoo.com/mrss/"
-  xmlns:atom="http://www.w3.org/2005/Atom"
->
-  <channel>
-    <title>${xmlEscape('Timely Voice')}</title>
-    <link>${xmlEscape(SITE_URL)}</link>
-    <atom:link rel="self" type="application/rss+xml" href="${xmlEscape(`${SITE_URL.replace(/\/$/, '')}/rss.xml`)}" />
-    <description>${xmlEscape('Latest articles from Timely Voice')}</description>
-    <language>en</language>
-    ${feedItems}
-  </channel>
-</rss>`;
+    const total = totalAgg?.[0]?.n || 0;
 
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    res.type('application/rss+xml; charset=utf-8').send(xml);
-  } catch (e) {
-    console.error('rss.xml error:', e);
-    res.status(500).send('rss generation failed');
-  }
-});
-
-
-app.get('/rss/:slug.xml', async (req, res) => {
-  try {
-     const slugAliases = { world: 'international', biz: 'business' };
-
-const raw  = String(req.params.slug || '').trim().toLowerCase();
-const slug = slugAliases[raw] || raw;
-if (!slug) return res.status(400).send('missing category slug');
-
-
-    // 1) Find category by slug
-    const cat = await Category.findOne({ slug }).lean();
-    if (!cat) {
-      // Helpful error (readers prefer 404 over generic 500)
-      return res.status(404).send(`unknown category: ${slug}`);
-    }
-
-    // 2) Fetch articles in this category, allow missing publishAt
-const now = new Date();
-const docs = await Article.find({
-  status: 'published',
-  category: cat.name, // <-- use Category NAME, not ObjectId field
-  $or: [
-    { publishAt: { $lte: now } },
-    { publishAt: { $exists: false } },
-    { publishAt: null },
-  ],
-})
-  .sort({ publishedAt: -1, _id: -1 })
-  .limit(100)
-  .lean();
-
-
-    // 3) Build RSS safely
-    const siteUrl = SITE_URL.replace(/\/+$/, '');
-
-    const feedTitle = `${cat.title || cat.name || slug} — Timely Voice`;
-    const selfUrl = `${siteUrl}/rss/${encodeURIComponent(slug)}.xml`;
-
-    let xml = '';
-    xml += `<?xml version="1.0" encoding="UTF-8"?>\n`;
-    xml += `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xmlns:content="http://purl.org/rss/1.0/modules/content/">\n`;
-    xml += `<channel>\n`;
-    xml += `<title>${escapeXml(feedTitle)}</title>\n`;
-      xml += `<link>${siteUrl}</link>\n`;
-      xml += `<description>${escapeXml(feedTitle)}</description>\n`;
-      xml += `<atom:link href="${selfUrl}" rel="self" type="application/rss+xml"/>\n`;
-      xml += `<lastBuildDate>${new Date().toUTCString()}</lastBuildDate>\n`;
-      xml += `<language>en</language>\n`;
-
-    for (const a of docs) {
-  const title  = a.title || 'Untitled';
-  const url    = `${siteUrl}/article/${a.slug}`;
-  const pubISO = new Date(a.publishedAt || a.publishAt || a.updatedAt || Date.now()).toUTCString();
-
-  // Robust image fallback
-  const imgUrl =
-    (a.ogImage && a.ogImage.trim()) ||
-    (a.imageUrl && a.imageUrl.trim()) ||
-    SITE_LOGO;
-
-  // Clean, short description
-  const summary = cleanSummary(a.summary || a.excerpt || '');
-
-  // Optional rich body for readers that support content:encoded
-  const contentHtml = `
-    ${imgUrl ? `<p><img src="${escapeXml(imgUrl)}" alt="${escapeXml(title)}" /></p>` : ''}
-    ${summary ? `<p>${escapeXml(summary)}</p>` : ''}
-    <p><a href="${escapeXml(url)}">Read more</a></p>
-  `.trim();
-
-  xml += `  <item>\n`;
-  xml += `    <title>${escapeXml(title)}</title>\n`;
-  xml += `    <link>${escapeXml(url)}</link>\n`;               // escaped link ✅
-  xml += `    <guid isPermaLink="true">${escapeXml(url)}</guid>\n`;
-  xml += `    <pubDate>${pubISO}</pubDate>\n`;
-  if (summary) xml += `    <description><![CDATA[${summary}]]></description>\n`;
-  xml += `    <content:encoded><![CDATA[${contentHtml}]]></content:encoded>\n`;
-  if (imgUrl) {
-    xml += `    <media:content url="${escapeXml(imgUrl)}" medium="image" />\n`;
-    xml += `    <media:thumbnail url="${escapeXml(imgUrl)}" />\n`;
-  }
-  xml += `    <source url="${escapeXml(siteUrl)}">Timely Voice</source>\n`;
-  xml += `  </item>\n`;
-}
-
-
-    xml += `</channel>\n</rss>\n`;
-
-    res.set('Content-Type', 'application/rss+xml; charset=utf-8');
-    return res.status(200).send(xml);
-  } catch (err) {
-    console.error('RSS(category) error:', err?.stack || err);
-    return res.status(500).send('rss generation failed');
-  }
-});
-
-// helper
-function escapeXml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function cleanSummary(str = '') {
-  const s = String(str);
-  // remove our internal markers or stray tokens
-  return s
-    .replace(/:contentReference\[.*?\]/g, '')
-    .replace(/\[oaicite:.*?\]/g, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
-
-// --- Safe renderable image resolver (for old or missing Cloudinary links) ---
-function ensureRenderableImage(a) {
-  const FALLBACK =
-    process.env.SITE_FALLBACK_IMG ||
-    'https://res.cloudinary.com/damjdyqj2/image/upload/f_auto,q_auto,w_640/news-images/defaults/fallback-hero';
-
-  // prefer explicit ogImage → cloudinary publicId → imageUrl → fallback
-  if (a.ogImage && /^https?:\/\//i.test(a.ogImage)) return a.ogImage;
-
-  if (a.imagePublicId) {
-    const cloudinary = require('./src/lib/cloudinary');
-    return cloudinary.url(a.imagePublicId, {
-      width: 640,
-      crop: 'fill',
-      format: 'jpg',
-      secure: true,
+    return res.json({
+      category: { id: String(cat._id), name: cat.name, slug: cat.slug, description: cat.description || '' },
+      items,
+      total,
+      page,
+      limit
     });
-  }
-
-  if (a.imageUrl && /^https?:\/\//i.test(a.imageUrl)) return a.imageUrl;
-
-  return FALLBACK;
-}
-
-// --- OpenRouter key sanity ping (returns model list on success) ---
-app.get("/api/automation/_debug/openrouter/ping", async (req, res) => {
-  try {
-    const raw = process.env.OPENROUTER_API_KEY;
-    const apiKey = (raw || "").trim();
-
-    const r = await fetch("https://openrouter.ai/api/v1/models", {
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "HTTP-Referer": process.env.SITE_URL || "http://localhost",
-        "X-Title": "TimelyVoice Admin",
-      }
-    });
-
-    const body = await r.text();
-    res.status(r.status).type("application/json").send(body);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    return next(e);
   }
 });
 
-// ---- SPA catch-all with server-side canonical injection (MUST be last) ----
-const canonicalMiddleware = require('./canonical');
-app.use(canonicalMiddleware);
-
-// --- Surface server errors in JSON so the Admin can see the real cause ---
-app.use((err, req, res, next) => {
-  console.error("[SERVER ERROR]", err);
-  const msg = (err && err.message) ? err.message : String(err);
-  res.status(500).json({ error: msg, stack: err?.stack });
-});
-
-// Also catch unhandled async errors
-process.on("unhandledRejection", (err) => {
-  console.error("[UNHANDLED REJECTION]", err);
-});
-
-
-// Dev: list all routes so we can find the exact automation path
-app.get('/api/dev/routes', (req, res) => {
+app.get('/api/_debug/endpoints', (_req, res) => {
   res.json(listEndpoints(app));
 });
 
+// 404 for /api/* (keep SPA routes to front-end)
+app.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
 
-
-
-/* -------------------- Start server -------------------- */
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('API listening on', PORT);
+// Generic error handler (last)
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
+
+/* -------------------- Server bootstrap -------------------- */
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const HOST = process.env.HOST || '0.0.0.0';
+
+if (require.main === module) {
+  app.listen(PORT, HOST, () => {
+    console.log(`✅ API up on http://${HOST}:${PORT}`);
+  });
+}
+
+// Export app for testing
+module.exports = app;

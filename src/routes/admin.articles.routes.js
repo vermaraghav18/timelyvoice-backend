@@ -136,6 +136,12 @@ function normalizeArticlesWithCategories(items, categoriesMapById = new Map(), c
   });
 }
 
+// Render-safe category text for admin UI cells
+const toCatText = (v) =>
+  Array.isArray(v) ? v.map(toCatText).filter(Boolean)
+  : (v && typeof v === 'object') ? (v.name || v.slug || '')
+  : (v || '');
+
 // ────────────────────────────────────────────────────────────────────────────────
 // CLOUDINARY PUBLIC ID DERIVER (for pasted image URLs)
 
@@ -209,7 +215,12 @@ router.get('/drafts', async (req, res) => {
     const categoriesMapById = new Map((docsById || []).map(d => [String(d._id), d]));
     const categoriesMapByName = new Map((docsByName || []).map(d => [d.name, d]));
 
-    const drafts = normalizeArticlesWithCategories(rawDrafts, categoriesMapById, categoriesMapByName);
+    const normalizedDrafts = normalizeArticlesWithCategories(rawDrafts, categoriesMapById, categoriesMapByName);
+    const drafts = normalizedDrafts.map(a => ({
+      ...a,
+      category: toCatText(a.category),
+      categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : []
+    }));
 
     res.json(drafts);
   } catch (err) {
@@ -301,7 +312,12 @@ router.get('/', async (req, res) => {
     const categoriesMapById = new Map((docsById || []).map(d => [String(d._id), d]));
     const categoriesMapByName = new Map((docsByName || []).map(d => [d.name, d]));
 
-    const items = normalizeArticlesWithCategories(rawItems, categoriesMapById, categoriesMapByName);
+    const normalized = normalizeArticlesWithCategories(rawItems, categoriesMapById, categoriesMapByName);
+    const items = normalized.map(a => ({
+      ...a,
+      category: toCatText(a.category),
+      categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : []
+    }));
 
     res.json({ items, total, page: pageNum, limit: perPage });
   } catch (err) {
@@ -319,7 +335,10 @@ router.get('/:id', async (req, res) => {
     if (!raw) return res.status(404).json({ error: 'not_found' });
 
     const items = normalizeArticlesWithCategories([raw]);
-    res.json(items[0]);
+    const a = items[0];
+    a.category = toCatText(a.category);
+    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    res.json(a);
   } catch (err) {
     console.error('[admin.articles] get error', err);
     res.status(500).json({ error: 'failed_to_get_article' });
@@ -420,7 +439,10 @@ router.patch('/:id', async (req, res) => {
 
     // normalize category in patch response too
     const items = normalizeArticlesWithCategories([updated]);
-    res.json(items[0]);
+    const a = items[0];
+    a.category = toCatText(a.category);
+    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    res.json(a);
   } catch (err) {
     console.error('[admin.articles] patch error', err);
     res.status(500).json({ error: 'failed_to_update_article' });
@@ -442,7 +464,10 @@ router.post('/:id/publish', async (req, res) => {
 
     // respond immediately to the client (normalized)
     const items = normalizeArticlesWithCategories([updated]);
-    res.json(items[0]);
+    const a = items[0];
+    a.category = toCatText(a.category);
+    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    res.json(a);
 
     // fire-and-forget social posting (does not block the response)
     try {
