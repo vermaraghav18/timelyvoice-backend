@@ -60,6 +60,7 @@ const XItem   = require('./src/models/XItem');
 // Comments & newsletter models (used by their routers below)
 const Comment = require('./models/Comment');
 const Subscriber = require('./models/Subscriber');
+const rssTopNewsRouter = require("./src/routes/rss.topnews");
 
 // 7) Cron jobs
 require('./cron');
@@ -233,6 +234,7 @@ app.use('/api/admin/articles', adminArticlesRouter);
 
 // robots + cached high-traffic endpoints
 app.use("/", robotsRoute);
+app.use("/rss", rssTopNewsRouter);  
 app.use('/api/breaking',  cacheRoute(30_000), breakingRoutes);
 app.use('/api/ticker',    cacheRoute(30_000), tickerRoutes);
 app.use('/api/sections',  cacheRoute(60_000), sectionsRouter);
