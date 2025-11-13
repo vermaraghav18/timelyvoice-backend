@@ -34,6 +34,16 @@ function isPlaceholderUrl(u = '') {
 function isPlaceholderPublicId(pid = '') {
   if (!pid) return true;
   const s = String(pid).toLowerCase();
+
+  // This is the same default you use in ensurePublicId()
+  const defaultPid = (
+    process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
+    'news-images/default-hero'
+  ).toLowerCase();
+
+  // Treat the default hero as a placeholder too
+  if (s === defaultPid) return true;
+
   // treat obvious fakes/examples as placeholders, but don't nuke real dated ids
   return (
     s.includes('placeholder') ||
@@ -42,6 +52,7 @@ function isPlaceholderPublicId(pid = '') {
     s === 'news/default'
   );
 }
+
 
 // Ensure we always have some publicId before building final URLs
 function ensurePublicId(article) {

@@ -6,7 +6,10 @@ const { v2: cloudinary } = require("cloudinary");
 const slugify = require("slugify");
 
 // ---------- CONFIG ----------
-const FOLDER = process.env.AUTOMATION_IMAGE_FOLDER || "news-images";
+const FOLDER =
+   process.env.AUTOMATION_IMAGE_FOLDER ||
+   process.env.CLOUDINARY_FOLDER ||
+   "news-images";
 const FALLBACK_ID =
   process.env.AUTOMATION_DEFAULT_IMAGE_ID ||
   process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
