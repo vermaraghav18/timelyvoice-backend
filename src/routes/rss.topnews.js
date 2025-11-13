@@ -15,7 +15,7 @@ function esc(s = "") {
       case "&": return "&amp;";
       case '"': return "&quot;";
       case "'": return "&apos;";
-      default: return c;
+      default:  return c;
     }
   });
 }
@@ -23,6 +23,14 @@ function esc(s = "") {
 function articleUrlFromSlug(slug) {
   if (!slug) return SITE_URL;
   return `${SITE_URL}/article/${slug}`;
+}
+
+function guessMimeFromUrl(url = "") {
+  const u = url.toLowerCase();
+  if (u.endsWith(".webp")) return "image/webp";
+  if (u.endsWith(".png"))  return "image/png";
+  if (u.endsWith(".gif"))  return "image/gif";
+  return "image/jpeg";
 }
 
 router.get("/top-news.xml", async (req, res, next) => {
@@ -33,7 +41,8 @@ router.get("/top-news.xml", async (req, res, next) => {
       status: "published",
       publishedAt: { $ne: null },
     })
-      .select("title slug summary publishedAt updatedAt createdAt")
+      // 👇 NOTE: include image fields now
+      .select("title slug summary publishedAt updatedAt createdAt imageUrl ogImage cover")
       .sort({ publishedAt: -1, updatedAt: -1, createdAt: -1 })
       .limit(limit)
       .lean();
@@ -57,13 +66,25 @@ router.get("/top-news.xml", async (req, res, next) => {
       const pubDate = new Date(pub).toUTCString();
       const desc = a.summary || "";
 
+      // choose best image (order: ogImage > imageUrl > cover)
+      const img = a.ogImage || a.imageUrl || a.cover || "";
+      const mime = img ? guessMimeFromUrl(img) : null;
+
       xml += `  <item>
     <title>${esc(a.title || "")}</title>
     <link>${esc(link)}</link>
     <guid isPermaLink="true">${esc(link)}</guid>
     <pubDate>${esc(pubDate)}</pubDate>
     <description><![CDATA[${desc}]]></description>
-  </item>
+`;
+
+      // 🔹 Add enclosure only if we have an image
+      if (img) {
+        xml += `    <enclosure url="${esc(img)}" type="${esc(mime)}" />
+`;
+      }
+
+      xml += `  </item>
 `;
     }
 
