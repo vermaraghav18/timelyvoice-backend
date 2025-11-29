@@ -25,6 +25,9 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const { Types } = mongoose;
 
+// ⬇️ ADD THIS
+const prerender = require('prerender-node');
+
 function escapeRegex(s = '') {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -68,6 +71,21 @@ require('./cron');
 
 // 9) App init
 const app = express();
+
+// --- Prerender.io middleware for bots (Googlebot, etc.) ---
+if (process.env.PRERENDER_TOKEN) {
+  prerender
+    .set('prerenderToken', process.env.PRERENDER_TOKEN)
+    .set('protocol', 'https')
+    .set('host', 'timelyvoice.com')
+    .blacklisted('^/api'); // don't touch API routes
+
+  app.use(prerender);
+  console.log('[prerender] enabled for bots');
+} else {
+  console.warn('[prerender] PRERENDER_TOKEN not set, prerender disabled');
+}
+
 
 // ✅ Safe static assets mount (won’t crash if frontend/dist doesn’t exist)
 const distAssets = path.join(__dirname, '../frontend/dist/assets');
