@@ -4,42 +4,64 @@ const router = express.Router();
 
 /**
  * ---------------------------------------------------------------------
- * Robots.txt handler
+ * robots.txt handler
  * ---------------------------------------------------------------------
- * Ensures:
- *   - Production: always uses apex (https://timelyvoice.com)
- *   - Dev: auto-detects localhost origin (so you can test locally)
+ * - In production, always advertises the canonical site origin
+ *   (https://timelyvoice.com or process.env.SITE_URL)
+ * - In dev, auto-detects the current host so you can test locally.
+ * - Blocks crawl of admin + API/analytics while keeping all public
+ *   pages crawlable.
  * ---------------------------------------------------------------------
  */
 
-const PROD_SITE = 'https://timelyvoice.com';
+const PROD_SITE =
+  (process.env.SITE_URL && process.env.SITE_URL.replace(/\/+$/, '')) ||
+  'https://timelyvoice.com';
 
-// Determine which origin to use
-let SITE_ORIGIN;
+/** Resolve the site origin for this request */
+function getSiteOrigin(req) {
+  // Force canonical origin in production
+  if (process.env.NODE_ENV === 'production') {
+    return PROD_SITE;
+  }
 
-if (process.env.NODE_ENV === 'production') {
-  // Always force apex domain in production
-  SITE_ORIGIN = PROD_SITE;
-} else {
-  // Use local frontend base if defined, else fallback
-  SITE_ORIGIN = (
-    process.env.FRONTEND_BASE_URL ||
-    process.env.SITE_URL ||
-    'http://localhost:5173'
-  ).replace(/\/+$/, '');
-  // normalize to https for Search Console consistency
-  SITE_ORIGIN = SITE_ORIGIN.replace(/^http:\/\//, 'https://');
+  // In dev, infer from request headers (localhost, etc.)
+  const proto =
+    req.headers['x-forwarded-proto'] ||
+    req.protocol ||
+    'http';
+  const host =
+    req.headers['x-forwarded-host'] ||
+    req.headers.host ||
+    'localhost:5173';
+
+  // Always normalize to https:// for consistency
+  return `${proto}://${host}`.replace(/^http:\/\//, 'https://').replace(/\/+$/, '');
 }
 
 router.get('/robots.txt', (req, res) => {
-  res.type('text/plain').send(
-`User-agent: *
-Allow: /
+  const SITE_ORIGIN = getSiteOrigin(req);
 
-Sitemap: ${SITE_ORIGIN}/sitemap.xml
-Sitemap: ${SITE_ORIGIN}/news-sitemap.xml
-`
-  );
+  const body = [
+    'User-agent: *',
+    // Block non-public surfaces
+    'Disallow: /admin',
+    'Disallow: /api/',
+    'Disallow: /analytics/',
+    'Disallow: /newsletter/',
+    'Disallow: /comments/',
+    'Disallow: /rss',
+    '',
+    // Everything else is fine to crawl
+    'Allow: /',
+    '',
+    // Sitemaps
+    `Sitemap: ${SITE_ORIGIN}/sitemap.xml`,
+    `Sitemap: ${SITE_ORIGIN}/news-sitemap.xml`,
+    '',
+  ].join('\n');
+
+  res.type('text/plain').send(body);
 });
 
 module.exports = router;
