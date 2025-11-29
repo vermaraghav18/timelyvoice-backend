@@ -84,10 +84,24 @@ async function buildAllUrls(origin) {
     { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
   ).lean();
 
-  // Core urls
+   // Core urls (homepage + key static pages)
   const core = [
+    // Home
     { loc: origin, changefreq: 'hourly', priority: '1.0' },
+
+    // Key sections
+    { loc: `${origin}/top-news`,        changefreq: 'hourly', priority: '0.9' },
+
+    // Trust / policy pages (important for Google Ads & E-E-A-T)
+    { loc: `${origin}/about`,           changefreq: 'yearly', priority: '0.4' },
+    { loc: `${origin}/contact`,         changefreq: 'yearly', priority: '0.4' },
+    { loc: `${origin}/editorial-policy`,changefreq: 'yearly', priority: '0.3' },
+    { loc: `${origin}/corrections`,     changefreq: 'yearly', priority: '0.3' },
+    { loc: `${origin}/privacy-policy`,  changefreq: 'yearly', priority: '0.3' },
+    { loc: `${origin}/terms`,           changefreq: 'yearly', priority: '0.3' },
+    { loc: `${origin}/advertising`,     changefreq: 'yearly', priority: '0.3' },
   ];
+
 
   // Categories -> /category/:slug
   const catUrls = categories.map((c) => ({
