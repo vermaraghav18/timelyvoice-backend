@@ -77,13 +77,13 @@ prerender.set('blacklisted', [
 app.use(prerender);
 
 // ✅ Safe static assets mount (won’t crash if frontend/dist doesn’t exist)
-const distAssets = path.join(__dirname, '../frontend/dist/assets');
-if (fs.existsSync(distAssets)) {
-  app.use('/assets', express.static(distAssets, { maxAge: '1y', immutable: true }));
-  console.log('[static] Serving /assets from', distAssets);
-} else {
-  console.warn('[static] frontend dist assets not found, skipping /assets mount');
-}
+//const distAssets = path.join(__dirname, '../frontend/dist/assets');
+//if (fs.existsSync(distAssets)) {
+  //app.use('/assets', express.static(distAssets, { maxAge: '1y', immutable: true }));
+  //console.log('[static] Serving /assets from', distAssets);
+//} else {
+  //console.warn('[static] frontend dist assets not found, skipping /assets mount');
+//}
 
 app.use(cookieParser());
 
