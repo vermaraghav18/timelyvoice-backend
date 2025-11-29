@@ -35,6 +35,11 @@ const ArticleSchema = new mongoose.Schema({
   category:    { type: String, index: true },
   tags:        { type: [String], default: [], index: true },
 
+    // Timeline (used for History)
+  year:       { type: Number, min: 0, max: 4000 },   // 0–4000 (we treat as BC for now)
+  era:        { type: String, enum: ['BC', 'AD'], default: 'BC' },
+
+
   // Images
   imageUrl:      { type: String, default: '' },      // Cloudinary (or absolute) URL
   imagePublicId: { type: String, default: '' },
@@ -121,5 +126,7 @@ ArticleSchema.index({ category: 1, publishedAt: -1 });
 ArticleSchema.index({ tags: 1, publishedAt: -1 });
 ArticleSchema.index({ publishedAt: -1 });
 ArticleSchema.index({ slug: 1 }, { unique: true });
+ArticleSchema.index({ category: 1, year: 1 });
+
 
 module.exports = mongoose.models.Article || mongoose.model('Article', ArticleSchema);

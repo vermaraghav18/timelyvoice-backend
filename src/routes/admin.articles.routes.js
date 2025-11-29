@@ -364,7 +364,9 @@ router.patch('/:id', async (req, res) => {
       'tags',
       'body',
       'bodyHtml',
-      'author'
+      'author',
+      'year',
+      'era',
     ];
 
     // 1) pick allowed fields
@@ -420,7 +422,7 @@ router.patch('/:id', async (req, res) => {
     // 5) persist merged (only known keys)
     const toSaveKeys = [
       'title','slug','category','summary','imageUrl','imagePublicId','imageAlt',
-      'status','tags','body','bodyHtml','author','publishedAt','ogImage','thumbImage'
+      'status','tags','body','bodyHtml','author','publishedAt','ogImage','thumbImage','year','era',
     ];
     const toSave = {};
     for (const k of toSaveKeys) {

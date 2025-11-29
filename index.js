@@ -51,6 +51,7 @@ const sectionsV2 = require('./src/routes/sectionsV2');
 const adminAdsRouter = require('./src/routes/admin.ads.routes');
 const planImageRoutes = require('./src/routes/planImage.routes');
 const articlesRouter = require('./src/routes/articles');
+const historyPageRoutes = require("./src/routes/historyPageRoutes");
 
 // 6) Models registered early
 const Article = require('./src/models/Article');
@@ -241,6 +242,9 @@ app.use('/api/sections',  cacheRoute(60_000), sectionsRouter);
 app.use('/api/top-news',  cacheRoute(30_000), require("./src/routes/topnews"));
 
 app.use('/api/plan-image', planImageRoutes);
+// History Page (Public + Admin)
+app.use("/api/history-page", historyPageRoutes);
+
 
 // Cache helpers
 function clearCache(prefix = '') {
@@ -948,6 +952,64 @@ async function ensureArticleHasImage(payload = {}) {
 }
 
 /* -------------------- Articles API (public + admin) -------------------- */
+
+// ⬇⬇⬇ ADD THIS WHOLE BLOCK ⬇⬇⬇
+app.get('/api/history/timeline', async (req, res) => {
+  try {
+    // sort = "asc" or "desc" (default: desc = 4000 → 0)
+    const sortParam = String(req.query.sort || 'desc').toLowerCase();
+    const sortDir = sortParam === 'asc' ? 1 : -1;
+
+    const fromYear = req.query.fromYear ? Number(req.query.fromYear) : null;
+    const toYear   = req.query.toYear   ? Number(req.query.toYear)   : null;
+
+    // Basic year filter: require year, and apply optional range
+    const yearFilter = { $ne: null };
+    if (!Number.isNaN(fromYear) && fromYear !== null) {
+      yearFilter.$gte = fromYear;
+    }
+    if (!Number.isNaN(toYear) && toYear !== null) {
+      yearFilter.$lte = toYear;
+    }
+
+    // We only want History articles.
+    // category can be:
+    //  - a simple string ("History")
+    //  - an object { name, slug }
+    const match = {
+      status: 'published',
+      year: yearFilter,
+      $or: [
+        { category: { $regex: /^history$/i } },
+        { 'category.name': { $regex: /^history$/i } },
+        { 'category.slug': { $regex: /^history$/i } },
+      ],
+    };
+
+    // Safety limit: max 2000 items
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit || '500', 10), 1),
+      2000
+    );
+
+    const items = await Article.find(match)
+      .sort({ year: sortDir, _id: 1 })
+      .limit(limit)
+      .select('title slug summary year era imageUrl ogImage publishedAt')
+      .lean();
+
+    res.setHeader(
+      'Cache-Control',
+      'public, max-age=60, s-maxage=300, stale-while-revalidate=600'
+    );
+    res.json({ items, total: items.length });
+  } catch (e) {
+    console.error('GET /api/history/timeline failed:', e);
+    res.status(500).json({ error: 'failed_to_load_history_timeline' });
+  }
+});
+// ⬆⬆⬆ ADD THIS WHOLE BLOCK ⬆⬆⬆
+
 // list
 app.get('/api/articles', optionalAuth, async (req, res) => {
   const page  = Math.max(parseInt(req.query.page  || '1', 10), 1);

@@ -73,6 +73,17 @@ function normalizeIncomingArticle(raw = {}) {
   a.slug     = a.slug?.trim();
   a.category = a.category?.trim();
 
+    // Normalize timeline fields (optional)
+  if (a.year !== undefined && a.year !== null && a.year !== '') {
+    const y = parseInt(a.year, 10);
+    if (!Number.isNaN(y)) a.year = y;
+    else delete a.year;
+  }
+  if (a.era !== 'BC' && a.era !== 'AD') {
+    delete a.era; // fallback to schema default
+  }
+
+
   // auto-slug if missing
   if (!a.slug && a.title) a.slug = slugify(a.title);
 

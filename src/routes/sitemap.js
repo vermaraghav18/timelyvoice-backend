@@ -38,7 +38,6 @@ const ORIGIN = (
 const PUBLICATION_NAME = process.env.PUBLICATION_NAME || 'My News';
 const PUBLICATION_LANGUAGE = process.env.PUBLICATION_LANGUAGE || 'en';
 
-
 function xmlEscape(s = '') {
   return String(s)
     .replaceAll('&', '&amp;')
@@ -53,7 +52,9 @@ function xmlEscape(s = '') {
 -------------------------------------------- */
 async function buildAllUrls(origin) {
   if (!Models.Category || !Models.Article || !Models.Tag) {
-    throw new Error('Sitemap models not set. Call setModels({ Article, Category, Tag }) before mounting the router.');
+    throw new Error(
+      'Sitemap models not set. Call setModels({ Article, Category, Tag }) before mounting the router.'
+    );
   }
 
   // Categories (for /category/:slug)
@@ -61,25 +62,27 @@ async function buildAllUrls(origin) {
     .find({}, { slug: 1, updatedAt: 1 })
     .lean();
 
-  // Tags (for /tag/:slug) – optional but nice to have
+  // Tags (for /tag/:slug)
+  // We still load tags if needed for other logic, but we no longer
+  // include tag listing pages in the sitemap because they are NOINDEX
+  // and tend to create duplicate/low-value clusters.
   const tags = await Models.Tag
     .find({}, { slug: 1, updatedAt: 1 })
     .lean();
 
   // Articles (only published + visible by schedule)
   const now = new Date();
-const articles = await Models.Article.find(
-  {
-    status: 'published',
-    $or: [
-      { publishAt: { $lte: now } },
-      { publishAt: { $exists: false } },
-      { publishAt: null }
-    ]
-  },
-  { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
-).lean();
-
+  const articles = await Models.Article.find(
+    {
+      status: 'published',
+      $or: [
+        { publishAt: { $lte: now } },
+        { publishAt: { $exists: false } },
+        { publishAt: null },
+      ],
+    },
+    { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
+  ).lean();
 
   // Core urls
   const core = [
@@ -87,44 +90,45 @@ const articles = await Models.Article.find(
   ];
 
   // Categories -> /category/:slug
-  const catUrls = categories.map(c => ({
+  const catUrls = categories.map((c) => ({
     loc: `${origin}/category/${encodeURIComponent(c.slug)}`,
     lastmod: (c.updatedAt || new Date()).toISOString(),
     changefreq: 'daily',
     priority: '0.6',
   }));
 
-  // Tags -> /tag/:slug (optional)
-  const tagUrls = tags.map(t => ({
-    loc: `${origin}/tag/${encodeURIComponent(t.slug)}`,
-    lastmod: (t.updatedAt || new Date()).toISOString(),
-    changefreq: 'daily',
-    priority: '0.5',
-  }));
+  // Tags -> /tag/:slug
+  // ❌ We intentionally keep tag listing pages OUT of the main sitemap
+  //    to avoid thin/duplicate index candidates.
+  const tagUrls = []; // intentionally empty
 
   // Articles -> /article/:slug  (prefer updatedAt → publishedAt → publishAt)
-const articleUrls = articles.map(a => {
-  const last = a.updatedAt || a.publishedAt || a.publishAt || new Date();
-  return {
-    loc: `${origin}/article/${encodeURIComponent(a.slug)}`,
-    lastmod: new Date(last).toISOString(),
-    changefreq: 'weekly',
-    priority: '0.8',
-  };
-});
+  const articleUrls = articles.map((a) => {
+    const last = a.updatedAt || a.publishedAt || a.publishAt || new Date();
+    return {
+      loc: `${origin}/article/${encodeURIComponent(a.slug)}`,
+      lastmod: new Date(last).toISOString(),
+      changefreq: 'weekly',
+      priority: '0.8',
+    };
+  });
 
-
-  return [...core, ...catUrls, ...tagUrls, ...articleUrls];
+  // Only core, categories, and articles should be indexed
+  return [...core, ...catUrls, ...articleUrls];
 }
 
 function urlsToXml(urls) {
-  const items = urls.map(u => `
+  const items = urls
+    .map(
+      (u) => `
   <url>
     <loc>${xmlEscape(u.loc)}</loc>
     ${u.lastmod ? `<lastmod>${u.lastmod}</lastmod>` : ''}
     ${u.changefreq ? `<changefreq>${u.changefreq}</changefreq>` : ''}
     ${u.priority ? `<priority>${u.priority}</priority>` : ''}
-  </url>`).join('');
+  </url>`
+    )
+    .join('');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset
@@ -137,12 +141,11 @@ ${items}
 /* -------------------------------------------
    Google News sitemap (last 48h)
 -------------------------------------------- */
-/* -------------------------------------------
-   Google News sitemap (last 48h)
--------------------------------------------- */
 async function buildNewsXml(origin) {
   if (!Models.Article) {
-    throw new Error('Sitemap models not set. Call setModels({ Article, Category, Tag }) before mounting the router.');
+    throw new Error(
+      'Sitemap models not set. Call setModels({ Article, Category, Tag }) before mounting the router.'
+    );
   }
 
   const now = new Date();
@@ -155,28 +158,34 @@ async function buildNewsXml(origin) {
       $or: [
         { publishAt: { $lte: now } },
         { publishAt: { $exists: false } },
-        { publishAt: null }
+        { publishAt: null },
       ],
       // within last 48h by publishedAt (fallback to createdAt)
       $or: [
         { publishedAt: { $gte: twoDaysAgo } },
-        { $and: [{ publishedAt: { $exists: false } }, { createdAt: { $gte: twoDaysAgo } }] }
-      ]
+        {
+          $and: [
+            { publishedAt: { $exists: false } },
+            { createdAt: { $gte: twoDaysAgo } },
+          ],
+        },
+      ],
     },
     { slug: 1, title: 1, publishedAt: 1, updatedAt: 1, createdAt: 1 }
   )
-  .sort({ publishedAt: -1, createdAt: -1 })
-  .limit(200) // Google News: only last ~48h; 200 is safe
-  .lean();
+    .sort({ publishedAt: -1, createdAt: -1 })
+    .limit(200) // Google News: only last ~48h; 200 is safe
+    .lean();
 
-  const items = articles.map(a => {
-    const pubDate = a.publishedAt || a.createdAt || new Date();
-    const updDate = a.updatedAt || pubDate;
-    const pubIso  = new Date(pubDate).toISOString();
-    const lastIso = new Date(updDate).toISOString();
-    const loc     = `${origin}/article/${encodeURIComponent(a.slug)}`;
+  const items = articles
+    .map((a) => {
+      const pubDate = a.publishedAt || a.createdAt || new Date();
+      const updDate = a.updatedAt || pubDate;
+      const pubIso = new Date(pubDate).toISOString();
+      const lastIso = new Date(updDate).toISOString();
+      const loc = `${origin}/article/${encodeURIComponent(a.slug)}`;
 
-    return `
+      return `
   <url>
     <loc>${xmlEscape(loc)}</loc>
     <lastmod>${lastIso}</lastmod>
@@ -189,7 +198,8 @@ async function buildNewsXml(origin) {
       <news:title>${xmlEscape(a.title || 'Article')}</news:title>
     </news:news>
   </url>`;
-  }).join('');
+    })
+    .join('');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset
@@ -212,8 +222,15 @@ router.get('/sitemap.xml', async (req, res, next) => {
     const now = Date.now();
     const maxAgeMs = 5 * 60 * 1000; // 5 min
 
-    if (!cache.dirty && cache.xml && (now - cache.lastBuiltXml) < maxAgeMs) {
-      res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600');
+    if (
+      !cache.dirty &&
+      cache.xml &&
+      now - cache.lastBuiltXml < maxAgeMs
+    ) {
+      res.setHeader(
+        'Cache-Control',
+        'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600'
+      );
       res.type('xml').send(cache.xml);
       return;
     }
@@ -225,7 +242,10 @@ router.get('/sitemap.xml', async (req, res, next) => {
     cache.lastBuiltXml = now;
     cache.dirty = false;
 
-    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600');
+    res.setHeader(
+      'Cache-Control',
+      'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600'
+    );
     res.type('xml').send(xml);
   } catch (e) {
     next(e);
@@ -240,8 +260,15 @@ router.get('/news-sitemap.xml', async (req, res, next) => {
     const now = Date.now();
     const maxAgeMs = 5 * 60 * 1000; // 5 min
 
-    if (!cache.dirty && cache.news && (now - cache.lastBuiltNews) < maxAgeMs) {
-      res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600');
+    if (
+      !cache.dirty &&
+      cache.news &&
+      now - cache.lastBuiltNews < maxAgeMs
+    ) {
+      res.setHeader(
+        'Cache-Control',
+        'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600'
+      );
       res.type('xml').send(cache.news);
       return;
     }
@@ -252,7 +279,10 @@ router.get('/news-sitemap.xml', async (req, res, next) => {
     cache.lastBuiltNews = now;
     cache.dirty = false;
 
-    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600');
+    res.setHeader(
+      'Cache-Control',
+      'public, max-age=300, s-maxage=1200, stale-while-revalidate=3600'
+    );
     res.type('xml').send(xml);
   } catch (e) {
     next(e);
