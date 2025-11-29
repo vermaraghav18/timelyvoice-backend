@@ -1,18 +1,3 @@
-// backend/index.js — fully fixed and complete
-
-const path = require('path');
-require('dotenv').config({ path: path.resolve(__dirname, '.env') });
-
-// 2) Polyfill fetch for Node < 18
-// (Node 18+ has global fetch; this shim only runs when needed)
-// Polyfill fetch only if Node < 18; otherwise use the native fetch
-const fetch = (typeof globalThis.fetch === 'function')
-  ? globalThis.fetch.bind(globalThis)
-  : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-
-// 3) Single configured Cloudinary instance
-const cloudinary = require('./src/lib/cloudinary');
-
 // 4) Core deps
 const fs = require('fs');
 const slugify = require('slugify');
@@ -25,7 +10,7 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const { Types } = mongoose;
 
-// ⬇️ ADD THIS
+// ⬇️ Prerender.io
 const prerender = require('prerender-node');
 
 function escapeRegex(s = '') {
@@ -54,7 +39,7 @@ const sectionsV2 = require('./src/routes/sectionsV2');
 const adminAdsRouter = require('./src/routes/admin.ads.routes');
 const planImageRoutes = require('./src/routes/planImage.routes');
 const articlesRouter = require('./src/routes/articles');
-const historyPageRoutes = require("./src/routes/historyPageRoutes");
+const historyPageRoutes = require('./src/routes/historyPageRoutes');
 
 // 6) Models registered early
 const Article = require('./src/models/Article');
@@ -64,7 +49,7 @@ const XItem   = require('./src/models/XItem');
 // Comments & newsletter models (used by their routers below)
 const Comment = require('./models/Comment');
 const Subscriber = require('./models/Subscriber');
-const rssTopNewsRouter = require("./src/routes/rss.topnews");
+const rssTopNewsRouter = require('./src/routes/rss.topnews');
 
 // 7) Cron jobs
 require('./cron');
@@ -72,20 +57,24 @@ require('./cron');
 // 9) App init
 const app = express();
 
-// --- Prerender.io middleware for bots (Googlebot, etc.) ---
-if (process.env.PRERENDER_TOKEN) {
-  prerender
-    .set('prerenderToken', process.env.PRERENDER_TOKEN)
-    .set('protocol', 'https')
-    .set('host', 'timelyvoice.com')
-    .blacklisted('^/api'); // don't touch API routes
+// ---------------- Prerender.io integration ----------------
+prerender.set('prerenderToken', process.env.PRERENDER_TOKEN);
 
-  app.use(prerender);
-  console.log('[prerender] enabled for bots');
-} else {
-  console.warn('[prerender] PRERENDER_TOKEN not set, prerender disabled');
-}
+// Important to ignore static assets and APIs
+prerender.set('whitelisted', ['/']);
+prerender.set('blacklisted', [
+  '^/api',
+  '\\.css$',
+  '\\.js$',
+  '\\.png$',
+  '\\.jpg$',
+  '\\.jpeg$',
+  '\\.svg$',
+  '\\.gif$',
+  '\\.webp$'
+]);
 
+app.use(prerender);
 
 // ✅ Safe static assets mount (won’t crash if frontend/dist doesn’t exist)
 const distAssets = path.join(__dirname, '../frontend/dist/assets');
