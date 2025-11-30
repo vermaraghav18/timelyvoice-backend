@@ -1,4 +1,19 @@
+// 1) Path + dotenv MUST be loaded first
+const path = require('path');
+const dotenvResult = require('dotenv').config({
+  path: path.resolve(__dirname, '.env'),
+});
+
+// Debug logs to confirm .env is loaded (you can remove later)
+console.log('[dotenv] loaded from', path.resolve(__dirname, '.env'));
+console.log('[dotenv] MONGO_URI at top =', process.env.MONGO_URI || '(undefined)');
+
+// 2) Fetch polyfill for SSR / automation (safe for Node 18+ too)
+const fetch = (typeof globalThis.fetch === 'function')
+  ? globalThis.fetch.bind(globalThis)
+  : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 // 4) Core deps
+
 const fs = require('fs');
 const slugify = require('slugify');
 const express = require('express');
@@ -389,11 +404,25 @@ app.post('/api/analytics/collect', (req, res) => {
 });
 
 /* -------------------- ENV -------------------- */
-const {
-  ADMIN_PASSWORD, JWT_SECRET, MONGO_URI,
-  CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CLOUDINARY_FOLDER = 'news-site',
-  PUBLICATION_NAME = 'My News'
+let {
+  ADMIN_PASSWORD,
+  JWT_SECRET,
+  MONGO_URI,
+  CLOUDINARY_CLOUD_NAME,
+  CLOUDINARY_API_KEY,
+  CLOUDINARY_API_SECRET,
+  CLOUDINARY_FOLDER = 'news-site',
+  PUBLICATION_NAME = 'My News',
 } = process.env;
+
+console.log('[env] MONGO_URI (after destructuring) =', MONGO_URI);
+
+if (!MONGO_URI) {
+  // Safety fallback, though if dotenv loaded correctly this should already be set
+  MONGO_URI = process.env.MONGO_URI;
+  console.log('[env] MONGO_URI patched from process.env =', MONGO_URI);
+}
+
 
 // Frontend canonical base (used by SSR/feeds)
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://timelyvoice.com';
