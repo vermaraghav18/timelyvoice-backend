@@ -1,48 +1,62 @@
 // backend/src/routes/rss.topnews.js
-const router = require("express").Router();
+
+const express = require("express");
+const router = express.Router();
 const Article = require("../models/Article");
 
+// Base URL for links in RSS items
 const FRONTEND_BASE_URL =
-  process.env.FRONTEND_BASE_URL || "https://timelyvoice.com";
-const SITE_URL = FRONTEND_BASE_URL.replace(/\/$/, "");
+  (process.env.FRONTEND_BASE_URL ||
+    process.env.SITE_URL ||
+    "https://timelyvoice.com").replace(/\/$/, "");
+const SITE_URL = FRONTEND_BASE_URL;
 
-// minimal XML escape
+// Minimal XML escape
 function esc(s = "") {
   return String(s).replace(/[<>&'"]/g, (c) => {
     switch (c) {
-      case "<": return "&lt;";
-      case ">": return "&gt;";
-      case "&": return "&amp;";
-      case '"': return "&quot;";
-      case "'": return "&apos;";
-      default:  return c;
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case "&":
+        return "&amp;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&apos;";
+      default:
+        return c;
     }
   });
 }
 
 function articleUrlFromSlug(slug) {
   if (!slug) return SITE_URL;
-  return `${SITE_URL}/article/${slug}`;
+  return `${SITE_URL}/article/${encodeURIComponent(slug)}`;
 }
 
 function guessMimeFromUrl(url = "") {
   const u = url.toLowerCase();
   if (u.endsWith(".webp")) return "image/webp";
-  if (u.endsWith(".png"))  return "image/png";
-  if (u.endsWith(".gif"))  return "image/gif";
+  if (u.endsWith(".png")) return "image/png";
+  if (u.endsWith(".gif")) return "image/gif";
   return "image/jpeg";
 }
 
-router.get("/top-news.xml", async (req, res, next) => {
+// Shared handler for both /top-news and /top-news.xml
+async function handleTopNewsRss(req, res, next) {
   try {
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
 
+    // Basic "latest published" filter
     const rows = await Article.find({
       status: "published",
       publishedAt: { $ne: null },
     })
-      // 👇 NOTE: include image fields now
-      .select("title slug summary publishedAt updatedAt createdAt imageUrl ogImage cover")
+      .select(
+        "title slug summary publishedAt updatedAt createdAt imageUrl ogImage cover"
+      )
       .sort({ publishedAt: -1, updatedAt: -1, createdAt: -1 })
       .limit(limit)
       .lean();
@@ -53,10 +67,10 @@ router.get("/top-news.xml", async (req, res, next) => {
 <rss version="2.0">
 <channel>
   <title>The Timely Voice — Top News</title>
-  <link>${SITE_URL}/top-news</link>
+  <link>${esc(SITE_URL + "/top-news")}</link>
   <description>Newest headlines from The Timely Voice</description>
   <language>en</language>
-  <lastBuildDate>${now}</lastBuildDate>
+  <lastBuildDate>${esc(now)}</lastBuildDate>
 `;
 
     for (const a of rows) {
@@ -78,7 +92,6 @@ router.get("/top-news.xml", async (req, res, next) => {
     <description><![CDATA[${desc}]]></description>
 `;
 
-      // 🔹 Add enclosure only if we have an image
       if (img) {
         xml += `    <enclosure url="${esc(img)}" type="${esc(mime)}" />
 `;
@@ -95,8 +108,13 @@ router.get("/top-news.xml", async (req, res, next) => {
     res.set("Cache-Control", "public, max-age=300");
     res.status(200).send(xml);
   } catch (err) {
+    console.error("[RSS] /rss/top-news error:", err);
     next(err);
   }
-});
+}
+
+// Support both /rss/top-news and /rss/top-news.xml
+router.get("/top-news", handleTopNewsRss);
+router.get("/top-news.xml", handleTopNewsRss);
 
 module.exports = router;
