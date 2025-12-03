@@ -28,16 +28,24 @@ cloudinary.config({
   secure: true,
 });
 
-// Google service account
-const keyFile = path.join(
-  __dirname,
-  "../../keys/google-drive-service-account.json"
-);
+// Google service account (Render-safe)
+let credentials = undefined;
+
+if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+  try {
+    credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  } catch (err) {
+    console.error("[Drive] Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:", err);
+  }
+}
+
 const auth = new google.auth.GoogleAuth({
-  keyFile,
+  credentials,
   scopes: ["https://www.googleapis.com/auth/drive.readonly"],
 });
+
 const drive = google.drive({ version: "v3", auth });
+
 
 // -----------------------------------------------------------------------------
 // TEXT UTILS
