@@ -8,19 +8,22 @@ const { google } = require("googleapis");
 const { v2: cloudinary } = require("cloudinary");
 const Article = require("../models/Article");
 
+// ✅ NEW unified Google Drive client
+const { getDriveClient } = require("./driveClient");
+
 // -----------------------------------------------------------------------------
 // CONFIG
 // -----------------------------------------------------------------------------
 const DRIVE_FOLDER_ID =
   process.env.GOOGLE_DRIVE_NEWS_FOLDER_ID ||
-  process.env.GOOGLE_DRIVE_FOLDER_ID; // try NEWS first, fallback to old name
+  process.env.GOOGLE_DRIVE_FOLDER_ID;
 
 const TEMP_DIR = path.join(__dirname, "../../tmp-drive-images");
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
 
-// Ensure tmp directory exists
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
-
-// Cloudinary config (safe)
+// Cloudinary config
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -29,48 +32,9 @@ cloudinary.config({
 });
 
 // -----------------------------------------------------------------------------
-// GOOGLE DRIVE AUTH (env JSON first, then local file) — RENDER SAFE
+// GOOGLE DRIVE AUTH (replaced by unified driveClient.js)
 // -----------------------------------------------------------------------------
-let credentials = undefined;
-let credSource = "none";
-
-if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-  try {
-    credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    credSource = "env-json";
-  } catch (err) {
-    console.error("[Drive] Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:", err);
-  }
-}
-
-if (!credentials) {
-  try {
-    const keyFile = path.join(
-      __dirname,
-      "../../keys/google-drive-service-account.json"
-    );
-    if (fs.existsSync(keyFile)) {
-      // eslint-disable-next-line global-require, import/no-dynamic-require
-      credentials = require(keyFile);
-      credSource = "local-file";
-    }
-  } catch (err) {
-    console.error("[Drive] Failed to load local key file:", err);
-  }
-}
-
-console.log("[Drive] credential source:", credSource);
-
-let drive = null;
-try {
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
-  });
-  drive = google.drive({ version: "v3", auth });
-} catch (err) {
-  console.error("[Drive] Failed to init Google Drive client:", err);
-}
+const { drive, credSource } = getDriveClient();
 
 // -----------------------------------------------------------------------------
 // TEXT UTILS
@@ -124,6 +88,7 @@ function tokenize(str = "") {
     .split(/[\s-]+/)
     .filter(Boolean);
 }
+
 function dedupe(a) {
   return Array.from(new Set(a));
 }
@@ -184,8 +149,10 @@ function buildTokens(meta) {
     .map(stem)
     .filter((t) => !STOPWORDS.has(t) && t.length >= 3);
 
-  if (meta.category)
+  if (meta.category) {
     raw.push(...tokenize(meta.category).map((t) => stem(t)));
+  }
+
   (meta.tags || []).forEach((t) =>
     raw.push(...tokenize(String(t)).map((x) => stem(x)))
   );
@@ -212,9 +179,7 @@ function buildTokens(meta) {
 // 1) SEARCH GOOGLE DRIVE
 // -----------------------------------------------------------------------------
 async function searchDriveCandidates(tokens = [], phrases = []) {
-  if (!drive) {
-    return [];
-  }
+  if (!drive) return [];
 
   const qParts = [];
 
@@ -248,35 +213,31 @@ function scoreFile(f, tokens, phrases, strongNames) {
   const name = f.name.toLowerCase();
   let score = 0;
 
-  // phrase boost
   for (const p of phrases) {
     const plain = p.replace(/\s+/g, "");
     const hyph = p.replace(/\s+/g, "-");
-    if (name.includes(plain) || name.includes(hyph) || name.includes(p))
+    if (name.includes(plain) || name.includes(hyph) || name.includes(p)) {
       score += 7;
+    }
   }
 
-  // token boost
   for (const t of tokens) {
     if (name.includes(t)) score += 2;
   }
 
-  // multi-match bonus
   const matchedTokens = tokens.filter((t) => name.includes(t));
   if (matchedTokens.length >= 2) score += 2;
 
-  // famous-name penalty
   score += negativePenalty(name, strongNames);
 
   return { score, matchedTokens };
 }
 
 // -----------------------------------------------------------------------------
-// 3) DOWNLOAD FROM DRIVE → TEMP → UPLOAD TO CLOUDINARY
+// 3) DOWNLOAD FROM DRIVE → TEMP → CLOUDINARY
 // -----------------------------------------------------------------------------
 async function downloadAndUploadToCloudinary(file) {
   const destPath = path.join(TEMP_DIR, `${file.id}-${file.name}`);
-
   const dest = fs.createWriteStream(destPath);
 
   await drive.files
@@ -287,7 +248,6 @@ async function downloadAndUploadToCloudinary(file) {
       });
     });
 
-  // Upload to Cloudinary folder: news-images/google/
   const uploaded = await cloudinary.uploader.upload(destPath, {
     folder: process.env.CLOUDINARY_FOLDER
       ? `${process.env.CLOUDINARY_FOLDER}/google`
@@ -295,7 +255,6 @@ async function downloadAndUploadToCloudinary(file) {
     resource_type: "image",
   });
 
-  // Safe cleanup: don't let unlink errors break the flow
   try {
     if (fs.existsSync(destPath)) {
       fs.unlinkSync(destPath);
@@ -311,20 +270,40 @@ async function downloadAndUploadToCloudinary(file) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) PERSON-SPECIFIC ROTATION HELPER (modi-01, modi-02, ...)
+// 4) PERSON-SPECIFIC ROTATION (modi-01, modi-02, ...)
 // -----------------------------------------------------------------------------
 async function pickRotatedPersonFile(personKey, candidates) {
   if (!personKey || !Array.isArray(candidates) || !candidates.length) {
     return null;
   }
 
-  // Count how many articles already mention this person (title or summary)
   const regex = new RegExp(personKey, "i");
-  const usedCount = await Article.countDocuments({
-    $or: [{ title: regex }, { summary: regex }],
-  });
 
-  // Stable order by file name, so rotation is predictable: modi-01, modi-02, ...
+  // ✅ Only hit MongoDB if this model's connection is actually ready
+  let usedCount = 0;
+  try {
+    const conn = Article.db; // Mongoose connection used by the model
+    const isReady = conn && conn.readyState === 1; // 1 = connected
+
+    if (isReady) {
+      usedCount = await Article.countDocuments({
+        $or: [{ title: regex }, { summary: regex }],
+      });
+    } else {
+      // No live DB connection in this context (like test script) → just start at 0
+      console.warn(
+        "[imagePicker Drive] rotation: skipping Article.countDocuments because Mongo is not connected"
+      );
+      usedCount = 0;
+    }
+  } catch (err) {
+    console.warn(
+      "[imagePicker Drive] rotation: failed to fetch usedCount, defaulting to 0:",
+      err.message || err
+    );
+    usedCount = 0;
+  }
+
   const sorted = [...candidates].sort((a, b) =>
     a.name.toLowerCase().localeCompare(b.name.toLowerCase())
   );
@@ -349,18 +328,15 @@ async function pickRotatedPersonFile(personKey, candidates) {
 // -----------------------------------------------------------------------------
 exports.chooseHeroImage = async function (meta = {}) {
   try {
-    // Basic safety checks for prod
     if (!DRIVE_FOLDER_ID) {
       const why = { mode: "no-drive-folder-id" };
       console.error(
-        "[imagePicker Drive] ERROR: DRIVE_FOLDER_ID is not configured (.env GOOGLE_DRIVE_NEWS_FOLDER_ID / GOOGLE_DRIVE_FOLDER_ID)"
+        "[imagePicker Drive] ERROR: DRIVE_FOLDER_ID is not configured"
       );
-      console.warn("[imagePicker Drive] DEBUG:", { metaTitle: meta.title, why });
+
       return {
         publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-        url: cloudinary.url(
-          process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID
-        ),
+        url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
         why,
       };
     }
@@ -368,12 +344,10 @@ exports.chooseHeroImage = async function (meta = {}) {
     if (!drive) {
       const why = { mode: "no-drive-client", credSource };
       console.error("[imagePicker Drive] ERROR: Drive client not initialized");
-      console.warn("[imagePicker Drive] DEBUG:", { metaTitle: meta.title, why });
+
       return {
         publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-        url: cloudinary.url(
-          process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID
-        ),
+        url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
         why,
       };
     }
@@ -384,7 +358,7 @@ exports.chooseHeroImage = async function (meta = {}) {
     let candidates = await searchDriveCandidates(tokens, phrases);
 
     // Fallback: list everything in folder
-    if (!candidates.length) {
+    if (!candidates.length && drive) {
       const all = await drive.files.list({
         q: `'${DRIVE_FOLDER_ID}' in parents`,
         fields: "files(id, name, mimeType, modifiedTime)",
@@ -395,20 +369,14 @@ exports.chooseHeroImage = async function (meta = {}) {
 
     if (!candidates.length) {
       const why = { mode: "no-drive-files" };
-      console.warn("[imagePicker Drive] DEBUG:", {
-        metaTitle: meta.title,
-        why,
-      });
+
       return {
         publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-        url: cloudinary.url(
-          process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID
-        ),
+        url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
         why,
       };
     }
 
-    // 4A) Try PERSON-BASED ROTATION first (e.g. modi-01, modi-02, ...)
     let best = null;
     let rotationMeta = null;
 
@@ -432,7 +400,7 @@ exports.chooseHeroImage = async function (meta = {}) {
       }
     }
 
-    // 4B) Fallback to scoring logic if no rotation
+    // Fallback to scoring
     if (!best) {
       for (const f of candidates) {
         const { score, matchedTokens } = scoreFile(
@@ -442,12 +410,10 @@ exports.chooseHeroImage = async function (meta = {}) {
           strongNames
         );
         const pack = { file: f, score, matchedTokens };
-
         if (!best || score > best.score) best = pack;
       }
     }
 
-    // Download + Upload to Cloudinary
     const uploaded = await downloadAndUploadToCloudinary(best.file);
 
     const baseWhy = {
@@ -455,8 +421,8 @@ exports.chooseHeroImage = async function (meta = {}) {
       file: best.file.name,
       score: best.score,
       matchedTokens: best.matchedTokens,
+      credSource,
     };
-
     const why = rotationMeta ? { ...baseWhy, rotation: rotationMeta } : baseWhy;
 
     console.log("[imagePicker Drive] DEBUG:", {
@@ -472,15 +438,10 @@ exports.chooseHeroImage = async function (meta = {}) {
   } catch (err) {
     const why = { mode: "error", error: String(err) };
     console.error("[imagePicker Drive] ERROR:", err);
-    console.error("[imagePicker Drive] DEBUG:", {
-      metaTitle: meta.title,
-      why,
-    });
+
     return {
       publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-      url: cloudinary.url(
-        process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID
-      ),
+      url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
       why,
     };
   }

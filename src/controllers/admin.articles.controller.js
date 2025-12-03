@@ -90,19 +90,18 @@ exports.createOne = async (req, res) => {
 
     ensureSlug(article);
 
-    // Publishing logic
     article.status = article.status.toLowerCase();
     if (article.status === 'published' && !article.publishedAt) {
       article.publishedAt = new Date();
     }
 
-    // 1️⃣ Manual Google Drive URL override
+    // ✔️ FIXED LOGIC: Only real URLs bypass the auto-picker
     const manualUrlProvided =
       typeof article.imageUrl === 'string' &&
-      article.imageUrl.trim() !== '' &&
+      article.imageUrl.trim().startsWith('http') &&
       !article.imagePublicId;
 
-    // 2️⃣ AUTO-IMAGE (Google Drive → Cloudinary via imagePicker)
+    // AUTO PICK
     if (!manualUrlProvided && !article.imagePublicId) {
       const pick = await chooseHeroImage({
         title: article.title,
@@ -112,17 +111,12 @@ exports.createOne = async (req, res) => {
         slug: article.slug,
       });
 
-      // 🧾 DEBUG LOG: see what the picker decided for createOne
       if (pick) {
         console.log('[imagePicker] createOne chooseHeroImage:', {
           title: article.title,
           why: pick.why,
           publicId: pick.publicId,
           url: pick.url,
-        });
-      } else {
-        console.log('[imagePicker] createOne chooseHeroImage returned null/undefined:', {
-          title: article.title,
         });
       }
 
@@ -134,9 +128,8 @@ exports.createOne = async (req, res) => {
       }
     }
 
-    // 3️⃣ If manual URL → only set hero image from URL
+    // Manual URL provided (actual URL)
     if (manualUrlProvided) {
-      // Cloudinary OG & thumb must still be generated
       const uploaded = await uploadDriveImageToCloudinary(article.imageUrl, {
         folder: process.env.CLOUDINARY_FOLDER || 'news-images',
       });
@@ -144,7 +137,6 @@ exports.createOne = async (req, res) => {
       article.imageUrl = uploaded.secure_url;
     }
 
-    // 4️⃣ Finalize OG / Thumb
     finalizeImageFields(article);
 
     const saved = await Article.create(article);
@@ -157,7 +149,7 @@ exports.createOne = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// IMPORT MANY (Bulk upload)
+// IMPORT MANY
 // ─────────────────────────────────────────────────────────────
 exports.importMany = async (req, res) => {
   try {
@@ -169,18 +161,17 @@ exports.importMany = async (req, res) => {
         let article = normalizeIncoming(raw);
         ensureSlug(article);
 
-        // Bulk publish logic
         article.status = article.status.toLowerCase();
         if (article.status === 'published' && !article.publishedAt) {
           article.publishedAt = new Date();
         }
 
+        // ✔️ FIXED LOGIC HERE TOO
         const manualUrlProvided =
           typeof article.imageUrl === 'string' &&
-          article.imageUrl.trim() !== '' &&
+          article.imageUrl.trim().startsWith('http') &&
           !article.imagePublicId;
 
-        // AUTO PICK
         if (!manualUrlProvided && !article.imagePublicId) {
           const pick = await chooseHeroImage({
             title: article.title,
@@ -190,17 +181,12 @@ exports.importMany = async (req, res) => {
             slug: article.slug,
           });
 
-          // 🧾 DEBUG LOG: see what the picker decided for importMany
           if (pick) {
             console.log('[imagePicker] importMany chooseHeroImage:', {
               title: article.title,
               why: pick.why,
               publicId: pick.publicId,
               url: pick.url,
-            });
-          } else {
-            console.log('[imagePicker] importMany chooseHeroImage returned null/undefined:', {
-              title: article.title,
             });
           }
 
@@ -212,7 +198,6 @@ exports.importMany = async (req, res) => {
           }
         }
 
-        // Manual override
         if (manualUrlProvided) {
           const uploaded = await uploadDriveImageToCloudinary(article.imageUrl, {
             folder: process.env.CLOUDINARY_FOLDER || 'news-images',
@@ -238,7 +223,7 @@ exports.importMany = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// PREVIEW MANY (Bulk preview)
+// PREVIEW MANY
 // ─────────────────────────────────────────────────────────────
 exports.previewMany = async (req, res) => {
   try {
@@ -249,12 +234,12 @@ exports.previewMany = async (req, res) => {
       let article = normalizeIncoming(raw);
       ensureSlug(article);
 
+      // ✔️ FIX APPLIED HERE ALSO
       const manualUrlProvided =
         typeof article.imageUrl === 'string' &&
-        article.imageUrl.trim() !== '' &&
+        article.imageUrl.trim().startsWith('http') &&
         !article.imagePublicId;
 
-      // AUTO PICK
       if (!manualUrlProvided && !article.imagePublicId) {
         const pick = await chooseHeroImage({
           title: article.title,
@@ -264,17 +249,12 @@ exports.previewMany = async (req, res) => {
           slug: article.slug,
         });
 
-        // 🧾 DEBUG LOG: see what the picker decided for previewMany
         if (pick) {
           console.log('[imagePicker] previewMany chooseHeroImage:', {
             title: article.title,
             why: pick.why,
             publicId: pick.publicId,
             url: pick.url,
-          });
-        } else {
-          console.log('[imagePicker] previewMany chooseHeroImage returned null/undefined:', {
-            title: article.title,
           });
         }
 
