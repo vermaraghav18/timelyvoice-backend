@@ -6,7 +6,7 @@ const fs = require("fs");
 const path = require("path");
 const { google } = require("googleapis");
 const { v2: cloudinary } = require("cloudinary");
-const Article = require("../models/Article"); // 🔁 NEW: to inspect existing articles
+const Article = require("../models/Article");
 
 // -----------------------------------------------------------------------------
 // CONFIG
@@ -28,24 +28,49 @@ cloudinary.config({
   secure: true,
 });
 
-// Google service account (Render-safe)
+// -----------------------------------------------------------------------------
+// GOOGLE DRIVE AUTH (env JSON first, then local file) — RENDER SAFE
+// -----------------------------------------------------------------------------
 let credentials = undefined;
+let credSource = "none";
 
 if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
   try {
     credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    credSource = "env-json";
   } catch (err) {
     console.error("[Drive] Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:", err);
   }
 }
 
-const auth = new google.auth.GoogleAuth({
-  credentials,
-  scopes: ["https://www.googleapis.com/auth/drive.readonly"],
-});
+if (!credentials) {
+  try {
+    const keyFile = path.join(
+      __dirname,
+      "../../keys/google-drive-service-account.json"
+    );
+    if (fs.existsSync(keyFile)) {
+      // eslint-disable-next-line global-require, import/no-dynamic-require
+      credentials = require(keyFile);
+      credSource = "local-file";
+    }
+  } catch (err) {
+    console.error("[Drive] Failed to load local key file:", err);
+  }
+}
 
-const drive = google.drive({ version: "v3", auth });
+console.log("[Drive] credential source:", credSource);
 
+let drive = null;
+try {
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+  });
+  drive = google.drive({ version: "v3", auth });
+} catch (err) {
+  console.error("[Drive] Failed to init Google Drive client:", err);
+}
 
 // -----------------------------------------------------------------------------
 // TEXT UTILS
@@ -187,6 +212,10 @@ function buildTokens(meta) {
 // 1) SEARCH GOOGLE DRIVE
 // -----------------------------------------------------------------------------
 async function searchDriveCandidates(tokens = [], phrases = []) {
+  if (!drive) {
+    return [];
+  }
+
   const qParts = [];
 
   for (const t of tokens) {
@@ -284,9 +313,6 @@ async function downloadAndUploadToCloudinary(file) {
 // -----------------------------------------------------------------------------
 // 4) PERSON-SPECIFIC ROTATION HELPER (modi-01, modi-02, ...)
 // -----------------------------------------------------------------------------
-// We rotate images per person based on how many articles about them already exist.
-// Example: if we have modi-01, modi-02, modi-03 and 5 Modi articles already:
-//   usedCount = 5  → index = 5 % 3 = 2  → pick 3rd image
 async function pickRotatedPersonFile(personKey, candidates) {
   if (!personKey || !Array.isArray(candidates) || !candidates.length) {
     return null;
@@ -298,7 +324,7 @@ async function pickRotatedPersonFile(personKey, candidates) {
     $or: [{ title: regex }, { summary: regex }],
   });
 
-  // Stable order by file name, so rotation is predictable: modi-01, modi-02, modi-03...
+  // Stable order by file name, so rotation is predictable: modi-01, modi-02, ...
   const sorted = [...candidates].sort((a, b) =>
     a.name.toLowerCase().localeCompare(b.name.toLowerCase())
   );
@@ -323,13 +349,25 @@ async function pickRotatedPersonFile(personKey, candidates) {
 // -----------------------------------------------------------------------------
 exports.chooseHeroImage = async function (meta = {}) {
   try {
+    // Basic safety checks for prod
     if (!DRIVE_FOLDER_ID) {
-      const why = {
-        mode: "no-drive-folder-id",
-      };
+      const why = { mode: "no-drive-folder-id" };
       console.error(
         "[imagePicker Drive] ERROR: DRIVE_FOLDER_ID is not configured (.env GOOGLE_DRIVE_NEWS_FOLDER_ID / GOOGLE_DRIVE_FOLDER_ID)"
       );
+      console.warn("[imagePicker Drive] DEBUG:", { metaTitle: meta.title, why });
+      return {
+        publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
+        url: cloudinary.url(
+          process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID
+        ),
+        why,
+      };
+    }
+
+    if (!drive) {
+      const why = { mode: "no-drive-client", credSource };
+      console.error("[imagePicker Drive] ERROR: Drive client not initialized");
       console.warn("[imagePicker Drive] DEBUG:", { metaTitle: meta.title, why });
       return {
         publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
@@ -356,9 +394,7 @@ exports.chooseHeroImage = async function (meta = {}) {
     }
 
     if (!candidates.length) {
-      const why = {
-        mode: "no-drive-files",
-      };
+      const why = { mode: "no-drive-files" };
       console.warn("[imagePicker Drive] DEBUG:", {
         metaTitle: meta.title,
         why,
@@ -372,9 +408,7 @@ exports.chooseHeroImage = async function (meta = {}) {
       };
     }
 
-    // -----------------------------------------------------------------------
     // 4A) Try PERSON-BASED ROTATION first (e.g. modi-01, modi-02, ...)
-    // -----------------------------------------------------------------------
     let best = null;
     let rotationMeta = null;
 
@@ -391,17 +425,14 @@ exports.chooseHeroImage = async function (meta = {}) {
           best = {
             file: rotated.file,
             score: null,
-            matchedTokens: [], // not crucial when rotating
+            matchedTokens: [],
           };
           rotationMeta = rotated.meta;
         }
       }
     }
 
-    // -----------------------------------------------------------------------
-    // 4B) If no rotation used (no strong person or no person-specific images),
-    //     fall back to pure scoring logic (old behaviour).
-    // -----------------------------------------------------------------------
+    // 4B) Fallback to scoring logic if no rotation
     if (!best) {
       for (const f of candidates) {
         const { score, matchedTokens } = scoreFile(
