@@ -1,382 +1,313 @@
 // backend/src/controllers/admin.articles.controller.js
+
 const Article = require('../models/Article');
-const { decideAndAttach } = require('../services/imageStrategy');
 const { buildImageVariants } = require('../services/imageVariants');
-const cloudinary = require('cloudinary').v2;
+const { decideAndAttach } = require('../services/imageStrategy');
+const { uploadDriveImageToCloudinary } = require('../services/googleDriveUploader');
+const { chooseHeroImage } = require('../services/imagePicker');
+const slugify = require('slugify');
 
-// ────────────────────────────────────────────────────────────────────────────────
-// URL-safe slug generator
-const slugify = (s) =>
-  s.toString()
-    .toLowerCase()
-    .trim()
-    .replace(/['"]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+const PLACEHOLDER_HOSTS = ['example.com', 'cdn.example', 'your-cdn.example'];
 
-// Treat typical placeholders as “empty” so fallback can apply
-const PLACEHOLDER_HOSTS = ['your-cdn.example', 'cdn.example.com', 'example.com'];
-function isPlaceholderUrl(u = '') {
+function isPlaceholderUrl(url = '') {
+  if (!url) return true;
   try {
-    const { hostname } = new URL(u);
-    if (!hostname) return true;
+    const { hostname } = new URL(url);
     return (
+      !hostname ||
       PLACEHOLDER_HOSTS.includes(hostname) ||
-      hostname.endsWith('.example') ||
-      hostname.includes('cdn.example')
+      hostname.includes('example')
     );
   } catch {
-    // Invalid URL → treat as placeholder so server will replace it
     return true;
   }
 }
 
 function isPlaceholderPublicId(pid = '') {
   if (!pid) return true;
-  const s = String(pid).toLowerCase();
+  const s = pid.toLowerCase();
+  const def =
+    (process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
+      'news-images/defaults/fallback-hero').toLowerCase();
 
-  // This is the same default you use in ensurePublicId()
-  const defaultPid = (
-    process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
-    'news-images/default-hero'
-  ).toLowerCase();
-
-  // Treat the default hero as a placeholder too
-  if (s === defaultPid) return true;
-
-  // treat obvious fakes/examples as placeholders, but don't nuke real dated ids
+  if (s === def) return true;
   return (
     s.includes('placeholder') ||
     s.includes('example') ||
-    s === 'news/example' ||
     s === 'news/default'
   );
 }
 
-
-// Ensure we always have some publicId before building final URLs
-function ensurePublicId(article) {
-  if (!article) return;
-  if (!article.imagePublicId || isPlaceholderPublicId(article.imagePublicId)) {
-    const DEFAULT_PID =
-      process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
-      'news-images/default-hero'; // <-- put your real default folder/public id here
-    article.imagePublicId = DEFAULT_PID;
+function ensureSlug(a) {
+  if (!a.slug && a.title) {
+    a.slug = slugify(a.title, { lower: true, strict: true });
   }
 }
 
-function normalizeIncomingArticle(raw = {}) {
+function normalizeIncoming(raw = {}) {
   const a = { ...raw };
 
-  a.status   = a.status || 'draft';
-  a.title    = a.title?.trim();
-  a.slug     = a.slug?.trim();
+  a.status = a.status || 'draft';
+  a.title = a.title?.trim();
+  a.slug = a.slug?.trim();
   a.category = a.category?.trim();
 
-    // Normalize timeline fields (optional)
-  if (a.year !== undefined && a.year !== null && a.year !== '') {
-    const y = parseInt(a.year, 10);
-    if (!Number.isNaN(y)) a.year = y;
-    else delete a.year;
-  }
-  if (a.era !== 'BC' && a.era !== 'AD') {
-    delete a.era; // fallback to schema default
-  }
-
-
-  // auto-slug if missing
-  if (!a.slug && a.title) a.slug = slugify(a.title);
-
   if (!Array.isArray(a.tags) && typeof a.tags === 'string') {
-    a.tags = a.tags.split(',').map(s => s.trim()).filter(Boolean);
+    a.tags = a.tags.split(',').map(t => t.trim()).filter(Boolean);
   }
   if (!Array.isArray(a.tags)) a.tags = [];
 
-  // Always ignore any incoming image fields; server decides images
-  delete a.imageUrl;
-  delete a.ogImage;
-  delete a.thumbImage;
-
-  if (isPlaceholderPublicId(a.imagePublicId)) {
-    delete a.imagePublicId;
-  }
-
-  // Optional: if client wants to *force* default image, allow a flag
-  if (a.forceDefaultImage === true) {
-    delete a.imagePublicId;
-  }
+  if (isPlaceholderPublicId(a.imagePublicId)) delete a.imagePublicId;
+  if (isPlaceholderUrl(a.imageUrl)) delete a.imageUrl;
 
   return a;
 }
 
-// Only allow known strategies
-function sanitizeStrategy(s) {
-  const v = String(s || '').toLowerCase();
-  return v === 'stock' ? 'stock' : 'cloudinary';
-}
-
-// Build final URLs (hero/og/thumb) from imagePublicId or default
+// Build final url variants from Cloudinary publicId
 function finalizeImageFields(article) {
-  if (!article) return;
+  if (!article.imagePublicId) return;
 
-  // guarantee a usable public id
-  ensurePublicId(article);
-  const publicId = article.imagePublicId;
-  if (!publicId) return; // defensive: should not happen
+  const vars = buildImageVariants(article.imagePublicId);
 
-  try {
-    const variants = buildImageVariants(publicId);
-    if (variants && typeof variants === 'object') {
-      if (!article.imageUrl)
-        article.imageUrl =
-          variants.hero || variants.base || cloudinary.url(publicId, { secure: true });
-      if (!article.ogImage)
-        article.ogImage =
-          variants.og ||
-          cloudinary.url(publicId, {
-            width: 1200,
-            height: 630,
-            crop: 'fill',
-            gravity: 'auto',
-            format: 'jpg',
-            secure: true,
-          });
-      if (!article.thumbImage)
-        article.thumbImage =
-          variants.thumb ||
-          cloudinary.url(publicId, {
-            width: 400,
-            height: 300,
-            crop: 'fill',
-            gravity: 'auto',
-            format: 'webp',
-            secure: true,
-          });
-    } else {
-      if (!article.imageUrl)
-        article.imageUrl = cloudinary.url(publicId, { secure: true });
-      if (!article.ogImage)
-        article.ogImage = cloudinary.url(publicId, {
-          width: 1200,
-          height: 630,
-          crop: 'fill',
-          gravity: 'auto',
-          format: 'jpg',
-          secure: true,
-        });
-      if (!article.thumbImage)
-        article.thumbImage = cloudinary.url(publicId, {
-          width: 400,
-          height: 300,
-          crop: 'fill',
-          gravity: 'auto',
-          format: 'webp',
-          secure: true,
-        });
-    }
-  } catch {
-    // super safe fallback
-    if (!article.imageUrl)
-      article.imageUrl = cloudinary.url(publicId, { secure: true });
-    if (!article.ogImage)
-      article.ogImage = cloudinary.url(publicId, {
-        width: 1200,
-        height: 630,
-        crop: 'fill',
-        gravity: 'auto',
-        format: 'jpg',
-        secure: true,
-      });
-    if (!article.thumbImage)
-      article.thumbImage = cloudinary.url(publicId, {
-        width: 400,
-        height: 300,
-        crop: 'fill',
-        gravity: 'auto',
-        format: 'webp',
-        secure: true,
-      });
-  }
+  if (!article.imageUrl) article.imageUrl = vars.hero;
+  if (!article.ogImage) article.ogImage = vars.og;
+  if (!article.thumbImage) article.thumbImage = vars.thumb;
 
   if (!article.imageAlt) {
     article.imageAlt = article.title || 'News image';
   }
 }
 
-// ────────────────────────────────────────────────────────────────────────────────
-// OPTIONAL: auto-pick by slug from Cloudinary (Admin Search API)
-// Enable with CLOUDINARY_AUTOPICK=on and set CLOUDINARY_FOLDER
-async function maybeAutopickBySlug(article) {
-  const AUTOPICK = String(process.env.CLOUDINARY_AUTOPICK || '').toLowerCase() === 'on';
-  const FOLDER = process.env.CLOUDINARY_FOLDER || 'news-images';
-  if (!AUTOPICK || !article?.slug || article.imagePublicId) return;
-
-  try {
-    const expr = `folder:${FOLDER} AND (public_id:${FOLDER}/${article.slug}* OR filename:${article.slug}*)`;
-    const res = await cloudinary.search.expression(expr).max_results(5).execute();
-
-    if (res?.resources?.length) {
-      // pick the first; you can add better ranking if you want
-      const pick = res.resources[0];
-      article.imagePublicId = pick.public_id;
-    }
-  } catch (e) {
-    console.warn('[autopick] Cloudinary search failed:', e?.message || e);
-  }
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// CREATE ARTICLE — FULL GOOGLE DRIVE → CLOUDINARY SUPPORT
+// ─────────────────────────────────────────────────────────────
 exports.createOne = async (req, res) => {
   try {
-    const article = normalizeIncomingArticle(req.body);
-    const primary = sanitizeStrategy(req.body?.imageStrategy);
+    let article = normalizeIncoming(req.body);
 
-    // Try to auto-pick only if nothing set yet
-    if (!article.imagePublicId && !article.imageUrl) {
-      await maybeAutopickBySlug(article); // optional
+    ensureSlug(article);
+
+    // Publishing logic
+    article.status = article.status.toLowerCase();
+    if (article.status === 'published' && !article.publishedAt) {
+      article.publishedAt = new Date();
     }
 
-    // IMPORTANT: merge what decideAndAttach returns
-    const img = await decideAndAttach(article, { imageStrategy: primary, fallbacks: ['stock'] });
-    if (img && typeof img === 'object') Object.assign(article, img);
+    // 1️⃣ Manual Google Drive URL override
+    const manualUrlProvided =
+      typeof article.imageUrl === 'string' &&
+      article.imageUrl.trim() !== '' &&
+      !article.imagePublicId;
 
-    // Always guarantee a usable publicId and build URLs
+    // 2️⃣ AUTO-IMAGE (Google Drive → Cloudinary via imagePicker)
+    if (!manualUrlProvided && !article.imagePublicId) {
+      const pick = await chooseHeroImage({
+        title: article.title,
+        summary: article.summary,
+        category: article.category,
+        tags: article.tags,
+        slug: article.slug,
+      });
+
+      // 🧾 DEBUG LOG: see what the picker decided for createOne
+      if (pick) {
+        console.log('[imagePicker] createOne chooseHeroImage:', {
+          title: article.title,
+          why: pick.why,
+          publicId: pick.publicId,
+          url: pick.url,
+        });
+      } else {
+        console.log('[imagePicker] createOne chooseHeroImage returned null/undefined:', {
+          title: article.title,
+        });
+      }
+
+      if (pick && pick.publicId) {
+        article.imagePublicId = pick.publicId;
+        if (pick.url && !article.imageUrl) {
+          article.imageUrl = pick.url;
+        }
+      }
+    }
+
+    // 3️⃣ If manual URL → only set hero image from URL
+    if (manualUrlProvided) {
+      // Cloudinary OG & thumb must still be generated
+      const uploaded = await uploadDriveImageToCloudinary(article.imageUrl, {
+        folder: process.env.CLOUDINARY_FOLDER || 'news-images',
+      });
+      article.imagePublicId = uploaded.public_id;
+      article.imageUrl = uploaded.secure_url;
+    }
+
+    // 4️⃣ Finalize OG / Thumb
     finalizeImageFields(article);
 
     const saved = await Article.create(article);
 
-    // ── Telegram auto-post: immediately after save
-    try {
-      const { postArticle } = require('../services/telegram.service');
-      const imageUrl = saved.ogImage || saved.thumbImage || saved.imageUrl || null;
-
-      await postArticle({
-        title: saved.title,
-        summary: saved.excerpt || saved.summary || '',
-        url: `${process.env.SITE_URL || 'https://timelyvoice.com'}/article/${saved.slug}`,
-        imageUrl,
-      });
-    } catch (e) {
-      console.warn('[telegram] post failed (non-blocking):', e?.response?.data || e.message);
-    }
-    // ── End Telegram block
-
     return res.json({ ok: true, id: saved._id, slug: saved.slug });
   } catch (err) {
     console.error('[admin.articles] createOne error:', err);
-    return res.status(400).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err.message) });
   }
 };
 
+// ─────────────────────────────────────────────────────────────
+// IMPORT MANY (Bulk upload)
+// ─────────────────────────────────────────────────────────────
 exports.importMany = async (req, res) => {
   try {
-    const {
-      items = [],
-      imageStrategy = 'cloudinary',
-      continueOnError = true,
-      forceDefaultImage = false, // optional bulk switch
-    } = req.body || {};
-
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ ok: false, error: 'items[] required' });
-    }
-
-    const primary = sanitizeStrategy(imageStrategy);
+    const { items = [] } = req.body || {};
     const results = [];
 
     for (const raw of items) {
       try {
-        const article = normalizeIncomingArticle({
-          ...raw,
-          ...(forceDefaultImage ? { forceDefaultImage: true } : {}),
-        });
+        let article = normalizeIncoming(raw);
+        ensureSlug(article);
 
-        if (!article.imagePublicId && !article.imageUrl) {
-          await maybeAutopickBySlug(article); // optional
+        // Bulk publish logic
+        article.status = article.status.toLowerCase();
+        if (article.status === 'published' && !article.publishedAt) {
+          article.publishedAt = new Date();
         }
 
-        const img = await decideAndAttach(article, {
-          imageStrategy: primary,
-          fallbacks: ['stock'],
-        });
-        if (img && typeof img === 'object') Object.assign(article, img);
+        const manualUrlProvided =
+          typeof article.imageUrl === 'string' &&
+          article.imageUrl.trim() !== '' &&
+          !article.imagePublicId;
+
+        // AUTO PICK
+        if (!manualUrlProvided && !article.imagePublicId) {
+          const pick = await chooseHeroImage({
+            title: article.title,
+            summary: article.summary,
+            category: article.category,
+            tags: article.tags,
+            slug: article.slug,
+          });
+
+          // 🧾 DEBUG LOG: see what the picker decided for importMany
+          if (pick) {
+            console.log('[imagePicker] importMany chooseHeroImage:', {
+              title: article.title,
+              why: pick.why,
+              publicId: pick.publicId,
+              url: pick.url,
+            });
+          } else {
+            console.log('[imagePicker] importMany chooseHeroImage returned null/undefined:', {
+              title: article.title,
+            });
+          }
+
+          if (pick && pick.publicId) {
+            article.imagePublicId = pick.publicId;
+            if (pick.url && !article.imageUrl) {
+              article.imageUrl = pick.url;
+            }
+          }
+        }
+
+        // Manual override
+        if (manualUrlProvided) {
+          const uploaded = await uploadDriveImageToCloudinary(article.imageUrl, {
+            folder: process.env.CLOUDINARY_FOLDER || 'news-images',
+          });
+          article.imagePublicId = uploaded.public_id;
+          article.imageUrl = uploaded.secure_url;
+        }
 
         finalizeImageFields(article);
 
         const saved = await Article.create(article);
-
-        // ── Telegram auto-post per imported item (inside loop, after save)
-        try {
-          const { postArticle } = require('../services/telegram.service');
-          const imageUrl = saved.ogImage || saved.thumbImage || saved.imageUrl || null;
-
-          await postArticle({
-            title: saved.title,
-            summary: saved.excerpt || saved.summary || '',
-            url: `${process.env.SITE_URL || 'https://timelyvoice.com'}/article/${saved.slug}`,
-            imageUrl,
-          });
-        } catch (e) {
-          console.warn('[telegram] post failed (non-blocking):', e?.response?.data || e.message);
-        }
-        // ── End Telegram block
-
         results.push({ ok: true, id: saved._id, slug: saved.slug });
       } catch (e) {
-        const errMsg = String(e?.message || e);
-        console.error('[admin.articles] import item failed:', errMsg);
-        if (!continueOnError) {
-          return res.status(400).json({ ok: false, error: errMsg, results });
-        }
-        results.push({ ok: false, error: errMsg });
+        results.push({ ok: false, error: String(e.message) });
       }
     }
 
     return res.json({ ok: true, results });
   } catch (err) {
-    console.error('[admin.articles] importMany error:', err);
-    return res.status(400).json({ ok: false, error: String(err?.message || err) });
+    console.error('[importMany]', err);
+    return res.status(500).json({ ok: false, error: String(err.message) });
   }
 };
 
+// ─────────────────────────────────────────────────────────────
+// PREVIEW MANY (Bulk preview)
+// ─────────────────────────────────────────────────────────────
 exports.previewMany = async (req, res) => {
   try {
-    const { items = [], imageStrategy = 'cloudinary' } = req.body || {};
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ ok: false, error: 'items[] required' });
-    }
-
-    const primary = sanitizeStrategy(imageStrategy);
+    const { items = [] } = req.body || {};
     const previews = [];
 
-    for (let i = 0; i < items.length; i++) {
-      const raw = items[i];
-      const article = normalizeIncomingArticle(raw);
+    for (const raw of items) {
+      let article = normalizeIncoming(raw);
+      ensureSlug(article);
 
-      if (!article.imagePublicId && !article.imageUrl) {
-        await maybeAutopickBySlug(article); // optional
+      const manualUrlProvided =
+        typeof article.imageUrl === 'string' &&
+        article.imageUrl.trim() !== '' &&
+        !article.imagePublicId;
+
+      // AUTO PICK
+      if (!manualUrlProvided && !article.imagePublicId) {
+        const pick = await chooseHeroImage({
+          title: article.title,
+          summary: article.summary,
+          category: article.category,
+          tags: article.tags,
+          slug: article.slug,
+        });
+
+        // 🧾 DEBUG LOG: see what the picker decided for previewMany
+        if (pick) {
+          console.log('[imagePicker] previewMany chooseHeroImage:', {
+            title: article.title,
+            why: pick.why,
+            publicId: pick.publicId,
+            url: pick.url,
+          });
+        } else {
+          console.log('[imagePicker] previewMany chooseHeroImage returned null/undefined:', {
+            title: article.title,
+          });
+        }
+
+        if (pick && pick.publicId) {
+          article.imagePublicId = pick.publicId;
+          if (pick.url && !article.imageUrl) {
+            article.imageUrl = pick.url;
+          }
+        }
       }
 
-      const img = await decideAndAttach(article, { imageStrategy: primary, fallbacks: ['stock'] });
-      if (img && typeof img === 'object') Object.assign(article, img);
+      if (manualUrlProvided) {
+        const uploaded = await uploadDriveImageToCloudinary(article.imageUrl, {
+          folder: process.env.CLOUDINARY_FOLDER || 'news-images',
+        });
+        article.imagePublicId = uploaded.public_id;
+        article.imageUrl = uploaded.secure_url;
+      }
 
       finalizeImageFields(article);
 
       previews.push({
-        index: i,
         title: article.title,
         slug: article.slug,
-        category: article.category,
-        imagePublicId: article.imagePublicId || null,
-        imageUrl: article.imageUrl || null,
-        ogImage: article.ogImage || null,
-        imageAlt: article.imageAlt || (article.title || ''),
+        imagePublicId: article.imagePublicId,
+        imageUrl: article.imageUrl,
+        ogImage: article.ogImage,
       });
     }
 
-    return res.json({ ok: true, previews });
+    res.json({ ok: true, previews });
   } catch (err) {
-    console.error('[admin.articles] previewMany error:', err);
-    return res.status(400).json({ ok: false, error: String(err?.message || err) });
+    console.error('[previewMany]', err);
+    res.status(500).json({ ok: false, error: String(err.message) });
   }
 };

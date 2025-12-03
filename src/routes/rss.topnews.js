@@ -48,20 +48,37 @@ function guessMimeFromUrl(url = "") {
 async function handleTopNewsRss(req, res, next) {
   try {
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
+    const now = new Date();
 
-    // Basic "latest published" filter
+    // Visibility rules similar to public APIs:
+    // - status = published
+    // - publishAt or publishedAt <= now OR both missing
     const rows = await Article.find({
       status: "published",
-      publishedAt: { $ne: null },
+      $or: [
+        { publishedAt: { $lte: now } },
+        { publishAt:   { $lte: now } },
+        {
+          $and: [
+            { publishedAt: { $exists: false } },
+            { publishAt:   { $exists: false } },
+          ],
+        },
+      ],
     })
       .select(
-        "title slug summary publishedAt updatedAt createdAt imageUrl ogImage cover"
+        "title slug summary publishedAt publishAt updatedAt createdAt imageUrl ogImage cover"
       )
-      .sort({ publishedAt: -1, updatedAt: -1, createdAt: -1 })
+      .sort({
+        publishedAt: -1,
+        publishAt: -1,
+        createdAt: -1,
+        _id: -1,
+      })
       .limit(limit)
       .lean();
 
-    const now = new Date().toUTCString();
+    const nowStr = new Date().toUTCString();
 
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -70,13 +87,13 @@ async function handleTopNewsRss(req, res, next) {
   <link>${esc(SITE_URL + "/top-news")}</link>
   <description>Newest headlines from The Timely Voice</description>
   <language>en</language>
-  <lastBuildDate>${esc(now)}</lastBuildDate>
+  <lastBuildDate>${esc(nowStr)}</lastBuildDate>
 `;
 
     for (const a of rows) {
       const link = articleUrlFromSlug(a.slug);
       const pub =
-        a.publishedAt || a.updatedAt || a.createdAt || new Date();
+        a.publishedAt || a.publishAt || a.updatedAt || a.createdAt || new Date();
       const pubDate = new Date(pub).toUTCString();
       const desc = a.summary || "";
 
@@ -105,7 +122,8 @@ async function handleTopNewsRss(req, res, next) {
 </rss>`;
 
     res.set("Content-Type", "application/rss+xml; charset=utf-8");
-    res.set("Cache-Control", "public, max-age=300");
+    // Shorter cache so new posts appear faster in readers
+    res.set("Cache-Control", "public, max-age=60");
     res.status(200).send(xml);
   } catch (err) {
     console.error("[RSS] /rss/top-news error:", err);

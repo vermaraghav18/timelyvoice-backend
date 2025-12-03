@@ -56,11 +56,15 @@
 
     "geoip-lite": "^1.4.10",
 
+    "googleapis": "^166.0.0",
+
     "jsdom": "^27.0.1",
 
     "jsonwebtoken": "^9.0.2",
 
     "luxon": "^3.7.2",
+
+    "mime-types": "^3.0.2",
 
     "mongoose": "^8.18.3",
 

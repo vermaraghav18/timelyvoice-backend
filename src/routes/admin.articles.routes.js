@@ -112,7 +112,11 @@ function normalizeArticlesWithCategories(items, categoriesMapById = new Map(), c
     if (looksLikeObjectId(a.category)) {
       const c = categoriesMapById.get(String(a.category));
       if (c) {
-        a.category = { id: String(c._id), name: c.name || null, slug: c.slug || (c.name ? slugify(c.name, { lower: true, strict: true }) : null) };
+        a.category = {
+          id: String(c._id),
+          name: c.name || null,
+          slug: c.slug || (c.name ? slugify(c.name, { lower: true, strict: true }) : null),
+        };
       } else {
         a.category = { id: String(a.category), name: null, slug: null };
       }
@@ -126,7 +130,7 @@ function normalizeArticlesWithCategories(items, categoriesMapById = new Map(), c
       a.category = {
         id: c ? String(c._id) : null,
         name,
-        slug: c?.slug || slugify(name, { lower: true, strict: true })
+        slug: c?.slug || slugify(name, { lower: true, strict: true }),
       };
       return a;
     }
@@ -139,8 +143,8 @@ function normalizeArticlesWithCategories(items, categoriesMapById = new Map(), c
 // Render-safe category text for admin UI cells
 const toCatText = (v) =>
   Array.isArray(v) ? v.map(toCatText).filter(Boolean)
-  : (v && typeof v === 'object') ? (v.name || v.slug || '')
-  : (v || '');
+    : (v && typeof v === 'object') ? (v.name || v.slug || '')
+      : (v || '');
 
 // ────────────────────────────────────────────────────────────────────────────────
 // CLOUDINARY PUBLIC ID DERIVER (for pasted image URLs)
@@ -170,6 +174,44 @@ function deriveCloudinaryPublicIdFromUrl(url = '') {
   }
 }
 
+// Normalize remote image URLs (Google Drive → direct download URL)
+function normalizeRemoteImageUrl(raw = '') {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+
+  // If it's a Google Drive link, convert it to a direct download URL
+  if (s.includes('drive.google.com')) {
+    // Patterns:
+    //  - https://drive.google.com/file/d/FILE_ID/view?usp=sharing
+    //  - https://drive.google.com/open?id=FILE_ID
+    //  - https://drive.google.com/uc?id=FILE_ID&export=download
+    let fileId = null;
+
+    const byPath = s.match(/\/file\/d\/([^/]+)/);
+    if (byPath && byPath[1]) {
+      fileId = byPath[1];
+    }
+
+    if (!fileId) {
+      const byParam = s.match(/[?&]id=([^&]+)/);
+      if (byParam && byParam[1]) {
+        fileId = byParam[1];
+      }
+    }
+
+    if (fileId) {
+      // Direct file content URL used by Cloudinary to fetch
+      return `https://drive.google.com/uc?export=download&id=${fileId}`;
+    }
+
+    // If we couldn't extract an ID, just return the original
+    return s;
+  }
+
+  // For all other URLs, just return as-is
+  return s;
+}
+
 // ────────────────────────────────────────────────────────────────────────────────
 // CREATE (single) — POST /api/admin/articles
 router.post('/', ctrl.createOne);
@@ -180,6 +222,53 @@ router.post('/import', ctrl.importMany);
 // PREVIEW BULK IMPORT (no DB writes) — POST /api/admin/articles/preview-import
 router.post('/preview-import', ctrl.previewMany);
 
+// IMPORT IMAGE FROM URL (Cloudinary + Google Drive support)
+// POST /api/admin/articles/import-image-from-url
+router.post('/import-image-from-url', async (req, res) => {
+  try {
+    const { url } = req.body || {};
+    if (!url || typeof url !== 'string' || !url.trim()) {
+      return res.status(400).json({ error: 'url_required' });
+    }
+
+    const normalized = normalizeRemoteImageUrl(url);
+
+    // If it's already a Cloudinary URL, just derive its publicId and return
+    const maybePid = deriveCloudinaryPublicIdFromUrl(normalized);
+    if (maybePid) {
+      return res.json({
+        ok: true,
+        publicId: maybePid,
+        url: cloudinary.url(maybePid, { secure: true }),
+      });
+    }
+
+    // Otherwise, upload the remote URL to Cloudinary
+    const folder =
+      process.env.AUTOMATION_IMAGE_FOLDER ||
+      process.env.CLOUDINARY_FOLDER ||
+      'news-images';
+
+    const uploaded = await cloudinary.uploader.upload(normalized, {
+      folder,
+      overwrite: false,
+    });
+
+    return res.json({
+      ok: true,
+      publicId: uploaded.public_id,
+      url: uploaded.secure_url,
+      width: uploaded.width,
+      height: uploaded.height,
+      format: uploaded.format,
+    });
+  } catch (err) {
+    console.error('[admin.articles] import-image-from-url failed', err?.message || err);
+    return res.status(500).json({ error: 'upload_failed' });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────────
 // LIST DRAFTS — GET /api/admin/articles/drafts
 router.get('/drafts', async (req, res) => {
   try {
@@ -387,8 +476,9 @@ router.patch('/:id', async (req, res) => {
     if (patch.imageUrl && isPlaceholderUrl(patch.imageUrl)) {
       delete patch.imageUrl; // force rebuild
     }
+    // 🔁 if imagePublicId is an empty string, mark it as null so we can treat as explicit clear
     if (patch.imagePublicId !== undefined && String(patch.imagePublicId).trim() === '') {
-      delete patch.imagePublicId; // treat as unset
+      patch.imagePublicId = null;
     }
 
     // 4) load current, merge
@@ -396,6 +486,18 @@ router.patch('/:id', async (req, res) => {
     if (!current) return res.status(404).json({ error: 'not_found' });
 
     const merged = { ...current, ...patch };
+
+    // 🔁 NEW: when admin explicitly clears the image fields ("" or null),
+    // drop them from merged so decideAndAttach can re-run auto-picker
+    if (Object.prototype.hasOwnProperty.call(patch, 'imageUrl') &&
+      (patch.imageUrl === '' || patch.imageUrl === null)) {
+      delete merged.imageUrl;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(patch, 'imagePublicId') &&
+      (patch.imagePublicId === '' || patch.imagePublicId === null)) {
+      delete merged.imagePublicId;
+    }
 
     // If a manual URL was provided and no publicId, try to derive one from the URL
     const manualUrlProvided =
