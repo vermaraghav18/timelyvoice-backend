@@ -5,3 +5,4 @@ node_modules/
 # Ignore node modules
 node_modules/
 NUL
+keys/
