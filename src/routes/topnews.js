@@ -121,10 +121,12 @@ router.get("/", async (req, res, next) => {
     const page = Math.max(1, Number(req.query.page ?? 1));
     const skip = (page - 1) * limit;
 
+   const now = new Date();
     const q = {
       status: "published",
-      publishedAt: { $ne: null },
+      publishedAt: { $lte: now },
     };
+
 
     const [catMap, rows] = await Promise.all([
       getCategoryMap(),

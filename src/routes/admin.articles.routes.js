@@ -371,16 +371,23 @@ router.get('/', async (req, res) => {
     const perPage = Math.max(1, Math.min(200, parseInt(limit, 10) || 20));
     const skip = (pageNum - 1) * perPage;
 
-    const [rawItems, total] = await Promise.all([
-      Article.find(query)
-        .select('_id title slug status category summary publishedAt updatedAt imageUrl imagePublicId ogImage thumbImage tags')
-        .sort({ updatedAt: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(perPage)
-        .populate({ path: 'category', select: 'name slug', options: { lean: true } })
-        .lean(),
-      Article.countDocuments(query),
-    ]);
+   const [rawItems, total] = await Promise.all([
+  Article.find(query)
+    .select(
+      '_id title slug status category summary publishedAt updatedAt imageUrl imagePublicId ogImage thumbImage tags'
+    )
+    .sort({ publishedAt: -1, updatedAt: -1, createdAt: -1 })
+    .skip(skip)
+    .limit(perPage)
+    .populate({
+      path: 'category',
+      select: 'name slug',
+      options: { lean: true },
+    })
+    .lean(),
+  Article.countDocuments(query),
+]);
+
 
     // normalize categories
     const idSet = new Set();

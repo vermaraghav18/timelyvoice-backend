@@ -72,17 +72,21 @@ async function buildAllUrls(origin) {
 
   // Articles (only published + visible by schedule)
   const now = new Date();
-  const articles = await Models.Article.find(
-    {
-      status: 'published',
-      $or: [
-        { publishAt: { $lte: now } },
-        { publishAt: { $exists: false } },
-        { publishAt: null },
-      ],
-    },
-    { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
-  ).lean();
+
+const articles = await Models.Article.find(
+  {
+    status: 'published',
+    // treat publishedAt as the real publish time
+    $or: [
+      { publishedAt: { $lte: now } },
+      { publishedAt: { $exists: false } },
+      { publishedAt: null },
+    ],
+  },
+  { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
+)
+  .sort({ publishedAt: -1, updatedAt: -1, _id: -1 })
+  .lean();
 
    // Core urls (homepage + key static pages)
   const core = [
