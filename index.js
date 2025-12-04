@@ -8,6 +8,12 @@ const dotenvResult = require('dotenv').config({
 console.log('[dotenv] loaded from', path.resolve(__dirname, '.env'));
 console.log('[dotenv] MONGO_URI at top =', process.env.MONGO_URI || '(undefined)');
 
+console.log(
+  '[dotenv] CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID =',
+  process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID || '(undefined)'
+);
+
+
 // 2) Fetch polyfill for SSR / automation (safe for Node 18+ too)
 const fetch = (typeof globalThis.fetch === 'function')
   ? globalThis.fetch.bind(globalThis)
@@ -413,9 +419,13 @@ let {
   CLOUDINARY_CLOUD_NAME,
   CLOUDINARY_API_KEY,
   CLOUDINARY_API_SECRET,
-  CLOUDINARY_FOLDER = 'news-site',
+  CLOUDINARY_FOLDER = 'news-images',  
+  CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
   PUBLICATION_NAME = 'My News',
 } = process.env;
+
+console.log('[env] CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID =', CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID);
+
 
 console.log('[env] MONGO_URI (after destructuring) =', MONGO_URI);
 
