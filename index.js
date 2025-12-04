@@ -254,6 +254,8 @@ app.get("/api/automation/_debug/openrouter", (req, res) => {
 // Admin articles router
 const adminArticlesRouter = require('./src/routes/admin.articles.routes');
 app.use('/api/admin/articles', adminArticlesRouter);
+// ⬇ Image Picker Debug Route
+app.use("/api/debug", require("./src/routes/debug.imagePicker.routes"));
 
 // robots + cached high-traffic endpoints
 app.use("/", robotsRoute);

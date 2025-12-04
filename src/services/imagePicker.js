@@ -1,5 +1,6 @@
 // -----------------------------------------------------------------------------
 // imagePicker.js  (Google Drive → Cloudinary Hybrid Auto-Image System)
+// FIXED + IMPROVED VERSION
 // -----------------------------------------------------------------------------
 
 const fs = require("fs");
@@ -7,8 +8,6 @@ const path = require("path");
 const { google } = require("googleapis");
 const { v2: cloudinary } = require("cloudinary");
 const Article = require("../models/Article");
-
-// ✅ NEW unified Google Drive client
 const { getDriveClient } = require("./driveClient");
 
 // -----------------------------------------------------------------------------
@@ -23,7 +22,6 @@ if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
-// Cloudinary config
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -31,9 +29,6 @@ cloudinary.config({
   secure: true,
 });
 
-// -----------------------------------------------------------------------------
-// GOOGLE DRIVE AUTH (replaced by unified driveClient.js)
-// -----------------------------------------------------------------------------
 const { drive, credSource } = getDriveClient();
 
 // -----------------------------------------------------------------------------
@@ -76,9 +71,7 @@ const STOPWORDS = new Set([
   "ministry",
   "govt",
   "government",
-  "india",
-  "indian",
-  "country",
+  // ❌ REMOVED: india, indian, country
 ]);
 
 function tokenize(str = "") {
@@ -107,17 +100,24 @@ function ngrams(tokens, n) {
   return out;
 }
 
+// -----------------------------------------------------------------------------
+// STRONG NAMES (expanded)
+// -----------------------------------------------------------------------------
 function strongNamesFrom(title, summary) {
   const toks = tokenize(`${title} ${summary}`);
+
   return dedupe(
     toks.filter((t) =>
-      /^(modi|rahul|rajnath|gandhi|singh|ambani|adani|shah|yogi|kejriwal|trump|biden|musk)$/.test(
+      /^(modi|rahul|rajnath|gandhi|singh|ambani|adani|shah|yogi|kejriwal|trump|biden|musk|putin|vladimir|xi|jinping|zelensky|netanyahu|sunak|scholz|macron)$/.test(
         t
       )
     )
   );
 }
 
+// -----------------------------------------------------------------------------
+// NEGATIVE PENALTY
+// -----------------------------------------------------------------------------
 function negativePenalty(name, strong) {
   const famous = [
     "modi",
@@ -142,7 +142,7 @@ function negativePenalty(name, strong) {
 }
 
 // -----------------------------------------------------------------------------
-// Build tokens + phrases
+// TOKEN / PHRASE BUILDER
 // -----------------------------------------------------------------------------
 function buildTokens(meta) {
   const raw = dedupe(tokenize(`${meta.title} ${meta.summary} ${meta.slug}`))
@@ -162,6 +162,7 @@ function buildTokens(meta) {
   const titleToks = tokenize(meta.title)
     .map(stem)
     .filter((t) => !STOPWORDS.has(t));
+
   const phrases = dedupe([
     ...ngrams(titleToks, 3),
     ...ngrams(titleToks, 2),
@@ -176,7 +177,7 @@ function buildTokens(meta) {
 }
 
 // -----------------------------------------------------------------------------
-// 1) SEARCH GOOGLE DRIVE
+// SEARCH GOOGLE DRIVE
 // -----------------------------------------------------------------------------
 async function searchDriveCandidates(tokens = [], phrases = []) {
   if (!drive) return [];
@@ -186,6 +187,7 @@ async function searchDriveCandidates(tokens = [], phrases = []) {
   for (const t of tokens) {
     if (t.length >= 3) qParts.push(`name contains '${t}'`);
   }
+
   for (const p of phrases) {
     const plain = p.replace(/\s+/g, "");
     const hyph = p.replace(/\s+/g, "-");
@@ -207,12 +209,13 @@ async function searchDriveCandidates(tokens = [], phrases = []) {
 }
 
 // -----------------------------------------------------------------------------
-// 2) SCORE CANDIDATES
+// SCORING ENGINE (IMPROVED)
 // -----------------------------------------------------------------------------
 function scoreFile(f, tokens, phrases, strongNames) {
   const name = f.name.toLowerCase();
   let score = 0;
 
+  // Phrase match — strongest
   for (const p of phrases) {
     const plain = p.replace(/\s+/g, "");
     const hyph = p.replace(/\s+/g, "-");
@@ -221,7 +224,18 @@ function scoreFile(f, tokens, phrases, strongNames) {
     }
   }
 
+  // Strong-name BOOST
+  for (const s of strongNames) {
+    if (name.includes(s)) score += 10;
+  }
+
+  // Token scoring with downweights
   for (const t of tokens) {
+    if (["energy", "oil", "gas", "geopolitic", "defence", "security"].includes(t)) {
+      if (name.includes(t)) score += 1; // generic topics → weak
+      continue;
+    }
+
     if (name.includes(t)) score += 2;
   }
 
@@ -234,7 +248,7 @@ function scoreFile(f, tokens, phrases, strongNames) {
 }
 
 // -----------------------------------------------------------------------------
-// 3) DOWNLOAD FROM DRIVE → TEMP → CLOUDINARY
+// DOWNLOAD → CLOUDINARY
 // -----------------------------------------------------------------------------
 async function downloadAndUploadToCloudinary(file) {
   const destPath = path.join(TEMP_DIR, `${file.id}-${file.name}`);
@@ -256,11 +270,9 @@ async function downloadAndUploadToCloudinary(file) {
   });
 
   try {
-    if (fs.existsSync(destPath)) {
-      fs.unlinkSync(destPath);
-    }
-  } catch (cleanupErr) {
-    console.warn("[imagePicker Drive] cleanup warning:", cleanupErr);
+    if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+  } catch (err) {
+    console.warn("[imagePicker] cleanup warning:", err);
   }
 
   return {
@@ -270,7 +282,7 @@ async function downloadAndUploadToCloudinary(file) {
 }
 
 // -----------------------------------------------------------------------------
-// 4) PERSON-SPECIFIC ROTATION (modi-01, modi-02, ...)
+// PERSON ROTATION
 // -----------------------------------------------------------------------------
 async function pickRotatedPersonFile(personKey, candidates) {
   if (!personKey || !Array.isArray(candidates) || !candidates.length) {
@@ -279,28 +291,19 @@ async function pickRotatedPersonFile(personKey, candidates) {
 
   const regex = new RegExp(personKey, "i");
 
-  // ✅ Only hit MongoDB if this model's connection is actually ready
   let usedCount = 0;
   try {
-    const conn = Article.db; // Mongoose connection used by the model
-    const isReady = conn && conn.readyState === 1; // 1 = connected
+    const conn = Article.db;
+    const isReady = conn && conn.readyState === 1;
 
     if (isReady) {
       usedCount = await Article.countDocuments({
         $or: [{ title: regex }, { summary: regex }],
       });
     } else {
-      // No live DB connection in this context (like test script) → just start at 0
-      console.warn(
-        "[imagePicker Drive] rotation: skipping Article.countDocuments because Mongo is not connected"
-      );
       usedCount = 0;
     }
   } catch (err) {
-    console.warn(
-      "[imagePicker Drive] rotation: failed to fetch usedCount, defaulting to 0:",
-      err.message || err
-    );
     usedCount = 0;
   }
 
@@ -324,31 +327,23 @@ async function pickRotatedPersonFile(personKey, candidates) {
 }
 
 // -----------------------------------------------------------------------------
-// MAIN PUBLIC FUNCTION
+// MAIN EXPORT
 // -----------------------------------------------------------------------------
 exports.chooseHeroImage = async function (meta = {}) {
   try {
     if (!DRIVE_FOLDER_ID) {
-      const why = { mode: "no-drive-folder-id" };
-      console.error(
-        "[imagePicker Drive] ERROR: DRIVE_FOLDER_ID is not configured"
-      );
-
       return {
         publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
         url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-        why,
+        why: { mode: "no-drive-folder-id" },
       };
     }
 
     if (!drive) {
-      const why = { mode: "no-drive-client", credSource };
-      console.error("[imagePicker Drive] ERROR: Drive client not initialized");
-
       return {
         publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
         url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-        why,
+        why: { mode: "no-drive-client", credSource },
       };
     }
 
@@ -357,92 +352,83 @@ exports.chooseHeroImage = async function (meta = {}) {
 
     let candidates = await searchDriveCandidates(tokens, phrases);
 
-    // Fallback: list everything in folder
-    if (!candidates.length && drive) {
-      const all = await drive.files.list({
+    // Fallback list-all
+    if (!candidates.length) {
+      const res = await drive.files.list({
         q: `'${DRIVE_FOLDER_ID}' in parents`,
         fields: "files(id, name, mimeType, modifiedTime)",
         pageSize: 50,
       });
-      candidates = all.data.files || [];
+      candidates = res.data.files || [];
     }
 
     if (!candidates.length) {
-      const why = { mode: "no-drive-files" };
-
       return {
         publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
         url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-        why,
+        why: { mode: "no-drive-files" },
       };
     }
 
     let best = null;
     let rotationMeta = null;
 
+    // Person rotation
     const personKey = strongNames.length ? strongNames[0] : null;
     if (personKey) {
-      const lowerKey = personKey.toLowerCase();
+      const lower = personKey.toLowerCase();
       const personCandidates = candidates.filter((f) =>
-        f.name.toLowerCase().includes(lowerKey)
+        f.name.toLowerCase().includes(lower)
       );
 
       if (personCandidates.length > 0) {
         const rotated = await pickRotatedPersonFile(personKey, personCandidates);
         if (rotated && rotated.file) {
-          best = {
-            file: rotated.file,
-            score: null,
-            matchedTokens: [],
-          };
+          best = { file: rotated.file, score: null, matchedTokens: [] };
           rotationMeta = rotated.meta;
         }
       }
     }
 
-    // Fallback to scoring
+    // Standard scoring
     if (!best) {
       for (const f of candidates) {
-        const { score, matchedTokens } = scoreFile(
-          f,
-          tokens,
-          phrases,
-          strongNames
-        );
-        const pack = { file: f, score, matchedTokens };
-        if (!best || score > best.score) best = pack;
+        const pack = scoreFile(f, tokens, phrases, strongNames);
+        const scored = { file: f, score: pack.score, matchedTokens: pack.matchedTokens };
+
+        if (!best || scored.score > best.score) best = scored;
       }
+    }
+
+    // MINIMUM SCORE THRESHOLD
+    if (best.score !== null && best.score < 8) {
+      return {
+        publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
+        url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
+        why: { mode: "weak-match-fallback", score: best.score },
+      };
     }
 
     const uploaded = await downloadAndUploadToCloudinary(best.file);
 
-    const baseWhy = {
-      mode: rotationMeta ? rotationMeta.mode : "drive-picked",
-      file: best.file.name,
-      score: best.score,
-      matchedTokens: best.matchedTokens,
-      credSource,
-    };
-    const why = rotationMeta ? { ...baseWhy, rotation: rotationMeta } : baseWhy;
-
-    console.log("[imagePicker Drive] DEBUG:", {
-      metaTitle: meta.title,
-      why,
-    });
-
     return {
       publicId: uploaded.publicId,
       url: uploaded.url,
-      why,
+      why: {
+        mode: rotationMeta ? rotationMeta.mode : "drive-picked",
+        file: best.file.name,
+        score: best.score,
+        matchedTokens: best.matchedTokens,
+        rotation: rotationMeta || null,
+        credSource,
+      },
     };
   } catch (err) {
-    const why = { mode: "error", error: String(err) };
-    console.error("[imagePicker Drive] ERROR:", err);
-
+    console.error("[imagePicker ERROR]", err);
     return {
       publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
       url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-      why,
+      why: { mode: "error", error: String(err) },
     };
   }
 };

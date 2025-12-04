@@ -6,7 +6,7 @@ const mongoose = require('mongoose');
  * ARTICLE_MIN_BODY:    minimum words required in body (default 450)
  * ARTICLE_MIN_SUMMARY: minimum characters required in summary (default 60)
  */
-const MIN_BODY = parseInt(process.env.ARTICLE_MIN_BODY || '450', 10);
+const MIN_BODY = parseInt(process.env.ARTICLE_MIN_BODY || '350', 10);
 const MIN_SUMMARY = parseInt(process.env.ARTICLE_MIN_SUMMARY || '60', 10);
 
 function stripHtml(s = '') {
