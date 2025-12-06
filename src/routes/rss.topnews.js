@@ -4,14 +4,67 @@ const express = require("express");
 const router = express.Router();
 const Article = require("../models/Article");
 
-// Base URL for links in RSS items
+// ───────────────────────────────────────────────────────────────────────────────
+// Site base URL (links in RSS items)
+// ───────────────────────────────────────────────────────────────────────────────
+
 const FRONTEND_BASE_URL =
   (process.env.FRONTEND_BASE_URL ||
     process.env.SITE_URL ||
     "https://timelyvoice.com").replace(/\/$/, "");
 const SITE_URL = FRONTEND_BASE_URL;
 
-// Minimal XML escape
+// ───────────────────────────────────────────────────────────────────────────────
+// Cloudinary default image + URL builder (for RSS fallback)
+// ───────────────────────────────────────────────────────────────────────────────
+
+const DEFAULT_PID =
+  process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
+  "news-images/defaults/fallback-hero";
+
+const CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || null;
+
+function buildCloudinaryUrl(publicId, transform = "") {
+  if (!CLOUD_NAME || !publicId) return "";
+  const encodedPid = encodeURIComponent(publicId);
+  const base = `https://res.cloudinary.com/${CLOUD_NAME}/image/upload/`;
+  return transform ? `${base}${transform}/${encodedPid}` : `${base}${encodedPid}`;
+}
+
+// OG-style default hero used when article has no real image
+const FALLBACK_OG_URL = buildCloudinaryUrl(
+  DEFAULT_PID,
+  "c_fill,g_auto,h_630,w_1200,f_jpg"
+);
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────────
+
+// strip placeholders like "leave it empty" and wrapping quotes
+function sanitizeImageMarker(val) {
+  if (!val) return "";
+  let s = String(val).trim();
+  if (!s) return "";
+
+  // remove leading/trailing quotes
+  s = s.replace(/^['"]+|['"]+$/g, "").trim();
+  if (!s) return "";
+
+  const lower = s.toLowerCase();
+
+  if (
+    /^leave\s+(it|this)?\s*empty$/.test(lower) ||
+    lower === "leave empty" ||
+    lower === "none" ||
+    lower === "n/a"
+  ) {
+    return "";
+  }
+
+  return s;
+}
+
 function esc(s = "") {
   return String(s).replace(/[<>&'"]/g, (c) => {
     switch (c) {
@@ -44,7 +97,63 @@ function guessMimeFromUrl(url = "") {
   return "image/jpeg";
 }
 
+// Normalize any possible "image" value coming from Mongo
+// - objects: { url, secure_url }
+// - bad placeholders: "leave it empty", "Leave it empty", '"leave it empty"' etc.
+// - publicIds (no http): build Cloudinary URL
+// - only keep real URLs or resolved Cloudinary URLs
+function normalizeImageField(raw) {
+  if (!raw) return "";
+
+  // Handle { url, secure_url } objects (e.g. cover)
+  if (typeof raw === "object") {
+    if (raw.secure_url || raw.url) {
+      raw = raw.secure_url || raw.url;
+    } else {
+      return "";
+    }
+  }
+
+  const cleaned = sanitizeImageMarker(raw);
+  if (!cleaned) return "";
+
+  const s = cleaned;
+
+  // Already a full URL
+  if (/^https?:\/\//i.test(s)) return s;
+
+  // Otherwise, if we have Cloudinary, assume it's a publicId
+  if (CLOUD_NAME) {
+    return buildCloudinaryUrl(s, "c_fill,g_auto,h_630,w_1200,f_jpg");
+  }
+
+  // Unknown non-URL string – treat as no image for RSS safety
+  return "";
+}
+
+// Decide which image to use for RSS:
+// 1) ogImage (if valid URL)
+// 2) imageUrl
+// 3) cover.url / cover.secure_url
+// 4) fallback OG hero (Cloudinary default)
+function pickBestImageForRss(article) {
+  const coverObj = article.cover || {};
+  const coverUrl = normalizeImageField(coverObj.secure_url || coverObj.url);
+
+  const candidates = [
+    normalizeImageField(article.ogImage),
+    normalizeImageField(article.imageUrl),
+    coverUrl,
+  ].filter(Boolean);
+
+  // If the document has no usable image, fall back to global default OG
+  return candidates[0] || FALLBACK_OG_URL || "";
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
 // Shared handler for both /top-news and /top-news.xml
+// ───────────────────────────────────────────────────────────────────────────────
+
 async function handleTopNewsRss(req, res, next) {
   try {
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
@@ -57,11 +166,11 @@ async function handleTopNewsRss(req, res, next) {
       status: "published",
       $or: [
         { publishedAt: { $lte: now } },
-        { publishAt:   { $lte: now } },
+        { publishAt: { $lte: now } },
         {
           $and: [
             { publishedAt: { $exists: false } },
-            { publishAt:   { $exists: false } },
+            { publishAt: { $exists: false } },
           ],
         },
       ],
@@ -97,9 +206,8 @@ async function handleTopNewsRss(req, res, next) {
       const pubDate = new Date(pub).toUTCString();
       const desc = a.summary || "";
 
-      // choose best image (order: ogImage > imageUrl > cover)
-      const img = a.ogImage || a.imageUrl || a.cover || "";
-      const mime = img ? guessMimeFromUrl(img) : null;
+      const img = pickBestImageForRss(a); // ← always a real URL or fallback OG
+      const hasImage = !!img;
 
       xml += `  <item>
     <title>${esc(a.title || "")}</title>
@@ -109,7 +217,8 @@ async function handleTopNewsRss(req, res, next) {
     <description><![CDATA[${desc}]]></description>
 `;
 
-      if (img) {
+      if (hasImage) {
+        const mime = guessMimeFromUrl(img);
         xml += `    <enclosure url="${esc(img)}" type="${esc(mime)}" />
 `;
       }

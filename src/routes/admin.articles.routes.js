@@ -36,6 +36,30 @@ function buildCloudinaryUrl(publicId, transform = '') {
   return `${base}/${t}${publicId}`;
 }
 
+// Strip placeholders like "leave it empty" etc. and wrapping quotes
+function sanitizeImageUrl(u) {
+  if (!u) return '';
+  let s = String(u).trim();
+  if (!s) return '';
+
+  // strip wrapping single/double quotes if present
+  s = s.replace(/^['"]+|['"]+$/g, '').trim();
+  if (!s) return '';
+
+  const lower = s.toLowerCase();
+
+  if (
+    /^leave\s+(it|this)?\s*empty$/.test(lower) ||
+    lower === 'leave empty' ||
+    lower === 'none' ||
+    lower === 'n/a'
+  ) {
+    return '';
+  }
+
+  return s;
+}
+
 console.log('[admin.articles] DEFAULT_IMAGE_PUBLIC_ID =', DEFAULT_PID);
 console.log('[admin.articles] CLOUD_NAME =', CLOUD_NAME);
 
@@ -60,6 +84,12 @@ function isPlaceholderUrl(u = '') {
 
 function finalizeImageFields(article) {
   if (!article) return;
+
+  // Clean out any junk markers like "leave it empty"
+  article.imageUrl = sanitizeImageUrl(article.imageUrl);
+  article.ogImage = sanitizeImageUrl(article.ogImage);
+  article.thumbImage = sanitizeImageUrl(article.thumbImage);
+
   const publicId = article.imagePublicId || DEFAULT_PID;
   if (!publicId || !CLOUD_NAME) return;
 
@@ -330,11 +360,20 @@ router.get('/drafts', async (req, res) => {
       categoriesMapById,
       categoriesMapByName
     );
-    const drafts = normalizedDrafts.map((a) => ({
-      ...a,
-      category: toCatText(a.category),
-      categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : [],
-    }));
+    const drafts = normalizedDrafts.map((a) => {
+      // ensure draft imageUrl never exposes "leave it empty"
+      const clean = sanitizeImageUrl(a.imageUrl);
+      const bestPid = a.imagePublicId || DEFAULT_PID;
+      const imageUrl =
+        clean || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+
+      return {
+        ...a,
+        imageUrl,
+        category: toCatText(a.category),
+        categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : [],
+      };
+    });
 
     res.json(drafts);
   } catch (err) {
@@ -440,11 +479,24 @@ router.get('/', async (req, res) => {
       categoriesMapById,
       categoriesMapByName
     );
-    const items = normalized.map((a) => ({
-      ...a,
-      category: toCatText(a.category),
-      categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : [],
-    }));
+
+    const items = normalized.map((a) => {
+      // Fix the admin "Image URL (quick)" display:
+      // if imageUrl is "leave it empty", replace with real default hero URL
+      const cleaned = sanitizeImageUrl(a.imageUrl);
+      const bestPid = a.imagePublicId || DEFAULT_PID;
+
+      const imageUrl =
+        cleaned ||
+        (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+
+      return {
+        ...a,
+        imageUrl,
+        category: toCatText(a.category),
+        categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : [],
+      };
+    });
 
     res.json({ items, total, page: pageNum, limit: perPage });
   } catch (err) {
@@ -463,6 +515,14 @@ router.get('/:id', async (req, res) => {
 
     const items = normalizeArticlesWithCategories([raw]);
     const a = items[0];
+
+    // Also sanitize here so edit-form never sees "leave it empty"
+    const cleaned = sanitizeImageUrl(a.imageUrl);
+    const bestPid = a.imagePublicId || DEFAULT_PID;
+    a.imageUrl =
+      cleaned ||
+      (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+
     a.category = toCatText(a.category);
     a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
     res.json(a);
@@ -508,9 +568,16 @@ router.patch('/:id', async (req, res) => {
       patch.publishedAt = new Date();
     }
 
-    if (patch.imageUrl && isPlaceholderUrl(patch.imageUrl)) {
-      delete patch.imageUrl;
+    // Clean up any "leave it empty" / placeholder values coming from the UI
+    if (patch.imageUrl !== undefined) {
+      const cleaned = sanitizeImageUrl(patch.imageUrl);
+      if (!cleaned || isPlaceholderUrl(cleaned)) {
+        delete patch.imageUrl;
+      } else {
+        patch.imageUrl = cleaned;
+      }
     }
+
     if (
       patch.imagePublicId !== undefined &&
       String(patch.imagePublicId).trim() === ''
@@ -592,6 +659,13 @@ router.patch('/:id', async (req, res) => {
 
     const items = normalizeArticlesWithCategories([updated]);
     const a = items[0];
+
+    const cleanedUrl = sanitizeImageUrl(a.imageUrl);
+    const bestPid = a.imagePublicId || DEFAULT_PID;
+    a.imageUrl =
+      cleanedUrl ||
+      (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+
     a.category = toCatText(a.category);
     a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
     res.json(a);
@@ -675,6 +749,11 @@ router.post('/:id/publish', async (req, res) => {
 
     const items = normalizeArticlesWithCategories([updated]);
     const a = items[0];
+    const cleanedUrl = sanitizeImageUrl(a.imageUrl);
+    const bestPid = a.imagePublicId || DEFAULT_PID;
+    a.imageUrl =
+      cleanedUrl ||
+      (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
     a.category = toCatText(a.category);
     a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
     res.json(a);
