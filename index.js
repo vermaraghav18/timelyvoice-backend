@@ -58,6 +58,8 @@ const tickerRoutes = require('./routes/ticker');
 const sectionsRouter = require('./src/routes/sections');
 const sectionsV2 = require('./src/routes/sectionsV2');
 const adminAdsRouter = require('./src/routes/admin.ads.routes');
+const adminAiNewsRouter = require('./src/routes/admin.aiNews.routes');
+
 const planImageRoutes = require('./src/routes/planImage.routes');
 const articlesRouter = require('./src/routes/articles');
 const historyPageRoutes = require('./src/routes/historyPageRoutes');
@@ -260,8 +262,13 @@ app.get("/api/automation/_debug/openrouter", (req, res) => {
 // Admin articles router
 const adminArticlesRouter = require('./src/routes/admin.articles.routes');
 app.use('/api/admin/articles', adminArticlesRouter);
+
+// Admin AI News router (protected with admin auth)
+app.use('/api/admin/ai', auth, adminAiNewsRouter);
+
 // ⬇ Image Picker Debug Route
 app.use("/api/debug", require("./src/routes/debug.imagePicker.routes"));
+
 
 // robots + cached high-traffic endpoints
 app.use("/", robotsRoute);

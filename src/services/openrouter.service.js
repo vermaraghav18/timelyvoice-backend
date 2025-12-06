@@ -51,23 +51,67 @@ function getHeaderMeta() {
   };
 }
 
-/** Extract the last {...} JSON object from a string (in case model adds fluff) */
-function extractLastJSONObject(str) {
-  if (typeof str !== "string") return null;
-  const m = str.match(/\{[\s\S]*\}$/);
-  return m ? m[0] : null;
+/**
+ * Remove nasty control characters that break JSON.parse
+ */
+function stripControlChars(str) {
+  // remove all control chars 0x00–0x1F except tab/newline/carriage-return
+  return String(str || "").replace(
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
+    " "
+  );
 }
 
+/**
+ * Fix invalid backslash escapes.
+ * JSON only allows: \" \\ \/ \b \f \n \r \t \uXXXX
+ * Any other "\X" we convert to "\\X" so JSON.parse won't crash.
+ */
+function fixBadEscapes(str) {
+  return String(str || "").replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
+}
+
+/**
+ * Extract a JSON object from a string even if there is junk
+ * before or after it. We simply take the substring from the
+ * first '{' to the last '}'.
+ */
+function extractJSONObjectLoose(str) {
+  if (typeof str !== "string") return null;
+  const first = str.indexOf("{");
+  const last = str.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) return null;
+  return str.slice(first, last + 1);
+}
+
+/**
+ * Very defensive JSON parser for LLM output.
+ * - strips control chars
+ * - fixes bad escapes
+ * - if direct parse fails, tries to slice out the { ... } chunk
+ */
 function safeParseJSON(raw) {
-  // try direct parse first
+  // If it's already a plain object/array, just return it
+  if (raw && typeof raw === "object") return raw;
+
+  const base = String(raw || "");
+  const cleanedBase = fixBadEscapes(stripControlChars(base));
+
+  // 1️⃣ Try direct parse of the entire string
   try {
-    if (typeof raw === "string") return JSON.parse(raw);
-    if (raw && typeof raw === "object") return raw;
-  } catch (_) { /* ignore */ }
-  // fallback: try extracting last {...}
-  const last = extractLastJSONObject(String(raw || ""));
-  if (!last) throw new Error("No JSON object found in model output");
-  return JSON.parse(last);
+    return JSON.parse(cleanedBase);
+  } catch (_) {
+    // 2️⃣ Try to extract just the JSON object portion
+    const objStr = extractJSONObjectLoose(cleanedBase);
+    if (!objStr) {
+      // Optional: log a tiny preview to help debugging
+      console.error("[safeParseJSON] Could not find JSON object in:", cleanedBase.slice(0, 200));
+      throw new Error("No JSON object found in model output");
+    }
+
+    const cleanedObj = fixBadEscapes(stripControlChars(objStr));
+    return JSON.parse(cleanedObj);
+  }
 }
 
 /** Low-level OpenRouter caller that allows model/key overrides.
@@ -119,6 +163,8 @@ async function callOpenRouter({
   const data = await res.json();
   const content = data?.choices?.[0]?.message?.content ?? "";
   if (!content) throw new Error("OpenRouter returned empty content");
+
+  // content is usually a string with JSON inside
   return safeParseJSON(content);
 }
 

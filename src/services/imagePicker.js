@@ -1,11 +1,10 @@
 // -----------------------------------------------------------------------------
 // imagePicker.js  (Google Drive → Cloudinary Hybrid Auto-Image System)
-// FIXED + IMPROVED VERSION
+// CLEANED VERSION: never returns default image; only real Drive picks or null
 // -----------------------------------------------------------------------------
 
 const fs = require("fs");
 const path = require("path");
-const { google } = require("googleapis");
 const { v2: cloudinary } = require("cloudinary");
 const Article = require("../models/Article");
 const { getDriveClient } = require("./driveClient");
@@ -78,7 +77,7 @@ function tokenize(str = "") {
   return String(str)
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, " ")
-    .split(/[\s-]+/)
+    .split(/[\s-]+/g)
     .filter(Boolean);
 }
 
@@ -331,24 +330,19 @@ async function pickRotatedPersonFile(personKey, candidates) {
 // -----------------------------------------------------------------------------
 exports.chooseHeroImage = async function (meta = {}) {
   try {
+    // If Drive is not configured, tell caller "no pick"
     if (!DRIVE_FOLDER_ID) {
-      return {
-        publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-        url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-        why: { mode: "no-drive-folder-id" },
-      };
+      console.warn("[imagePicker] No DRIVE_FOLDER_ID configured");
+      return null;
     }
 
     if (!drive) {
-      return {
-        publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-        url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-        why: { mode: "no-drive-client", credSource },
-      };
+      console.warn("[imagePicker] No Drive client available; credSource =", credSource);
+      return null;
     }
 
     const { tokens, phrases } = buildTokens(meta);
-    const strongNames = strongNamesFrom(meta.title, meta.summary);
+    const strongNames = strongNamesFrom(meta.title || "", meta.summary || "");
 
     let candidates = await searchDriveCandidates(tokens, phrases);
 
@@ -363,11 +357,8 @@ exports.chooseHeroImage = async function (meta = {}) {
     }
 
     if (!candidates.length) {
-      return {
-        publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-        url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-        why: { mode: "no-drive-files" },
-      };
+      console.log("[imagePicker] No Drive files found in folder:", DRIVE_FOLDER_ID);
+      return null;
     }
 
     let best = null;
@@ -390,24 +381,28 @@ exports.chooseHeroImage = async function (meta = {}) {
       }
     }
 
-    // Standard scoring
+    // Standard scoring (if rotation didn't already choose)
     if (!best) {
       for (const f of candidates) {
         const pack = scoreFile(f, tokens, phrases, strongNames);
-        const scored = { file: f, score: pack.score, matchedTokens: pack.matchedTokens };
+        const scored = {
+          file: f,
+          score: pack.score,
+          matchedTokens: pack.matchedTokens,
+        };
 
         if (!best || scored.score > best.score) best = scored;
       }
     }
 
-    // MINIMUM SCORE THRESHOLD
-    if (best.score !== null && best.score < 8) {
-      return {
-        publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-        url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-        why: { mode: "weak-match-fallback", score: best.score },
-      };
+    // If somehow no usable candidate → no pick
+    if (!best || !best.file) {
+      console.log("[imagePicker] No best candidate after scoring");
+      return null;
     }
+
+    // ❌ OLD: there was a MINIMUM SCORE THRESHOLD here that forced default image
+    // ✅ NEW: we ALWAYS trust the best candidate we found
 
     const uploaded = await downloadAndUploadToCloudinary(best.file);
 
@@ -425,10 +420,8 @@ exports.chooseHeroImage = async function (meta = {}) {
     };
   } catch (err) {
     console.error("[imagePicker ERROR]", err);
-    return {
-      publicId: process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID,
-      url: cloudinary.url(process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID),
-      why: { mode: "error", error: String(err) },
-    };
+    // ❌ OLD: returned default hero here
+    // ✅ NEW: tell caller there is NO pick; it can decide fallback (default, etc.)
+    return null;
   }
 };

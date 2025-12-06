@@ -221,7 +221,28 @@ function normalizeRemoteImageUrl(raw = '') {
 
 // ────────────────────────────────────────────────────────────────────────────────
 // CREATE (single) — POST /api/admin/articles
-router.post('/', ctrl.createOne);
+// Wrap createOne so that CREATE always ignores incoming image fields and
+// forces auto-pick from Drive / strategy layer.
+router.post('/', async (req, res, next) => {
+  try {
+    if (req.body && typeof req.body === 'object') {
+      const scrubKeys = ['imageUrl', 'imagePublicId', 'ogImage', 'thumbImage'];
+
+      for (const key of scrubKeys) {
+        if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+          // Optional debug:
+          // console.log('[admin.create] dropping incoming field on create:', key, 'value=', req.body[key]);
+          delete req.body[key];
+        }
+      }
+    }
+
+    return ctrl.createOne(req, res, next);
+  } catch (err) {
+    console.error('[admin.articles] create wrapper error', err);
+    return res.status(500).json({ error: 'failed_to_create_article' });
+  }
+});
 
 // BULK IMPORT — POST /api/admin/articles/import
 router.post('/import', ctrl.importMany);
