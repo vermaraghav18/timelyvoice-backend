@@ -1,14 +1,15 @@
 // backend/src/routes/admin.aiNews.routes.js
-// Admin AI News routes
-
+// Admin AI News routes (Phase 11 — LIVE-FIRST generator)
 const express = require("express");
 const router = express.Router();
-
 const slugify = require("slugify");
 const Article = require("../models/Article");
 const { generateNewsBatch } = require("../services/aiNewsGenerator");
 const { finalizeArticleImages } = require("../services/finalizeArticleImages");
 const AiGenerationLog = require("../models/AiGenerationLog");
+
+// 👇 cron status snapshot (for Automation Dashboard)
+const { getCronStatusSnapshot } = require("../cron/autoNewsCron");
 
 // ─────────────────────────────────────────────────────────────
 // Simple health check
@@ -19,15 +20,46 @@ router.get("/ping", (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
+// CRON STATUS — used by AutomationDashboard "Automation status"
+// GET /api/admin/ai/cron-status
+// ─────────────────────────────────────────────────────────────
+router.get("/cron-status", (_req, res) => {
+  try {
+    if (typeof getCronStatusSnapshot !== "function") {
+      return res.status(404).json({
+        ok: false,
+        error: "cron_status_unavailable",
+      });
+    }
+
+    const snap = getCronStatusSnapshot();
+    if (!snap) {
+      return res.status(404).json({
+        ok: false,
+        error: "cron_status_unavailable",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      status: snap,
+    });
+  } catch (err) {
+    console.error("[admin.aiNews] /cron-status error:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "cron_status_failed",
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
 // LOG LIST — for admin dashboard
 // GET /api/admin/ai/logs?limit=50
 // ─────────────────────────────────────────────────────────────
 router.get("/logs", async (req, res) => {
   try {
-    const limit = Math.min(
-      parseInt(req.query.limit || "50", 10),
-      200
-    );
+    const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
 
     const logs = await AiGenerationLog.find({})
       .sort({ runAt: -1 })
@@ -54,11 +86,13 @@ router.get("/logs", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 router.post("/preview-batch", async (req, res) => {
   try {
-    const { count, categories } = req.body || {};
+    const { count, categories, mode, trendingBias } = req.body || {};
 
     const { normalized } = await generateNewsBatch({
       count,
       categories,
+      mode: mode === "breaking" ? "breaking" : "standard",
+      trendingBias: typeof trendingBias === "boolean" ? trendingBias : true,
     });
 
     return res.json({
@@ -79,18 +113,11 @@ router.post("/preview-batch", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // SAVE TO DB — CREATES REAL Article DOCUMENTS + AUTO IMAGES
 // POST /api/admin/ai/generate-batch
-//
-// Body:
-// {
-//   "count": 5,                          // optional, default 10 (max 20)
-//   "categories": ["World","Business"],  // optional
-//   "status": "draft" | "published"      // optional, default "draft"
-// }
 // ─────────────────────────────────────────────────────────────
 router.post("/generate-batch", async (req, res) => {
   const startedAt = Date.now();
 
-  const { count, categories, status } = req.body || {};
+  const { count, categories, status, mode, trendingBias } = req.body || {};
   const desiredStatus = (status || "draft").toLowerCase();
 
   let normalized = [];
@@ -100,7 +127,10 @@ router.post("/generate-batch", async (req, res) => {
     const result = await generateNewsBatch({
       count,
       categories,
+      mode: mode === "breaking" ? "breaking" : "standard",
+      trendingBias: typeof trendingBias === "boolean" ? trendingBias : true,
     });
+
     normalized = result.normalized || [];
 
     if (!normalized.length) {
@@ -130,7 +160,10 @@ router.post("/generate-batch", async (req, res) => {
       // Base slug from AI output, or from title
       let baseSlug =
         g.slug ||
-        slugify(g.title || "article", { lower: true, strict: true }) ||
+        slugify(g.title || "article", {
+          lower: true,
+          strict: true,
+        }) ||
         `article-${Date.now()}`;
 
       const payload = {
@@ -156,6 +189,7 @@ router.post("/generate-batch", async (req, res) => {
       };
 
       // 🔁 FINALIZE IMAGES (Drive → Cloudinary + OG + thumb)
+      // eslint-disable-next-line no-await-in-loop
       const fin = await finalizeArticleImages({
         title: payload.title,
         summary: payload.summary,
@@ -169,11 +203,13 @@ router.post("/generate-batch", async (req, res) => {
         thumbImage: null,
       });
 
-      payload.imagePublicId = fin.imagePublicId;
-      payload.imageUrl = fin.imageUrl;
-      payload.ogImage = fin.ogImage;
-      payload.thumbImage = fin.thumbImage;
-      payload.imageAlt = payload.imageAlt || fin.imageAlt;
+      if (fin) {
+        payload.imagePublicId = fin.imagePublicId || payload.imagePublicId;
+        payload.imageUrl = fin.imageUrl || payload.imageUrl;
+        payload.ogImage = fin.ogImage || payload.ogImage;
+        payload.thumbImage = fin.thumbImage || null;
+        payload.imageAlt = payload.imageAlt || fin.imageAlt;
+      }
 
       // Ensure slug is unique
       let finalSlug = payload.slug;
@@ -190,6 +226,11 @@ router.post("/generate-batch", async (req, res) => {
       if (payload.status === "published") {
         payload.publishedAt = new Date();
       }
+
+      // NEW: make sure automation docs get fresh timestamps
+      const now = new Date();
+      payload.createdAt = now;
+      payload.updatedAt = now;
 
       // eslint-disable-next-line no-await-in-loop
       const doc = await Article.create(payload);
@@ -244,7 +285,10 @@ router.post("/generate-batch", async (req, res) => {
         triggeredBy: "api-admin-ai-generate-batch",
       });
     } catch (logErr) {
-      console.error("[admin.aiNews] log-create failed:", logErr?.message || logErr);
+      console.error(
+        "[admin.aiNews] log-create failed:",
+        logErr?.message || logErr
+      );
     }
 
     return res.status(500).json({

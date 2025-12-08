@@ -12,6 +12,9 @@ const Category = require('../models/Category');
 const { decideAndAttach } = require('../services/imageStrategy');
 const { buildImageVariants } = require('../services/imageVariants');
 
+// 👇 NEW: AI hero image generator (Gemini via OpenRouter)
+const { generateAiHeroForArticle } = require('../services/aiImage.service');
+
 // Controller for create/import/preview
 const ctrl = require('../controllers/admin.articles.controller');
 
@@ -82,114 +85,6 @@ function isPlaceholderUrl(u = '') {
   }
 }
 
-function finalizeImageFields(article) {
-  if (!article) return;
-
-  // Clean out any junk markers like "leave it empty"
-  article.imageUrl = sanitizeImageUrl(article.imageUrl);
-  article.ogImage = sanitizeImageUrl(article.ogImage);
-  article.thumbImage = sanitizeImageUrl(article.thumbImage);
-
-  const publicId = article.imagePublicId || DEFAULT_PID;
-  if (!publicId || !CLOUD_NAME) return;
-
-  // hero
-  if (!article.imageUrl) {
-    article.imageUrl = buildCloudinaryUrl(publicId);
-  }
-
-  // og
-  if (!article.ogImage) {
-    article.ogImage = buildCloudinaryUrl(
-      publicId,
-      'c_fill,g_auto,h_630,w_1200,f_jpg'
-    );
-  }
-
-  // thumb
-  if (!article.thumbImage) {
-    article.thumbImage = buildCloudinaryUrl(
-      publicId,
-      'c_fill,g_auto,h_300,w_400,f_webp'
-    );
-  }
-
-  if (!article.imageAlt) {
-    article.imageAlt = article.title || 'News image';
-  }
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// CATEGORY NORMALIZATION (so admin never sees ObjectId in UI)
-
-const slugify = require('slugify');
-
-function looksLikeObjectId(val) {
-  return typeof val === 'string' && /^[a-f0-9]{24}$/i.test(val);
-}
-
-function normalizeArticlesWithCategories(
-  items,
-  categoriesMapById = new Map(),
-  categoriesMapByName = new Map()
-) {
-  return items.map((it) => {
-    const a = { ...it };
-
-    // Already populated object?
-    if (
-      a.category &&
-      typeof a.category === 'object' &&
-      (a.category._id || a.category.id || a.category.name)
-    ) {
-      const id = String(a.category._id || a.category.id || '');
-      const name = a.category.name || null;
-      const slug =
-        a.category.slug || (name ? slugify(name, { lower: true, strict: true }) : null);
-      a.category = name || id ? { id: id || null, name, slug } : null;
-      return a;
-    }
-
-    // ObjectId string
-    if (looksLikeObjectId(a.category)) {
-      const c = categoriesMapById.get(String(a.category));
-      if (c) {
-        a.category = {
-          id: String(c._id),
-          name: c.name || null,
-          slug: c.slug || (c.name ? slugify(c.name, { lower: true, strict: true }) : null),
-        };
-      } else {
-        a.category = { id: String(a.category), name: null, slug: null };
-      }
-      return a;
-    }
-
-    // Plain string name
-    if (typeof a.category === 'string' && a.category.trim()) {
-      const name = a.category.trim();
-      const c = categoriesMapByName.get(name) || null;
-      a.category = {
-        id: c ? String(c._id) : null,
-        name,
-        slug: c?.slug || slugify(name, { lower: true, strict: true }),
-      };
-      return a;
-    }
-
-    a.category = null;
-    return a;
-  });
-}
-
-// Render-safe category text for admin UI cells
-const toCatText = (v) =>
-  Array.isArray(v)
-    ? v.map(toCatText).filter(Boolean)
-    : v && typeof v === 'object'
-    ? v.name || v.slug || ''
-    : v || '';
-
 // ────────────────────────────────────────────────────────────────────────────────
 // CLOUDINARY PUBLIC ID DERIVER (for pasted image URLs)
 
@@ -249,6 +144,124 @@ function normalizeRemoteImageUrl(raw = '') {
   return s;
 }
 
+// Helper: sanitize + normalize (Cloudinary/Drive/any remote URL safe)
+function sanitizeAndNormalizeUrl(u) {
+  const cleaned = sanitizeImageUrl(u);
+  if (!cleaned) return '';
+  return normalizeRemoteImageUrl(cleaned) || cleaned;
+}
+
+function finalizeImageFields(article) {
+  if (!article) return;
+
+  // Clean out any junk markers like "leave it empty"
+  article.imageUrl = sanitizeAndNormalizeUrl(article.imageUrl);
+  article.ogImage = sanitizeAndNormalizeUrl(article.ogImage);
+  article.thumbImage = sanitizeAndNormalizeUrl(article.thumbImage);
+
+  const publicId = article.imagePublicId || DEFAULT_PID;
+  if (!publicId || !CLOUD_NAME) return;
+
+  // hero: only if no manual URL
+  if (!article.imageUrl) {
+    article.imageUrl = buildCloudinaryUrl(publicId);
+  }
+
+  // og: only if no manual URL
+  if (!article.ogImage) {
+    article.ogImage = buildCloudinaryUrl(
+      publicId,
+      'c_fill,g_auto,h_630,w_1200,f_jpg'
+    );
+  }
+
+  // thumb: only if no manual URL
+  if (!article.thumbImage) {
+    article.thumbImage = buildCloudinaryUrl(
+      publicId,
+      'c_fill,g_auto,h_300,w_400,f_webp'
+    );
+  }
+
+  if (!article.imageAlt) {
+    article.imageAlt = article.title || 'News image';
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// CATEGORY NORMALIZATION (so admin never sees ObjectId in UI)
+
+const slugify = require('slugify');
+
+function looksLikeObjectId(val) {
+  return typeof val === 'string' && /^[a-f0-9]{24}$/i.test(val);
+}
+
+function normalizeArticlesWithCategories(
+  items,
+  categoriesMapById = new Map(),
+  categoriesMapByName = new Map()
+) {
+  return items.map((it) => {
+    const a = { ...it };
+
+    // Already populated object?
+    if (
+      a.category &&
+      typeof a.category === 'object' &&
+      (a.category._id || a.category.id || a.category.name)
+    ) {
+      const id = String(a.category._id || a.category.id || '');
+      const name = a.category.name || null;
+      const slug =
+        a.category.slug ||
+        (name ? slugify(name, { lower: true, strict: true }) : null);
+      a.category = name || id ? { id: id || null, name, slug } : null;
+      return a;
+    }
+
+    // ObjectId string
+    if (looksLikeObjectId(a.category)) {
+      const c = categoriesMapById.get(String(a.category));
+      if (c) {
+        a.category = {
+          id: String(c._id),
+          name: c.name || null,
+          slug:
+            c.slug ||
+            (c.name ? slugify(c.name, { lower: true, strict: true }) : null),
+        };
+      } else {
+        a.category = { id: String(a.category), name: null, slug: null };
+      }
+      return a;
+    }
+
+    // Plain string name
+    if (typeof a.category === 'string' && a.category.trim()) {
+      const name = a.category.trim();
+      const c = categoriesMapByName.get(name) || null;
+      a.category = {
+        id: c ? String(c._id) : null,
+        name,
+        slug: c?.slug || slugify(name, { lower: true, strict: true }),
+      };
+      return a;
+    }
+
+    a.category = null;
+    return a;
+  });
+}
+
+// Render-safe category text for admin UI cells
+const toCatText = (v) =>
+  Array.isArray(v)
+    ? v.map(toCatText).filter(Boolean)
+    : v && typeof v === 'object'
+    ? v.name || v.slug || ''
+    : v || '';
+
 // ────────────────────────────────────────────────────────────────────────────────
 // CREATE (single) — POST /api/admin/articles
 // Wrap createOne so that CREATE always ignores incoming image fields and
@@ -302,7 +315,9 @@ router.post('/import-image-from-url', async (req, res) => {
     }
 
     // If you want uploads-from-URL here, wire it back to lib/cloudinary uploader.
-    return res.status(400).json({ error: 'non_cloudinary_url_not_supported_in_dev_mode' });
+    return res.status(400).json({
+      error: 'non_cloudinary_url_not_supported_in_dev_mode',
+    });
   } catch (err) {
     console.error('[admin.articles] import-image-from-url failed', err?.message || err);
     return res.status(500).json({ error: 'upload_failed' });
@@ -352,8 +367,12 @@ router.get('/drafts', async (req, res) => {
         : [],
     ]);
 
-    const categoriesMapById = new Map((docsById || []).map((d) => [String(d._id), d]));
-    const categoriesMapByName = new Map((docsByName || []).map((d) => [d.name, d]));
+    const categoriesMapById = new Map(
+      (docsById || []).map((d) => [String(d._id), d])
+    );
+    const categoriesMapByName = new Map(
+      (docsByName || []).map((d) => [d.name, d])
+    );
 
     const normalizedDrafts = normalizeArticlesWithCategories(
       rawDrafts,
@@ -362,7 +381,7 @@ router.get('/drafts', async (req, res) => {
     );
     const drafts = normalizedDrafts.map((a) => {
       // ensure draft imageUrl never exposes "leave it empty"
-      const clean = sanitizeImageUrl(a.imageUrl);
+      const clean = sanitizeAndNormalizeUrl(a.imageUrl);
       const bestPid = a.imagePublicId || DEFAULT_PID;
       const imageUrl =
         clean || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
@@ -371,7 +390,9 @@ router.get('/drafts', async (req, res) => {
         ...a,
         imageUrl,
         category: toCatText(a.category),
-        categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : [],
+        categories: Array.isArray(a.categories)
+          ? a.categories.map(toCatText)
+          : [],
       };
     });
 
@@ -413,14 +434,19 @@ router.get('/', async (req, res) => {
         .select('_id name')
         .lean();
       if (catDoc) {
-        and.push({ $or: [{ category: catDoc.name }, { category: catDoc._id }] });
+        and.push({
+          $or: [{ category: catDoc.name }, { category: catDoc._id }],
+        });
       } else {
         and.push({ $or: [{ 'category.slug': raw }, { category: raw }] });
       }
     }
 
     if (q) {
-      const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const rx = new RegExp(
+        String(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+        'i'
+      );
       and.push({ $or: [{ title: rx }, { summary: rx }, { body: rx }] });
     }
 
@@ -433,9 +459,11 @@ router.get('/', async (req, res) => {
     const [rawItems, total] = await Promise.all([
       Article.find(query)
         .select(
-          '_id title slug status category summary publishedAt updatedAt imageUrl imagePublicId ogImage thumbImage tags'
+          '_id title slug status category summary publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage tags'
         )
-        .sort({ publishedAt: -1, updatedAt: -1, createdAt: -1 })
+        // 1) drafts first (status: "draft" < "published")
+        // 2) within each status group → newest updated/created first
+        .sort({ status: 1, updatedAt: -1, createdAt: -1, publishedAt: -1 })
         .skip(skip)
         .limit(perPage)
         .populate({
@@ -471,8 +499,12 @@ router.get('/', async (req, res) => {
         : [],
     ]);
 
-    const categoriesMapById = new Map((docsById || []).map((d) => [String(d._id), d]));
-    const categoriesMapByName = new Map((docsByName || []).map((d) => [d.name, d]));
+    const categoriesMapById = new Map(
+      (docsById || []).map((d) => [String(d._id), d])
+    );
+    const categoriesMapByName = new Map(
+      (docsByName || []).map((d) => [d.name, d])
+    );
 
     const normalized = normalizeArticlesWithCategories(
       rawItems,
@@ -483,7 +515,7 @@ router.get('/', async (req, res) => {
     const items = normalized.map((a) => {
       // Fix the admin "Image URL (quick)" display:
       // if imageUrl is "leave it empty", replace with real default hero URL
-      const cleaned = sanitizeImageUrl(a.imageUrl);
+      const cleaned = sanitizeAndNormalizeUrl(a.imageUrl);
       const bestPid = a.imagePublicId || DEFAULT_PID;
 
       const imageUrl =
@@ -494,7 +526,9 @@ router.get('/', async (req, res) => {
         ...a,
         imageUrl,
         category: toCatText(a.category),
-        categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : [],
+        categories: Array.isArray(a.categories)
+          ? a.categories.map(toCatText)
+          : [],
       };
     });
 
@@ -509,7 +543,11 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     const raw = await Article.findById(req.params.id)
-      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .populate({
+        path: 'category',
+        select: 'name slug',
+        options: { lean: true },
+      })
       .lean();
     if (!raw) return res.status(404).json({ error: 'not_found' });
 
@@ -517,14 +555,16 @@ router.get('/:id', async (req, res) => {
     const a = items[0];
 
     // Also sanitize here so edit-form never sees "leave it empty"
-    const cleaned = sanitizeImageUrl(a.imageUrl);
+    const cleaned = sanitizeAndNormalizeUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
       cleaned ||
       (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
 
     a.category = toCatText(a.category);
-    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    a.categories = Array.isArray(a.categories)
+      ? a.categories.map(toCatText)
+      : [];
     res.json(a);
   } catch (err) {
     console.error('[admin.articles] get error', err);
@@ -560,9 +600,11 @@ router.patch('/:id', async (req, res) => {
     for (const k of allowed) {
       if (req.body[k] !== undefined) patch[k] = req.body[k];
     }
-
     if (typeof patch.tags === 'string') {
-      patch.tags = patch.tags.split(',').map((s) => s.trim()).filter(Boolean);
+      patch.tags = patch.tags
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
     }
     if (patch.status === 'published') {
       patch.publishedAt = new Date();
@@ -574,7 +616,18 @@ router.patch('/:id', async (req, res) => {
       if (!cleaned || isPlaceholderUrl(cleaned)) {
         delete patch.imageUrl;
       } else {
-        patch.imageUrl = cleaned;
+        // Allow Google Drive / remote URLs as-is (with Drive normalized)
+        patch.imageUrl = normalizeRemoteImageUrl(cleaned) || cleaned;
+      }
+    }
+
+    // NEW: allow manual OG image URL (Cloudinary, Drive, etc.)
+    if (patch.ogImage !== undefined) {
+      const cleanedOg = sanitizeImageUrl(patch.ogImage);
+      if (!cleanedOg || isPlaceholderUrl(cleanedOg)) {
+        delete patch.ogImage;
+      } else {
+        patch.ogImage = normalizeRemoteImageUrl(cleanedOg) || cleanedOg;
       }
     }
 
@@ -617,10 +670,14 @@ router.patch('/:id', async (req, res) => {
       }
     }
 
-    await decideAndAttach(merged, { imageStrategy: 'cloudinary', fallbacks: ['stock'] });
+    await decideAndAttach(merged, {
+      imageStrategy: 'cloudinary',
+      fallbacks: ['stock'],
+    });
     finalizeImageFields(merged);
 
-    if (!merged.thumbImage && merged.imageUrl) merged.thumbImage = merged.imageUrl;
+    if (!merged.thumbImage && merged.imageUrl)
+      merged.thumbImage = merged.imageUrl;
     if (!merged.ogImage && merged.imageUrl) merged.ogImage = merged.imageUrl;
 
     const toSaveKeys = [
@@ -652,7 +709,11 @@ router.patch('/:id', async (req, res) => {
       { $set: toSave },
       { new: true }
     )
-      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .populate({
+        path: 'category',
+        select: 'name slug',
+        options: { lean: true },
+      })
       .lean();
 
     if (!updated) return res.status(404).json({ error: 'not_found' });
@@ -660,14 +721,16 @@ router.patch('/:id', async (req, res) => {
     const items = normalizeArticlesWithCategories([updated]);
     const a = items[0];
 
-    const cleanedUrl = sanitizeImageUrl(a.imageUrl);
+    const cleanedUrl = sanitizeAndNormalizeUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
       cleanedUrl ||
       (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
 
     a.category = toCatText(a.category);
-    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    a.categories = Array.isArray(a.categories)
+      ? a.categories.map(toCatText)
+      : [];
     res.json(a);
   } catch (err) {
     console.error('[admin.articles] patch error', err);
@@ -734,6 +797,38 @@ router.post('/:id/use-default-image', async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
+// AI IMAGE — POST /api/admin/articles/:id/ai-image
+// Generate + attach an AI hero image (Gemini via OpenRouter)
+router.post('/:id/ai-image', async (req, res) => {
+  try {
+    if (process.env.AI_IMAGE_ENABLED === 'false') {
+      return res.status(403).json({
+        ok: false,
+        error: 'ai_image_disabled',
+      });
+    }
+
+    const { id } = req.params;
+    const result = await generateAiHeroForArticle(id);
+
+    return res.json({
+      ok: true,
+      articleId: result.articleId,
+      imageUrl: result.imageUrl,
+      ogImage: result.ogImage,
+      thumbImage: result.thumbImage,
+      imagePublicId: result.imagePublicId,
+    });
+  } catch (err) {
+    console.error('[admin.articles] /:id/ai-image error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || 'ai_image_failed',
+    });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────────
 // PUBLISH — POST /api/admin/articles/:id/publish
 router.post('/:id/publish', async (req, res) => {
   try {
@@ -742,20 +837,26 @@ router.post('/:id/publish', async (req, res) => {
       { $set: { status: 'published', publishedAt: new Date() } },
       { new: true }
     )
-      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .populate({
+        path: 'category',
+        select: 'name slug',
+        options: { lean: true },
+      })
       .lean();
 
     if (!updated) return res.status(404).json({ error: 'not_found' });
 
     const items = normalizeArticlesWithCategories([updated]);
     const a = items[0];
-    const cleanedUrl = sanitizeImageUrl(a.imageUrl);
+    const cleanedUrl = sanitizeAndNormalizeUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
       cleanedUrl ||
       (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
     a.category = toCatText(a.category);
-    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    a.categories = Array.isArray(a.categories)
+      ? a.categories.map(toCatText)
+      : [];
     res.json(a);
 
     try {

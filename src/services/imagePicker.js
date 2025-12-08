@@ -132,6 +132,14 @@ function negativePenalty(name, strong) {
     "trump",
     "biden",
     "musk",
+    "putin",
+    "xi",
+    "jinping",
+    "zelensky",
+    "netanyahu",
+    "sunak",
+    "scholz",
+    "macron",
   ];
 
   for (const f of famous) {
@@ -281,9 +289,9 @@ async function downloadAndUploadToCloudinary(file) {
 }
 
 // -----------------------------------------------------------------------------
-// PERSON ROTATION
+// PERSON ROTATION (CONTEXT-AWARE)
 // -----------------------------------------------------------------------------
-async function pickRotatedPersonFile(personKey, candidates) {
+async function pickRotatedPersonFile(personKey, candidates, tokens, phrases, strongNames) {
   if (!personKey || !Array.isArray(candidates) || !candidates.length) {
     return null;
   }
@@ -306,15 +314,46 @@ async function pickRotatedPersonFile(personKey, candidates) {
     usedCount = 0;
   }
 
-  const sorted = [...candidates].sort((a, b) =>
-    a.name.toLowerCase().localeCompare(b.name.toLowerCase())
+  const nonPersonTokens = tokens.filter((t) => !strongNames.includes(t));
+
+  // Score all person candidates
+  const scored = candidates.map((f) => {
+    const pack = scoreFile(f, tokens, phrases, strongNames);
+    const hasContextToken = pack.matchedTokens.some((mt) =>
+      nonPersonTokens.includes(mt)
+    );
+    return {
+      file: f,
+      score: pack.score,
+      matchedTokens: pack.matchedTokens,
+      hasContextToken,
+    };
+  });
+
+  // Prefer candidates that match BOTH the person and some context token
+  let pool = scored.filter((c) => c.hasContextToken && c.score >= 10);
+
+  // If no contextful candidates, fall back to any decent person image
+  if (!pool.length) {
+    pool = scored.filter((c) => c.score >= 10);
+  }
+
+  if (!pool.length) {
+    // Nothing good enough for rotation
+    return null;
+  }
+
+  const sorted = [...pool].sort((a, b) =>
+    a.file.name.toLowerCase().localeCompare(b.file.name.toLowerCase())
   );
 
   const index = usedCount % sorted.length;
   const chosen = sorted[index];
 
   return {
-    file: chosen,
+    file: chosen.file,
+    score: chosen.score,
+    matchedTokens: chosen.matchedTokens,
     meta: {
       mode: "drive-picked-rotated",
       personKey,
@@ -364,7 +403,7 @@ exports.chooseHeroImage = async function (meta = {}) {
     let best = null;
     let rotationMeta = null;
 
-    // Person rotation
+    // 1) CONTEXT-AWARE PERSON ROTATION (if we have a strong person)
     const personKey = strongNames.length ? strongNames[0] : null;
     if (personKey) {
       const lower = personKey.toLowerCase();
@@ -373,15 +412,25 @@ exports.chooseHeroImage = async function (meta = {}) {
       );
 
       if (personCandidates.length > 0) {
-        const rotated = await pickRotatedPersonFile(personKey, personCandidates);
+        const rotated = await pickRotatedPersonFile(
+          personKey,
+          personCandidates,
+          tokens,
+          phrases,
+          strongNames
+        );
         if (rotated && rotated.file) {
-          best = { file: rotated.file, score: null, matchedTokens: [] };
+          best = {
+            file: rotated.file,
+            score: rotated.score,
+            matchedTokens: rotated.matchedTokens,
+          };
           rotationMeta = rotated.meta;
         }
       }
     }
 
-    // Standard scoring (if rotation didn't already choose)
+    // 2) Standard scoring (if rotation didn't already choose)
     if (!best) {
       for (const f of candidates) {
         const pack = scoreFile(f, tokens, phrases, strongNames);
@@ -401,9 +450,35 @@ exports.chooseHeroImage = async function (meta = {}) {
       return null;
     }
 
-    // ❌ OLD: there was a MINIMUM SCORE THRESHOLD here that forced default image
-    // ✅ NEW: we ALWAYS trust the best candidate we found
+    // ---------------------------------------------------------------------------
+    // 3) QUALITY GATE for non-person images:
+    //    - If we are in the rotation path (personKey match), we already enforced
+    //      a minimum score inside pickRotatedPersonFile.
+    //    - Otherwise require MIN_SCORE + MIN_TOKENS; weak generic matches are rejected
+    // ---------------------------------------------------------------------------
+    const isRotation = !!rotationMeta;
 
+    if (!isRotation) {
+      const matchedCount = Array.isArray(best.matchedTokens)
+        ? best.matchedTokens.length
+        : 0;
+
+      const MIN_SCORE = 20;
+      const MIN_TOKENS = 2;
+
+      if ((best.score || 0) < MIN_SCORE && matchedCount < MIN_TOKENS) {
+        console.log(
+          "[imagePicker] best match too weak score=%s tokens=%s name=%s — letting default hero handle it",
+          best.score,
+          matchedCount,
+          best.file.name
+        );
+        // returning null tells finalizeArticleImages to use DEFAULT hero
+        return null;
+      }
+    }
+
+    // 4) Upload chosen Drive file to Cloudinary
     const uploaded = await downloadAndUploadToCloudinary(best.file);
 
     return {
@@ -420,8 +495,7 @@ exports.chooseHeroImage = async function (meta = {}) {
     };
   } catch (err) {
     console.error("[imagePicker ERROR]", err);
-    // ❌ OLD: returned default hero here
-    // ✅ NEW: tell caller there is NO pick; it can decide fallback (default, etc.)
+    // On error tell caller there is NO pick; it can decide fallback (default, etc.)
     return null;
   }
 };

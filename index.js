@@ -2061,8 +2061,32 @@ const HOST = process.env.HOST || '0.0.0.0';
 if (require.main === module) {
   app.listen(PORT, HOST, () => {
     console.log(`✅ API up on http://${HOST}:${PORT}`);
+
+    // ─────────────────────────────────────────────────────────
+    // Phase 5 — Auto Newsroom Cron
+    // ─────────────────────────────────────────────────────────
+    if (String(process.env.AI_NEWS_CRON_ENABLED || "false") === "true") {
+      try {
+        const { startAutoNewsCron } = require("./src/cron/autoNewsCron");
+        const sec = parseInt(
+          process.env.AI_NEWS_CRON_INTERVAL_SECONDS || "300",
+          10
+        );
+        startAutoNewsCron(sec);
+      } catch (e) {
+        console.error(
+          "[autoNewsCron] failed to start:",
+          e?.message || e
+        );
+      }
+    } else {
+      console.log(
+        "[autoNewsCron] not started (AI_NEWS_CRON_ENABLED != 'true')"
+      );
+    }
   });
 }
 
 // Export app for testing
 module.exports = app;
+

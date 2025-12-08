@@ -132,7 +132,7 @@ function normalizeImageField(raw) {
 }
 
 // Decide which image to use for RSS:
-// 1) ogImage (if valid URL)
+// 1) ogImage (if valid URL/publicId)
 // 2) imageUrl
 // 3) cover.url / cover.secure_url
 // 4) fallback OG hero (Cloudinary default)
@@ -159,9 +159,9 @@ async function handleTopNewsRss(req, res, next) {
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
     const now = new Date();
 
-    // Visibility rules similar to public APIs:
+    // Visibility rules:
     // - status = published
-    // - publishAt or publishedAt <= now OR both missing
+    // - publishedAt/publishAt <= now OR both missing (grace for old data)
     const rows = await Article.find({
       status: "published",
       $or: [
@@ -176,7 +176,7 @@ async function handleTopNewsRss(req, res, next) {
       ],
     })
       .select(
-        "title slug summary publishedAt publishAt updatedAt createdAt imageUrl ogImage cover"
+        "title slug summary body category publishedAt publishAt updatedAt createdAt imageUrl ogImage cover"
       )
       .sort({
         publishedAt: -1,
@@ -194,8 +194,8 @@ async function handleTopNewsRss(req, res, next) {
 <channel>
   <title>The Timely Voice — Top News</title>
   <link>${esc(SITE_URL + "/top-news")}</link>
-  <description>Newest headlines from The Timely Voice</description>
-  <language>en</language>
+  <description>Latest India, World, Business and more from The Timely Voice.</description>
+  <language>en-IN</language>
   <lastBuildDate>${esc(nowStr)}</lastBuildDate>
 `;
 
@@ -204,16 +204,20 @@ async function handleTopNewsRss(req, res, next) {
       const pub =
         a.publishedAt || a.publishAt || a.updatedAt || a.createdAt || new Date();
       const pubDate = new Date(pub).toUTCString();
-      const desc = a.summary || "";
+      const desc =
+        a.summary ||
+        (a.body ? String(a.body).slice(0, 400) : "");
 
       const img = pickBestImageForRss(a); // ← always a real URL or fallback OG
       const hasImage = !!img;
+      const category = a.category || "General";
 
       xml += `  <item>
     <title>${esc(a.title || "")}</title>
     <link>${esc(link)}</link>
     <guid isPermaLink="true">${esc(link)}</guid>
     <pubDate>${esc(pubDate)}</pubDate>
+    <category>${esc(category)}</category>
     <description><![CDATA[${desc}]]></description>
 `;
 
