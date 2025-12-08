@@ -77,6 +77,11 @@ const rssTopNewsRouter = require('./src/routes/rss.topnews');
 // 7) Cron jobs
 require('./cron');
 
+// 7) Cron jobs
+require('./cron'); // old RSS / autmotion cron
+const { startAutoNewsCron } = require("./src/cron/autoNewsCron"); // NEW: AI auto-news robot
+
+
 // 9) App init
 const app = express();
 
@@ -2061,8 +2066,23 @@ const HOST = process.env.HOST || '0.0.0.0';
 if (require.main === module) {
   app.listen(PORT, HOST, () => {
     console.log(`✅ API up on http://${HOST}:${PORT}`);
+
+    // 🔹 Start AI auto-news robot (autoNewsCron)
+    try {
+      console.log("[debug] AI_NEWS_CRON_ENABLED =", process.env.AI_NEWS_CRON_ENABLED);
+      if (String(process.env.AI_NEWS_CRON_ENABLED || "false") === "true") {
+        const sec = parseInt(process.env.AI_NEWS_CRON_INTERVAL_SECONDS || "300", 10) || 300;
+        startAutoNewsCron(sec);
+        console.log("[autoNewsCron] started, every %ds", sec);
+      } else {
+        console.log("[autoNewsCron] NOT started (AI_NEWS_CRON_ENABLED is not 'true')");
+      }
+    } catch (e) {
+      console.error("[autoNewsCron] failed to start:", e?.message || e);
+    }
   });
 }
 
 // Export app for testing
 module.exports = app;
+

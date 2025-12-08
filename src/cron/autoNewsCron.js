@@ -13,6 +13,7 @@ const { generateNewsBatch } = require("../services/aiNewsGenerator");
 const { finalizeArticleImages } = require("../services/finalizeArticleImages");
 const { shouldSkipAsDuplicate } = require("../services/aiArticleGuard");
 const slugify = require("slugify");
+const { fetchLiveSeeds } = require("../services/liveNewsIngestor");
 
 // NEW: topic-fingerprint deduper (backed by Mongo TTL)
 const { computeTopicKey } = require("../services/rssDeduper");
@@ -207,12 +208,31 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
           ]
         : undefined;
 
+       // 1) Pull fresh live seeds from RSS
+    //    This uses your FEEDS array and drops anything older than 24h or wrong year
+    const seedLimit = Math.max(allowed * 3, 10); // pool a few extra, it’s cheap
+    let seeds = [];
+    try {
+      seeds = await fetchLiveSeeds(seedLimit);
+    } catch (e) {
+      console.error("[autoNewsCron] fetchLiveSeeds error:", e);
+      seeds = [];
+    }
+
+    if (!seeds || !seeds.length) {
+      console.warn(
+        "[autoNewsCron] No fresh RSS seeds found; falling back to generic aiNewsGenerator prompt."
+      );
+    }
+
     const result = await generateNewsBatch({
       count: allowed,
       categories: pickedCategory ? [pickedCategory] : categories,
       trendingBias: true,
       mode: "standard",
+      seeds, // <-- NEW: pass RSS seeds into generator
     });
+
 
     const normalized = result?.normalized || [];
 

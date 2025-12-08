@@ -146,81 +146,132 @@ function normalizeOne(raw, index) {
  *  - raw:       whatever JSON the model returned
  *  - normalized: array of payloads ready for Article.create()
  */
-async function generateNewsBatch({ count, categories } = {}) {
+async function generateNewsBatch({
+  count,
+  categories,
+  seeds = [],
+  trendingBias,
+  mode,
+} = {}) {
   const n = Math.max(
     1,
     Math.min(parseInt(count || DEFAULT_BATCH_SIZE, 10), 20)
   );
 
   const cats =
-    Array.isArray(categories) && categories.length ? categories : ALLOWED_CATEGORIES;
+    Array.isArray(categories) && categories.length
+      ? categories
+      : ALLOWED_CATEGORIES;
+
+  const now = new Date();
+
+  // Build seed block if provided
+  let seedBlock = "";
+  let seedNote = "";
+  if (Array.isArray(seeds) && seeds.length) {
+    const limitedSeeds = seeds.slice(0, n); // we only need as many as we’re going to generate
+    seedBlock = limitedSeeds
+      .map((s, idx) => {
+        const pub =
+          s.publishedAt instanceof Date
+            ? s.publishedAt.toISOString()
+            : s.publishedAt || "";
+        return [
+          `[${idx + 1}]`,
+          `SOURCE: ${s.sourceName || "RSS"}`,
+          `TITLE: ${s.title || ""}`,
+          `SUMMARY: ${s.summary || s.description || ""}`,
+          `LINK: ${s.link || ""}`,
+          `PUBLISHED_AT: ${pub}`,
+        ].join("\n");
+      })
+      .join("\n\n");
+
+    seedNote = `
+You are given a list of LIVE RSS stories (title + short summary + link + publishedAt).
+You MUST base each article ONLY on these seeds. Do NOT invent topics that are not in the seed list.
+Use the seed’s timestamp as a guide. Today is ${now.toISOString().slice(0, 10)}. 
+Do NOT write about events from 2023 or any year far in the past unless explicitly contained in the seed text.
+`.trim();
+  } else {
+    seedNote = `
+You do NOT have direct access to live data. 
+When no RSS seeds are provided, stay as close as possible to the present date (${now.toISOString().slice(
+      0,
+      10
+    )}) and avoid referring to old years like 2023 unless clearly necessary.
+`.trim();
+  }
 
   const sysMessage = `
 You are an experienced news editor and writer for "The Timely Voice".
-Generate ORIGINAL, factual news articles based on real-world, recent events.
-Each article must be neutral, concise, and SEO-friendly.
-Always respond ONLY with strict JSON, no extra text.`;
+Generate ORIGINAL, factual-style news articles.
 
-  const userMessage = `
-Generate ${n} different news articles as a single JSON object.
+${seedNote}
 
-REQUIREMENTS:
-- Topics spread across categories: ${cats.join(
-    ", "
-  )} (but you may reuse if needed).
-- Each article body ~600–900 words, plain text, with paragraph breaks.
-- Strictly avoid copying sentences; write in your own words.
-- Indian audience primary, but include World + Business + Tech as needed.
-
-OUTPUT FORMAT (single JSON object):
+Return STRICTLY a valid JSON array of ${n} objects.
+Each object MUST have these fields:
 
 {
-  "articles": [
-    {
-      "title": "Headline 70–80 characters",
-      "slug": "kebab-case-url-slug",
-      "summary": "60–80 word summary of the article.",
-      "author": "Desk",
-      "category": "World | India | Business | Tech | Sports | Politics | Economy | Science",
-      "publishAt": "ISO 8601 datetime string (e.g. 2025-12-05T09:30:00+05:30)",
-      "tags": ["short", "topic", "keywords"],
-      "seo": {
-        "imageAlt": "Accessible description of the main photo",
-        "metaTitle": "<=80 character SEO title",
-        "metaDescription": "<=200 character SEO description",
-        "ogImageUrl": ""
-      },
-      "body": "600-900 word plain-text body with paragraphs."
-    }
-  ]
-}`;
+  "title": "string",
+  "slug": "kebab-case-url-slug",
+  "summary": "60-90 word summary",
+  "author": "Desk",
+  "category": "one of: ${ALLOWED_CATEGORIES.join(", ")}",
+  "status": "Published",
+  "publishAt": "ISO 8601 datetime in Asia/Kolkata timezone",
+  "imageUrl": "",
+  "imagePublicId": "",
+  "seo": {
+    "imageAlt": "short accessible alt text for hero image (even if empty imageUrl)",
+    "metaTitle": "≤80 chars",
+    "metaDescription": "≤200 chars",
+    "ogImageUrl": ""
+  },
+  "geo": {
+    "mode": "Global",
+    "areas": ["country:IN"]
+  },
+  "tags": ["tag1", "tag2"],
+  "body": "600-900 word article body in plain text with paragraph breaks."
+}
 
-  const messages = [
-    { role: "system", content: sysMessage },
-    { role: "user", content: userMessage },
-  ];
+Rules:
+- NEVER include phrases like "As of 2023" or clearly outdated timestamps unless explicitly in the RSS seed.
+- The "publishAt" field should be within the last 24 hours relative to the time now (${now.toISOString()}).
+- Do not copy any text verbatim from external sources; always rewrite.
+`.trim();
 
-  const json = await callOpenRouter({
-    messages,
-    model: AUTOMATION_MODEL, // 🔒 force GPT-4o-mini for automation
-    apiKey:
-      (process.env.OPENROUTER_API_KEY_AUTOMATION ||
-        process.env.OPENROUTER_API_KEY ||
-        "").trim(),
-    max_tokens: n * 2200, // safe upper bound
-  });
+  let userMessage;
+  if (seedBlock) {
+    userMessage = `
+Here are the live RSS seeds you must rewrite. 
+Create exactly one full article for each listed seed, keeping topical alignment with the original story.
 
-  // We expect { articles: [...] } but be defensive:
-  let rawArticles = [];
-  if (Array.isArray(json?.articles)) {
-    rawArticles = json.articles;
-  } else if (Array.isArray(json)) {
-    rawArticles = json;
-  } else if (json && typeof json === "object") {
-    // Maybe the model returned { data: [...] }
-    if (Array.isArray(json.data)) rawArticles = json.data;
+=== LIVE RSS SEEDS ===
+${seedBlock}
+`.trim();
+  } else {
+    // Fallback if no seeds were available: generic prompt but with strict recency rules.
+    userMessage = `
+No RSS seeds were provided.
+Generate ${n} news articles that could realistically appear on a current Indian news site today.
+Follow the JSON format exactly.
+`.trim();
   }
 
+  const json = await callOpenRouter({
+    messages: [
+      { role: "system", content: sysMessage },
+      { role: "user", content: userMessage },
+    ],
+    model: process.env.OPENROUTER_MODEL_AUTONEWS || DEFAULT_MODEL,
+    temperature: typeof trendingBias === "boolean" && trendingBias ? 0.7 : 0.35,
+    max_tokens: MAX_TOKENS_AUTONEWS || 4000,
+  });
+
+  // Existing logic that parses + normalizes
+  const rawArticles = Array.isArray(json) ? json : [];
   const normalized = rawArticles
     .map((raw, idx) => normalizeOne(raw, idx))
     .filter(Boolean);

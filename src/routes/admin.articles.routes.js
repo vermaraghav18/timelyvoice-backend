@@ -12,6 +12,9 @@ const Category = require('../models/Category');
 const { decideAndAttach } = require('../services/imageStrategy');
 const { buildImageVariants } = require('../services/imageVariants');
 
+// 👇 NEW: AI Image service (OpenRouter / Gemini)
+const { generateAiHeroForArticle } = require('../services/aiImage.service');
+
 // Controller for create/import/preview
 const ctrl = require('../controllers/admin.articles.controller');
 
@@ -145,7 +148,8 @@ function normalizeArticlesWithCategories(
       const id = String(a.category._id || a.category.id || '');
       const name = a.category.name || null;
       const slug =
-        a.category.slug || (name ? slugify(name, { lower: true, strict: true }) : null);
+        a.category.slug ||
+        (name ? slugify(name, { lower: true, strict: true }) : null);
       a.category = name || id ? { id: id || null, name, slug } : null;
       return a;
     }
@@ -157,7 +161,9 @@ function normalizeArticlesWithCategories(
         a.category = {
           id: String(c._id),
           name: c.name || null,
-          slug: c.slug || (c.name ? slugify(c.name, { lower: true, strict: true }) : null),
+          slug:
+            c.slug ||
+            (c.name ? slugify(c.name, { lower: true, strict: true }) : null),
         };
       } else {
         a.category = { id: String(a.category), name: null, slug: null };
@@ -302,7 +308,9 @@ router.post('/import-image-from-url', async (req, res) => {
     }
 
     // If you want uploads-from-URL here, wire it back to lib/cloudinary uploader.
-    return res.status(400).json({ error: 'non_cloudinary_url_not_supported_in_dev_mode' });
+    return res
+      .status(400)
+      .json({ error: 'non_cloudinary_url_not_supported_in_dev_mode' });
   } catch (err) {
     console.error('[admin.articles] import-image-from-url failed', err?.message || err);
     return res.status(500).json({ error: 'upload_failed' });
@@ -352,8 +360,12 @@ router.get('/drafts', async (req, res) => {
         : [],
     ]);
 
-    const categoriesMapById = new Map((docsById || []).map((d) => [String(d._id), d]));
-    const categoriesMapByName = new Map((docsByName || []).map((d) => [d.name, d]));
+    const categoriesMapById = new Map(
+      (docsById || []).map((d) => [String(d._id), d])
+    );
+    const categoriesMapByName = new Map(
+      (docsByName || []).map((d) => [d.name, d])
+    );
 
     const normalizedDrafts = normalizeArticlesWithCategories(
       rawDrafts,
@@ -371,7 +383,9 @@ router.get('/drafts', async (req, res) => {
         ...a,
         imageUrl,
         category: toCatText(a.category),
-        categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : [],
+        categories: Array.isArray(a.categories)
+          ? a.categories.map(toCatText)
+          : [],
       };
     });
 
@@ -397,6 +411,7 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
+// ────────────────────────────────────────────────────────────────────────────────
 // LIST — GET /api/admin/articles
 router.get('/', async (req, res) => {
   try {
@@ -430,14 +445,17 @@ router.get('/', async (req, res) => {
     const perPage = Math.max(1, Math.min(200, parseInt(limit, 10) || 20));
     const skip = (pageNum - 1) * perPage;
 
-    const [rawItems, total] = await Promise.all([
+    // NEW: fetch a larger pool, then sort drafts-first in JS, then paginate
+    const MAX_LIST = 1000;
+
+    const [allItems, total] = await Promise.all([
       Article.find(query)
-        .select(
-          '_id title slug status category summary publishedAt updatedAt imageUrl imagePublicId ogImage thumbImage tags'
-        )
-        .sort({ publishedAt: -1, updatedAt: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(perPage)
+           .select(
+      '_id title slug status category summary publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage tags source'
+    )
+
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .limit(MAX_LIST)
         .populate({
           path: 'category',
           select: 'name slug',
@@ -447,10 +465,41 @@ router.get('/', async (req, res) => {
       Article.countDocuments(query),
     ]);
 
+    // Helper to choose a date for ordering
+    function getSortDate(doc) {
+      const candidate =
+        (doc.publishedAt && new Date(doc.publishedAt)) ||
+        (doc.updatedAt && new Date(doc.updatedAt)) ||
+        (doc.createdAt && new Date(doc.createdAt));
+      if (!candidate || Number.isNaN(candidate.getTime())) {
+        return new Date(0);
+      }
+      return candidate;
+    }
+
+    // Drafts first, then Published (or other) with newest first inside each group
+    const sorted = (allItems || []).slice().sort((a, b) => {
+      const aStatus = (a.status || '').toString().toLowerCase();
+      const bStatus = (b.status || '').toString().toLowerCase();
+      const aIsDraft = !aStatus || aStatus === 'draft';
+      const bIsDraft = !bStatus || bStatus === 'draft';
+
+      if (aIsDraft !== bIsDraft) {
+        return aIsDraft ? -1 : 1; // drafts come first
+      }
+
+      const da = getSortDate(a);
+      const db = getSortDate(b);
+      return db - da; // newer first
+    });
+
+    // Apply pagination after status-aware sorting
+    const paged = sorted.slice(skip, skip + perPage);
+
     // normalize categories
     const idSet = new Set();
     const nameSet = new Set();
-    for (const it of rawItems) {
+    for (const it of paged) {
       const c = it.category;
       if (!c) continue;
       if (typeof c === 'object' && (c._id || c.id)) continue;
@@ -471,11 +520,15 @@ router.get('/', async (req, res) => {
         : [],
     ]);
 
-    const categoriesMapById = new Map((docsById || []).map((d) => [String(d._id), d]));
-    const categoriesMapByName = new Map((docsByName || []).map((d) => [d.name, d]));
+    const categoriesMapById = new Map(
+      (docsById || []).map((d) => [String(d._id), d])
+    );
+    const categoriesMapByName = new Map(
+      (docsByName || []).map((d) => [d.name, d])
+    );
 
     const normalized = normalizeArticlesWithCategories(
-      rawItems,
+      paged,
       categoriesMapById,
       categoriesMapByName
     );
@@ -487,14 +540,15 @@ router.get('/', async (req, res) => {
       const bestPid = a.imagePublicId || DEFAULT_PID;
 
       const imageUrl =
-        cleaned ||
-        (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+        cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
 
       return {
         ...a,
         imageUrl,
         category: toCatText(a.category),
-        categories: Array.isArray(a.categories) ? a.categories.map(toCatText) : [],
+        categories: Array.isArray(a.categories)
+          ? a.categories.map(toCatText)
+          : [],
       };
     });
 
@@ -520,11 +574,12 @@ router.get('/:id', async (req, res) => {
     const cleaned = sanitizeImageUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
-      cleaned ||
-      (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+      cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
 
     a.category = toCatText(a.category);
-    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    a.categories = Array.isArray(a.categories)
+      ? a.categories.map(toCatText)
+      : [];
     res.json(a);
   } catch (err) {
     console.error('[admin.articles] get error', err);
@@ -617,7 +672,10 @@ router.patch('/:id', async (req, res) => {
       }
     }
 
-    await decideAndAttach(merged, { imageStrategy: 'cloudinary', fallbacks: ['stock'] });
+    await decideAndAttach(merged, {
+      imageStrategy: 'cloudinary',
+      fallbacks: ['stock'],
+    });
     finalizeImageFields(merged);
 
     if (!merged.thumbImage && merged.imageUrl) merged.thumbImage = merged.imageUrl;
@@ -663,11 +721,12 @@ router.patch('/:id', async (req, res) => {
     const cleanedUrl = sanitizeImageUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
-      cleanedUrl ||
-      (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+      cleanedUrl || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
 
     a.category = toCatText(a.category);
-    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    a.categories = Array.isArray(a.categories)
+      ? a.categories.map(toCatText)
+      : [];
     res.json(a);
   } catch (err) {
     console.error('[admin.articles] patch error', err);
@@ -752,10 +811,11 @@ router.post('/:id/publish', async (req, res) => {
     const cleanedUrl = sanitizeImageUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
-      cleanedUrl ||
-      (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+      cleanedUrl || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
     a.category = toCatText(a.category);
-    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    a.categories = Array.isArray(a.categories)
+      ? a.categories.map(toCatText)
+      : [];
     res.json(a);
 
     try {
@@ -767,6 +827,45 @@ router.post('/:id/publish', async (req, res) => {
   } catch (err) {
     console.error('[admin.articles] publish error', err);
     res.status(500).json({ error: 'failed_to_publish' });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────────
+// AI IMAGE — POST /api/admin/articles/:id/ai-image
+// Generate + attach an AI hero image (Gemini/OpenRouter) and return updated URLs
+router.post('/:id/ai-image', async (req, res) => {
+  try {
+    if (process.env.AI_IMAGE_ENABLED === 'false') {
+      return res.status(403).json({
+        ok: false,
+        error: 'ai_image_disabled',
+      });
+    }
+
+    const { id } = req.params;
+    const result = await generateAiHeroForArticle(id);
+
+    if (!result) {
+      return res.status(404).json({
+        ok: false,
+        error: 'ai_image_failed',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      articleId: result.articleId || id,
+      imageUrl: result.imageUrl,
+      imagePublicId: result.imagePublicId,
+      ogImage: result.ogImage,
+      thumbImage: result.thumbImage,
+    });
+  } catch (err) {
+    console.error('[admin.articles] /:id/ai-image error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || 'ai_image_failed',
+    });
   }
 });
 

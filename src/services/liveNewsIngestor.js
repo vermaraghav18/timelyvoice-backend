@@ -22,18 +22,16 @@ const FEEDS = [
   "https://www.thehindu.com/news/feeder/default.rss",
   "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
 
-
   // ---- World ----
   "https://indianexpress.com/feed/",
   "https://www.hindustantimes.com/feeds/rss/world-news/rssfeed.xml",
- 
 
   // ---- Business / Economy ----
- "https://economictimes.indiatimes.com/rssfeedstopstories.cms",
- "https://www.livemint.com/rss/money",
+  "https://economictimes.indiatimes.com/rssfeedstopstories.cms",
+  "https://www.livemint.com/rss/money",
 
   // ---- Government of India ----
-
+  // (you can add PIB or other govt feeds here later)
 ];
 
 /**
@@ -174,6 +172,43 @@ function dedupe(stories) {
 }
 
 /**
+ * Helper: filter out OLD stories and those with past years in the title
+ * (e.g. "2023") when we are already in 2025.
+ */
+function filterFreshStories(stories) {
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const maxAgeMs = 3 * 24 * 60 * 60 * 1000; // ~3 days
+
+  const fresh = stories.filter((s) => {
+    const title = String(s.title || "");
+    const yearMatch = title.match(/(20\d{2})/);
+    if (yearMatch) {
+      const yearNum = parseInt(yearMatch[1], 10);
+      // Drop stories that clearly talk about an older year (2023 etc.)
+      if (Number.isFinite(yearNum) && yearNum < currentYear) {
+        return false;
+      }
+    }
+
+    let d = s.publishedAt;
+    if (!(d instanceof Date)) d = new Date(d);
+    if (!(d instanceof Date) || Number.isNaN(d.getTime())) {
+      // No usable date → keep only if title doesn't mention an old year
+      return true;
+    }
+
+    const ageMs = now.getTime() - d.getTime();
+    if (ageMs < 0) return true; // future timestamps: keep
+    if (ageMs > maxAgeMs) return false; // too old
+
+    return true;
+  });
+
+  return fresh;
+}
+
+/**
  * Fetch a pool of live seeds.
  *
  * limit: how many seeds to return (max).
@@ -192,15 +227,27 @@ async function fetchLiveSeeds(limit = 10) {
     return [];
   }
 
+  // 1) dedupe
   let filtered = dedupe(all);
 
-  // Sort newest → oldest
+  // 2) keep ONLY fresh + current-year stories
+  filtered = filterFreshStories(filtered);
+
+  if (!filtered.length) {
+    console.warn(
+      "[liveNewsIngestor] all stories were filtered as too old / past-year; falling back to newest raw items"
+    );
+    filtered = dedupe(all);
+  }
+
+  // 3) Sort newest → oldest
   filtered.sort(
     (a, b) =>
-      (b.publishedAt ? b.publishedAt.getTime() : 0) -
-      (a.publishedAt ? a.publishedAt.getTime() : 0)
+      (b.publishedAt ? new Date(b.publishedAt).getTime() : 0) -
+      (a.publishedAt ? new Date(a.publishedAt).getTime() : 0)
   );
 
+  // 4) Limit count
   if (filtered.length > limit) {
     filtered = filtered.slice(0, limit);
   }
