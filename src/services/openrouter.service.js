@@ -28,8 +28,14 @@ const AUTOMATION_MODEL =
 
 // Knobs for X-generation (long-form)
 const XGEN_TARGET_WORDS =
-  parseInt(process.env.XGEN_TARGET_WORDS || process.env.ARTICLE_MIN_BODY || "600", 10);
-const XGEN_MAX_TOKENS = parseInt(process.env.XGEN_MAX_TOKENS || "1600", 10);
+  parseInt(
+    process.env.XGEN_TARGET_WORDS || process.env.ARTICLE_MIN_BODY || "600",
+    10
+  );
+const XGEN_MAX_TOKENS = parseInt(
+  process.env.XGEN_MAX_TOKENS || "1600",
+  10
+);
 
 // Friendly boot logs (do not print secrets)
 console.log("[OpenRouter] global model =", process.env.OPENROUTER_MODEL);
@@ -105,7 +111,10 @@ function safeParseJSON(raw) {
     const objStr = extractJSONObjectLoose(cleanedBase);
     if (!objStr) {
       // Optional: log a tiny preview to help debugging
-      console.error("[safeParseJSON] Could not find JSON object in:", cleanedBase.slice(0, 200));
+      console.error(
+        "[safeParseJSON] Could not find JSON object in:",
+        cleanedBase.slice(0, 200)
+      );
       throw new Error("No JSON object found in model output");
     }
 
@@ -114,8 +123,11 @@ function safeParseJSON(raw) {
   }
 }
 
-/** Low-level OpenRouter caller that allows model/key overrides.
- *  NOTE: returns ONLY parsed JSON content (no token usage). Keep as-is for existing flows.
+/**
+ * Low-level OpenRouter caller that allows model/key overrides.
+ * NOTE: returns the FULL OpenRouter response JSON (choices, usage, etc.).
+ * Callers that need the parsed JSON body should inspect
+ * response.choices[0].message.content and run safeParseJSON on it.
  */
 async function callOpenRouter({
   messages,
@@ -124,13 +136,12 @@ async function callOpenRouter({
   temperature = 0.3,
   max_tokens, // allow caller to set token budget
 }) {
-  const key =
-    (apiKey ||
-      process.env.OPENROUTER_API_KEY ||
-      "").trim();
+  const key = (apiKey || process.env.OPENROUTER_API_KEY || "").trim();
 
   if (!key) {
-    throw new Error("Missing OpenRouter key (OPENROUTER_API_KEY or provided apiKey).");
+    throw new Error(
+      "Missing OpenRouter key (OPENROUTER_API_KEY or provided apiKey)."
+    );
   }
 
   const modelToUse = model || DEFAULT_MODEL;
@@ -139,7 +150,6 @@ async function callOpenRouter({
   const body = {
     model: modelToUse,
     temperature,
-    response_format: { type: "json_object" }, // ask for JSON
     messages,
   };
   if (Number.isFinite(max_tokens)) body.max_tokens = max_tokens;
@@ -161,11 +171,51 @@ async function callOpenRouter({
   }
 
   const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content ?? "";
-  if (!content) throw new Error("OpenRouter returned empty content");
+  return data;
+}
 
-  // content is usually a string with JSON inside
-  return safeParseJSON(content);
+/**
+ * NEW: helper to safely extract message.content from a full OpenRouter response.
+ * This keeps callOpenRouter() low-level, but gives higher-level code
+ * (like aiNewsGenerator) a stable way to get the text.
+ */
+function extractContentFromResponse(data) {
+  try {
+    const choice = data?.choices?.[0];
+    if (!choice) return "";
+    if (choice.message?.content) return String(choice.message.content);
+    if (typeof choice.content === "string") return choice.content;
+    return "";
+  } catch (err) {
+    console.error("[OpenRouter] extractContentFromResponse error:", err);
+    return "";
+  }
+}
+
+/**
+ * NEW: High-level wrapper that:
+ * - calls callOpenRouter()
+ * - returns { text, model, tokens }
+ *
+ * This is what we will use from aiNewsGenerator so it no longer
+ * assumes callOpenRouter() returns just a string.
+ */
+async function callOpenRouterText(opts) {
+  const { model, ...rest } = opts || {};
+  const resp = await callOpenRouter({ model, ...rest });
+
+  const text = extractContentFromResponse(resp);
+  const usage = resp?.usage || {};
+
+  return {
+    text: text || "",
+    model: model || DEFAULT_MODEL,
+    tokens: {
+      prompt: usage.prompt_tokens || 0,
+      completion: usage.completion_tokens || 0,
+      total: usage.total_tokens || 0,
+    },
+  };
 }
 
 // -------------------------------
@@ -177,11 +227,12 @@ async function generateJSONDraft({
   defaults,
   sources,
   model,
-  targetWords,   // optional override; falls back to env
-  maxTokens,     // optional override; falls back to env
+  targetWords, // optional override; falls back to env
+  maxTokens, // optional override; falls back to env
 }) {
   // Model resolution: prefer explicit override, then xgen env, then default
-  const useModel = model || process.env.OPENROUTER_MODEL_XGEN || DEFAULT_MODEL;
+  const useModel =
+    model || process.env.OPENROUTER_MODEL_XGEN || DEFAULT_MODEL;
 
   const words = parseInt(String(targetWords || XGEN_TARGET_WORDS), 10);
   const maxTok = Number.isFinite(maxTokens) ? maxTokens : XGEN_MAX_TOKENS;
@@ -213,14 +264,18 @@ Rules:
 - Leave image fields blank.
 - Keep neutral, factual tone.
 - Slug must be kebab-case; append 6 random digits if needed to ensure uniqueness.
-- BODY LENGTH: write a cohesive, paragraph-based body of approximately ${words}–${words + 200} words (no bullet lists). Ensure clarity, chronology, and attribution to the provided official sources only.`;
+- BODY LENGTH: write a cohesive, paragraph-based body of approximately ${words}–${
+    words + 200
+  } words (no bullet lists). Ensure clarity, chronology, and attribution to the provided official sources only.`;
 
   const user = `
 TWEET:
 ${tweetText || "(none)"}
 
 VERIFIED SOURCES:
-${(sources || []).map((s) => `- ${s.url}`).join("\n") || "(none)"}
+${(sources || [])
+  .map((s) => `- ${s.url}`)
+  .join("\n") || "(none)"}
 
 EXTRACTED TEXT (from official pages):
 ${extractText || "(none)"}
@@ -232,7 +287,7 @@ publishAt=${defaults?.publishAt}
 geo.mode=${defaults?.geo?.mode}
 `.trim();
 
-  return callOpenRouter({
+  const resp = await callOpenRouter({
     model: useModel,
     messages: [
       { role: "system", content: sys },
@@ -241,23 +296,36 @@ geo.mode=${defaults?.geo?.mode}
     temperature: 0.2,
     max_tokens: maxTok,
   });
+
+  const content = resp?.choices?.[0]?.message?.content ?? "";
+  if (!content) {
+    throw new Error(
+      "OpenRouter returned empty content for generateJSONDraft."
+    );
+  }
+
+  return safeParseJSON(content);
 }
 
 // -------------------------------
 // 2) EXISTING FUNCTION — dedicated to RSS automation pipeline (long-form)
 // -------------------------------
 async function generateAutomationArticleDraft({
-  extractedText,   // cleaned text from parsed article page(s)
-  rssLink,         // original source URL (for reference only, do not quote)
-  defaults = {},   // { author, category, publishAt, geo: { mode }, tagsHint? }
-  model,           // optional override
+  extractedText, // cleaned text from parsed article page(s)
+  rssLink, // original source URL (for reference only, do not quote)
+  defaults = {}, // { author, category, publishAt, geo: { mode }, tagsHint? }
+  model, // optional override
 }) {
   // Use dedicated automation envs, falling back to global where needed
-  const apiKey =
-    (process.env.OPENROUTER_API_KEY_AUTOMATION ||
-      process.env.OPENROUTER_API_KEY ||
-      "").trim();
-  if (!apiKey) throw new Error("Missing OpenRouter key for automation (OPENROUTER_API_KEY[_AUTOMATION]).");
+  const apiKey = (
+    process.env.OPENROUTER_API_KEY_AUTOMATION ||
+    process.env.OPENROUTER_API_KEY ||
+    ""
+  ).trim();
+  if (!apiKey)
+    throw new Error(
+      "Missing OpenRouter key for automation (OPENROUTER_API_KEY[_AUTOMATION])."
+    );
 
   const useModel = model || AUTOMATION_MODEL;
 
@@ -311,7 +379,11 @@ author=${defaults.author || "Desk"}
 category=${defaults.category || "(auto)"}
 publishAt=${defaults.publishAt || "(auto now +05:30)"}
 geo.mode=${defaults?.geo?.mode || "Global"}
-tagsHint=${Array.isArray(defaults.tagsHint) ? defaults.tagsHint.join(", ") : "(none)"}
+tagsHint=${
+    Array.isArray(defaults.tagsHint)
+      ? defaults.tagsHint.join(", ")
+      : "(none)"
+  }
 `.trim();
 
   const meta = getHeaderMeta();
@@ -347,15 +419,29 @@ tagsHint=${Array.isArray(defaults.tagsHint) ? defaults.tagsHint.join(", ") : "(n
 
   // Minimal schema guards
   const required = [
-    "title","slug","summary","author","category","status",
-    "publishAt","imageUrl","imagePublicId","seo","geo","tags","body"
+    "title",
+    "slug",
+    "summary",
+    "author",
+    "category",
+    "status",
+    "publishAt",
+    "imageUrl",
+    "imagePublicId",
+    "seo",
+    "geo",
+    "tags",
+    "body",
   ];
   for (const k of required) {
     if (!(k in obj)) throw new Error(`LLM output missing field: ${k}`);
   }
-  if (!Array.isArray(obj.tags)) throw new Error("LLM output 'tags' must be an array");
-  if (!obj.seo || typeof obj.seo !== "object") throw new Error("LLM output 'seo' must be an object");
-  if (!obj.geo || typeof obj.geo !== "object") throw new Error("LLM output 'geo' must be an object");
+  if (!Array.isArray(obj.tags))
+    throw new Error("LLM output 'tags' must be an array");
+  if (!obj.seo || typeof obj.seo !== "object")
+    throw new Error("LLM output 'seo' must be an object");
+  if (!obj.geo || typeof obj.geo !== "object")
+    throw new Error("LLM output 'geo' must be an object");
 
   return obj;
 }
@@ -366,22 +452,26 @@ tagsHint=${Array.isArray(defaults.tagsHint) ? defaults.tagsHint.join(", ") : "(n
 //    Returns { model, parsed, tokens } so caller can store token usage if needed.
 // -------------------------------
 async function generateRSSRewriteJSON({
-  sourceName,   // e.g. "BBC World"
-  rawTitle,     // feed item title
-  rawSummary,   // feed item summary/description
-  url,          // original article URL (for reference only)
-  model,        // optional override model
-  apiKey,       // optional override API key
+  sourceName, // e.g. "BBC World"
+  rawTitle, // feed item title
+  rawSummary, // feed item summary/description
+  url, // original article URL (for reference only)
+  model, // optional override model
+  apiKey, // optional override API key
   maxTokens = 1200, // enough for ~400–600 tokens completion plus overhead
   temperature = 0.3,
 }) {
-  const key = (apiKey ||
+  const key = (
+    apiKey ||
     process.env.OPENROUTER_API_KEY_AUTOMATION ||
     process.env.OPENROUTER_API_KEY ||
-    "").trim();
+    ""
+  ).trim();
 
   if (!key) {
-    throw new Error("Missing OpenRouter key for automation (OPENROUTER_API_KEY[_AUTOMATION]).");
+    throw new Error(
+      "Missing OpenRouter key for automation (OPENROUTER_API_KEY[_AUTOMATION])."
+    );
   }
 
   const useModel = model || AUTOMATION_MODEL;
@@ -467,6 +557,10 @@ module.exports = {
   // Generic low-level caller (your other features can keep using it)
   callOpenRouter,
 
+  // NEW: high-level wrapper returning just text + tokens (for aiNewsGenerator)
+  callOpenRouterText,
+  extractContentFromResponse,
+
   // Existing flow (official sources) — now length-configurable
   generateJSONDraft,
 
@@ -475,4 +569,7 @@ module.exports = {
 
   // NEW: Short-form RSS rewrite (title + 90w summary + 300w body, same language)
   generateRSSRewriteJSON,
+
+  // Also export parser so aiNewsGenerator can use it
+  safeParseJSON,
 };

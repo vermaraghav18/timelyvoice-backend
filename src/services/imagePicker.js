@@ -25,7 +25,7 @@ cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
-  secure: true,
+  secure: true
 });
 
 const { drive, credSource } = getDriveClient();
@@ -69,7 +69,7 @@ const STOPWORDS = new Set([
   "minister",
   "ministry",
   "govt",
-  "government",
+  "government"
   // ❌ REMOVED: india, indian, country
 ]);
 
@@ -100,7 +100,7 @@ function ngrams(tokens, n) {
 }
 
 // -----------------------------------------------------------------------------
-// STRONG NAMES (expanded)
+// STRONG NAMES (leaders)
 // -----------------------------------------------------------------------------
 function strongNamesFrom(title, summary) {
   const toks = tokenize(`${title} ${summary}`);
@@ -113,6 +113,120 @@ function strongNamesFrom(title, summary) {
     )
   );
 }
+
+// All strong-name tokens we care about for filtering filenames
+const ALL_STRONG_NAME_TOKENS = [
+  "modi",
+  "rahul",
+  "rajnath",
+  "gandhi",
+  "singh",
+  "ambani",
+  "adani",
+  "shah",
+  "yogi",
+  "kejriwal",
+  "trump",
+  "biden",
+  "musk",
+  "putin",
+  "vladimir",
+  "xi",
+  "jinping",
+  "zelensky",
+  "netanyahu",
+  "sunak",
+  "scholz",
+  "macron"
+];
+
+// Returns true if filename contains some *other* strong leader name
+// that is NOT part of the article strongNames list.
+function containsOtherStrongName(fileNameLower, articleStrongNames) {
+  const allowed = new Set(
+    (articleStrongNames || []).map((s) => String(s).toLowerCase())
+  );
+
+  for (const token of ALL_STRONG_NAME_TOKENS) {
+    if (!fileNameLower.includes(token)) continue;
+    if (!allowed.has(token)) {
+      // file has a strong leader who is not in this article
+      return true;
+    }
+  }
+  return false;
+}
+
+// -----------------------------------------------------------------------------
+// BRAND / INSTITUTION STRONG TOKENS (IndiGo, RBI, GDP, Market, etc.)
+// -----------------------------------------------------------------------------
+const BRAND_STRONG_TOKENS = new Set([
+  // Airlines
+  "indigo",
+  "airindia",
+  "vistara",
+  "spicejet",
+  "akasa",
+  "goair",
+  "airasia",
+
+  // Financial / markets / regulators
+  "rbi",
+  "sebi",
+  "sensex",
+  "nifty",
+  "gdp",
+  "bse",
+  "nse",
+  "stock",
+  "market",
+  "markets",
+
+  // Institutions
+  "isro",
+  "drdo",
+  "railway",
+  "railways",
+  "indianrailways"
+]);
+
+
+function strongBrandsFrom(meta) {
+  const src = `${meta.title || ""} ${meta.summary || ""} ${
+    meta.slug || ""
+  } ${(meta.tags || []).join(" ")}`;
+  const toks = tokenize(src);
+  return dedupe(toks.filter((t) => BRAND_STRONG_TOKENS.has(t)));
+}
+
+// -----------------------------------------------------------------------------
+// GENERIC TOKENS WE DON'T WANT IN DRIVE QUERY (but still score on)
+// -----------------------------------------------------------------------------
+const GENERIC_QUERY_TOKENS = new Set([
+  "india",
+  "indian",
+  "global",
+  "world",
+  "summit",
+  "meeting",
+  "talks",
+  "ties",
+  "relation",
+  "relations",
+  "growth",
+  "economy",
+  "economic",
+  "market",
+  "markets",
+  "business",
+  "policy",
+  "reform",
+  "update",
+  "latest",
+  "breaking",
+  "event",
+  "news"
+]);
 
 // -----------------------------------------------------------------------------
 // NEGATIVE PENALTY
@@ -131,7 +245,7 @@ function negativePenalty(name, strong) {
     "kejriwal",
     "trump",
     "biden",
-    "musk",
+    "musk"
   ];
 
   for (const f of famous) {
@@ -144,7 +258,9 @@ function negativePenalty(name, strong) {
 // TOKEN / PHRASE BUILDER
 // -----------------------------------------------------------------------------
 function buildTokens(meta) {
-  const raw = dedupe(tokenize(`${meta.title} ${meta.summary} ${meta.slug}`))
+  const raw = dedupe(
+    tokenize(`${meta.title || ""} ${meta.summary || ""} ${meta.slug || ""}`)
+  )
     .map(stem)
     .filter((t) => !STOPWORDS.has(t) && t.length >= 3);
 
@@ -158,19 +274,37 @@ function buildTokens(meta) {
 
   const tokens = dedupe(raw);
 
-  const titleToks = tokenize(meta.title)
+  const titleToks = tokenize(meta.title || "")
     .map(stem)
     .filter((t) => !STOPWORDS.has(t));
 
-  const phrases = dedupe([
+  // Base phrases from the actual title
+  const basePhrases = [
     ...ngrams(titleToks, 3),
-    ...ngrams(titleToks, 2),
-    "election commission",
-    "supreme court",
-    "lok sabha",
-    "union budget",
-    "defence minister",
-  ]);
+    ...ngrams(titleToks, 2)
+  ];
+
+  // Extra hard-coded phrases ONLY if they actually appear in text
+  const extraPhrases = [];
+  const textLower = `${meta.title || ""} ${meta.summary || ""}`.toLowerCase();
+
+  if (textLower.includes("election commission")) {
+    extraPhrases.push("election commission");
+  }
+  if (textLower.includes("supreme court")) {
+    extraPhrases.push("supreme court");
+  }
+  if (textLower.includes("lok sabha")) {
+    extraPhrases.push("lok sabha");
+  }
+  if (textLower.includes("union budget")) {
+    extraPhrases.push("union budget");
+  }
+  if (textLower.includes("defence minister")) {
+    extraPhrases.push("defence minister");
+  }
+
+  const phrases = dedupe([...basePhrases, ...extraPhrases]);
 
   return { tokens, phrases };
 }
@@ -184,7 +318,10 @@ async function searchDriveCandidates(tokens = [], phrases = []) {
   const qParts = [];
 
   for (const t of tokens) {
-    if (t.length >= 3) qParts.push(`name contains '${t}'`);
+    if (t.length < 3) continue;
+    // Don’t use super-generic words to build the Drive query
+    if (GENERIC_QUERY_TOKENS.has(t)) continue;
+    qParts.push(`name contains '${t}'`);
   }
 
   for (const p of phrases) {
@@ -194,23 +331,26 @@ async function searchDriveCandidates(tokens = [], phrases = []) {
     qParts.push(`name contains '${hyph}'`);
   }
 
+  // Always filter to images only
+  const baseFilter = `'${DRIVE_FOLDER_ID}' in parents and mimeType contains 'image/'`;
+
   const query = qParts.length
-    ? `(${qParts.join(" or ")}) and '${DRIVE_FOLDER_ID}' in parents`
-    : `'${DRIVE_FOLDER_ID}' in parents`;
+    ? `${baseFilter} and (${qParts.join(" or ")})`
+    : baseFilter;
 
   const res = await drive.files.list({
     q: query,
     fields: "files(id, name, mimeType, modifiedTime)",
-    pageSize: 100,
+    pageSize: 100
   });
 
   return res.data.files || [];
 }
 
 // -----------------------------------------------------------------------------
-// SCORING ENGINE (IMPROVED)
+// SCORING ENGINE (IMPROVED + BRANDS + RECENCY)
 // -----------------------------------------------------------------------------
-function scoreFile(f, tokens, phrases, strongNames) {
+function scoreFile(f, tokens, phrases, strongNames, strongBrands) {
   const name = f.name.toLowerCase();
   let score = 0;
 
@@ -223,9 +363,14 @@ function scoreFile(f, tokens, phrases, strongNames) {
     }
   }
 
-  // Strong-name BOOST
+  // Strong-name BOOST (leaders)
   for (const s of strongNames) {
     if (name.includes(s)) score += 10;
+  }
+
+  // Brand / institution BOOST
+  for (const b of strongBrands) {
+    if (name.includes(b)) score += 8;
   }
 
   // Token scoring with downweights
@@ -242,6 +387,25 @@ function scoreFile(f, tokens, phrases, strongNames) {
   if (matchedTokens.length >= 2) score += 2;
 
   score += negativePenalty(name, strongNames);
+
+  // Recency bias using modifiedTime
+  if (f.modifiedTime) {
+    const now = Date.now();
+    const modifiedMs = new Date(f.modifiedTime).getTime();
+    if (!Number.isNaN(modifiedMs)) {
+      const ageMs = now - modifiedMs;
+      const sixMonths = 180 * 24 * 60 * 60 * 1000;
+      const twoYears = 730 * 24 * 60 * 60 * 1000;
+
+      if (ageMs <= sixMonths) {
+        score += 2; // very recent
+      } else if (ageMs <= twoYears) {
+        score += 1; // moderately recent
+      } else {
+        // very old: no bonus (or small penalty later if needed)
+      }
+    }
+  }
 
   return { score, matchedTokens };
 }
@@ -265,7 +429,7 @@ async function downloadAndUploadToCloudinary(file) {
     folder: process.env.CLOUDINARY_FOLDER
       ? `${process.env.CLOUDINARY_FOLDER}/google`
       : "news-images/google",
-    resource_type: "image",
+    resource_type: "image"
   });
 
   try {
@@ -276,7 +440,7 @@ async function downloadAndUploadToCloudinary(file) {
 
   return {
     publicId: uploaded.public_id,
-    url: uploaded.secure_url,
+    url: uploaded.secure_url
   };
 }
 
@@ -297,7 +461,7 @@ async function pickRotatedPersonFile(personKey, candidates) {
 
     if (isReady) {
       usedCount = await Article.countDocuments({
-        $or: [{ title: regex }, { summary: regex }],
+        $or: [{ title: regex }, { summary: regex }]
       });
     } else {
       usedCount = 0;
@@ -320,8 +484,8 @@ async function pickRotatedPersonFile(personKey, candidates) {
       personKey,
       usedCount,
       poolSize: sorted.length,
-      pickedIndex: index,
-    },
+      pickedIndex: index
+    }
   };
 }
 
@@ -343,15 +507,16 @@ exports.chooseHeroImage = async function (meta = {}) {
 
     const { tokens, phrases } = buildTokens(meta);
     const strongNames = strongNamesFrom(meta.title || "", meta.summary || "");
+    const strongBrands = strongBrandsFrom(meta);
 
     let candidates = await searchDriveCandidates(tokens, phrases);
 
-    // Fallback list-all
+    // Fallback list-all when query returns nothing
     if (!candidates.length) {
       const res = await drive.files.list({
-        q: `'${DRIVE_FOLDER_ID}' in parents`,
+        q: `'${DRIVE_FOLDER_ID}' in parents and mimeType contains 'image/'`,
         fields: "files(id, name, mimeType, modifiedTime)",
-        pageSize: 50,
+        pageSize: 50
       });
       candidates = res.data.files || [];
     }
@@ -364,13 +529,27 @@ exports.chooseHeroImage = async function (meta = {}) {
     let best = null;
     let rotationMeta = null;
 
-    // Person rotation
+    // Person rotation: if a strongName (e.g. modi/putin) exists,
+    // try to rotate across all matching files first,
+    // but avoid images that contain OTHER leaders not in this article.
     const personKey = strongNames.length ? strongNames[0] : null;
     if (personKey) {
       const lower = personKey.toLowerCase();
-      const personCandidates = candidates.filter((f) =>
-        f.name.toLowerCase().includes(lower)
-      );
+
+      const personCandidates = candidates.filter((f) => {
+        const fname = f.name.toLowerCase();
+
+        // Must contain this personKey (e.g. "modi")
+        if (!fname.includes(lower)) return false;
+
+        // If filename also contains some OTHER strong-name token
+        // that is not in article strongNames, skip it.
+        if (containsOtherStrongName(fname, strongNames)) {
+          return false;
+        }
+
+        return true;
+      });
 
       if (personCandidates.length > 0) {
         const rotated = await pickRotatedPersonFile(personKey, personCandidates);
@@ -384,14 +563,16 @@ exports.chooseHeroImage = async function (meta = {}) {
     // Standard scoring (if rotation didn't already choose)
     if (!best) {
       for (const f of candidates) {
-        const pack = scoreFile(f, tokens, phrases, strongNames);
+        const pack = scoreFile(f, tokens, phrases, strongNames, strongBrands);
         const scored = {
           file: f,
           score: pack.score,
-          matchedTokens: pack.matchedTokens,
+          matchedTokens: pack.matchedTokens
         };
 
-        if (!best || scored.score > best.score) best = scored;
+        if (!best || scored.score > best.score) {
+          best = scored;
+        }
       }
     }
 
@@ -401,8 +582,76 @@ exports.chooseHeroImage = async function (meta = {}) {
       return null;
     }
 
-    // ❌ OLD: there was a MINIMUM SCORE THRESHOLD here that forced default image
-    // ✅ NEW: we ALWAYS trust the best candidate we found
+    // ─────────────────────────────────────────────────────────────
+    // CONFIDENCE GATE:
+    // Only trust Drive pick if score is high enough and we have
+    // at least some meaningful token signal. Otherwise return null
+    // and let the caller (imageStrategy) fall back to default hero.
+    // ─────────────────────────────────────────────────────────────
+    if (best.score != null && typeof best.score === "number") {
+      const filenameLower = best.file.name.toLowerCase();
+
+      const hasStrongNameHit = Array.isArray(strongNames)
+        ? strongNames.some((s) =>
+            filenameLower.includes(String(s).toLowerCase())
+          )
+        : false;
+
+      const hasBrandHit = Array.isArray(strongBrands)
+        ? strongBrands.some((b) =>
+            filenameLower.includes(String(b).toLowerCase())
+          )
+        : false;
+
+      const matchedTokenCount = Array.isArray(best.matchedTokens)
+        ? best.matchedTokens.length
+        : 0;
+
+      const articleHasStrongName = strongNames.length > 0;
+      const articleHasStrongBrand = strongBrands.length > 0;
+
+      // Base thresholds
+      const MIN_SCORE_WITH_KEY = 5; // filename hits a leader or brand
+      const MIN_SCORE_WITHOUT_KEY = 8;
+      const MIN_SCORE_GENERIC = 10;
+
+      let minScore;
+
+      if (!articleHasStrongName && !articleHasStrongBrand) {
+        // Completely generic article: be extra strict
+        minScore = MIN_SCORE_GENERIC;
+        if (best.score < minScore || matchedTokenCount < 2) {
+          console.log("[imagePicker] Rejecting generic low-confidence candidate", {
+            file: best.file.name,
+            score: best.score,
+            minScore,
+            matchedTokenCount,
+            strongNames,
+            strongBrands
+          });
+          return null;
+        }
+      } else {
+        // Article has either leader or brand context
+        if (hasStrongNameHit || hasBrandHit) {
+          minScore = MIN_SCORE_WITH_KEY;
+        } else {
+          minScore = MIN_SCORE_WITHOUT_KEY;
+        }
+
+        if (best.score < minScore || matchedTokenCount === 0) {
+          console.log("[imagePicker] Rejecting low-confidence candidate", {
+            file: best.file.name,
+            score: best.score,
+            minScore,
+            matchedTokenCount,
+            strongNames,
+            strongBrands
+          });
+          return null;
+        }
+      }
+    }
 
     const uploaded = await downloadAndUploadToCloudinary(best.file);
 
@@ -415,13 +664,12 @@ exports.chooseHeroImage = async function (meta = {}) {
         score: best.score,
         matchedTokens: best.matchedTokens,
         rotation: rotationMeta || null,
-        credSource,
-      },
+        credSource
+      }
     };
   } catch (err) {
     console.error("[imagePicker ERROR]", err);
-    // ❌ OLD: returned default hero here
-    // ✅ NEW: tell caller there is NO pick; it can decide fallback (default, etc.)
+    // Tell caller "no pick"; caller can decide default image.
     return null;
   }
 };

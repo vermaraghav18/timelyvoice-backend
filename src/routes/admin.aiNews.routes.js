@@ -10,12 +10,87 @@ const { generateNewsBatch } = require("../services/aiNewsGenerator");
 const { finalizeArticleImages } = require("../services/finalizeArticleImages");
 const AiGenerationLog = require("../models/AiGenerationLog");
 
+// NEW: cron + RSS integration
+const {
+  getCronStatusSnapshot,
+  runOnceAutoNews,
+} = require("../cron/autoNewsCron");
+const { fetchLiveSeeds } = require("../services/liveNewsIngestor");
+
+// Use env-configured model for logging instead of hardcoding
+const LOG_MODEL =
+  process.env.OPENROUTER_MODEL_AUTONEWS ||
+  process.env.OPENROUTER_MODEL ||
+  "openai/gpt-4o-mini";
+
 // ─────────────────────────────────────────────────────────────
 // Simple health check
 // GET /api/admin/ai/ping
 // ─────────────────────────────────────────────────────────────
 router.get("/ping", (_req, res) => {
   res.json({ ok: true, scope: "admin-ai-news" });
+});
+
+// ─────────────────────────────────────────────────────────────
+// CRON STATUS — used by AutomationDashboard "Automation status"
+// GET /api/admin/ai/cron-status
+// ─────────────────────────────────────────────────────────────
+router.get("/cron-status", (_req, res) => {
+  try {
+    const snapshot = getCronStatusSnapshot();
+    return res.json({ ok: true, status: snapshot });
+  } catch (err) {
+    console.error("[admin.aiNews] /cron-status error:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "cron_status_failed",
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// MANUAL CRON RUN — trigger one AI automation cycle
+// POST /api/admin/ai/run-cron-once
+// ─────────────────────────────────────────────────────────────
+router.post("/run-cron-once", async (_req, res) => {
+  try {
+    const result = await runOnceAutoNews({ reason: "manual-api" });
+    return res.json({
+      ok: true,
+      result,
+    });
+  } catch (err) {
+    console.error("[admin.aiNews] /run-cron-once error:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "cron_run_failed",
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// RSS SEEDS PREVIEW — debug what cron sees
+// GET /api/admin/ai/rss-preview?limit=10
+// ─────────────────────────────────────────────────────────────
+router.get("/rss-preview", async (req, res) => {
+  try {
+    const limit = Math.max(
+      1,
+      Math.min(parseInt(req.query.limit || "10", 10), 50)
+    );
+    const seeds = await fetchLiveSeeds(limit);
+    return res.json({
+      ok: true,
+      count: seeds.length,
+      seeds,
+    });
+  } catch (err) {
+    console.error("[admin.aiNews] /rss-preview error:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "rss_preview_failed",
+    });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -107,7 +182,7 @@ router.post("/generate-batch", async (req, res) => {
       // Log: nothing generated
       await AiGenerationLog.create({
         runAt: new Date(startedAt),
-        model: "openai/gpt-4o-mini",
+        model: LOG_MODEL,
         countRequested: count || null,
         countGenerated: 0,
         countSaved: 0,
@@ -169,11 +244,13 @@ router.post("/generate-batch", async (req, res) => {
         thumbImage: null,
       });
 
-      payload.imagePublicId = fin.imagePublicId;
-      payload.imageUrl = fin.imageUrl;
-      payload.ogImage = fin.ogImage;
-      payload.thumbImage = fin.thumbImage;
-      payload.imageAlt = payload.imageAlt || fin.imageAlt;
+      if (fin) {
+        payload.imagePublicId = fin.imagePublicId;
+        payload.imageUrl = fin.imageUrl;
+        payload.ogImage = fin.ogImage;
+        payload.thumbImage = fin.thumbImage;
+        payload.imageAlt = payload.imageAlt || fin.imageAlt;
+      }
 
       // Ensure slug is unique
       let finalSlug = payload.slug;
@@ -206,7 +283,7 @@ router.post("/generate-batch", async (req, res) => {
     // Log success
     await AiGenerationLog.create({
       runAt: new Date(startedAt),
-      model: "openai/gpt-4o-mini",
+      model: LOG_MODEL,
       countRequested: count || null,
       countGenerated: normalized.length,
       countSaved: createdSummaries.length,
@@ -225,13 +302,16 @@ router.post("/generate-batch", async (req, res) => {
       articles: createdSummaries,
     });
   } catch (err) {
-    console.error("[admin.aiNews] /generate-batch error:", err?.message || err);
+    console.error(
+      "[admin.aiNews] /generate-batch error:",
+      err?.message || err
+    );
 
     // Log error
     try {
       await AiGenerationLog.create({
         runAt: new Date(startedAt),
-        model: "openai/gpt-4o-mini",
+        model: LOG_MODEL,
         countRequested: count || null,
         countGenerated: normalized.length || 0,
         countSaved: createdSummaries.length || 0,
@@ -244,7 +324,10 @@ router.post("/generate-batch", async (req, res) => {
         triggeredBy: "api-admin-ai-generate-batch",
       });
     } catch (logErr) {
-      console.error("[admin.aiNews] log-create failed:", logErr?.message || logErr);
+      console.error(
+        "[admin.aiNews] log-create failed:",
+        logErr?.message || logErr
+      );
     }
 
     return res.status(500).json({

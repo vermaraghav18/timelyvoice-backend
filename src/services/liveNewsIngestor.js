@@ -2,257 +2,218 @@
 "use strict";
 
 /**
- * Live News Ingestor
- * ------------------
- * Fetches REAL current news from RSS feeds and returns
- * lightweight “seed stories” for the AI to rewrite.
- *
- * We NEVER copy full article bodies (copyright safe).
- * We ONLY use title + summary + link + timestamp.
+ * Live News Ingestor — TODAY-ONLY VERSION
+ * ---------------------------------------
+ * This version:
+ * ✔ Handles broken RSS timestamps correctly
+ * ✔ Keeps ONLY stories whose publishedAt date is TODAY (server local time)
+ * ✔ Still removes 2023/2022 etc. stories
+ * ✔ Removes duplicate stories
+ * ✔ Removes promo / live blog / opinion junk
+ * ✔ Sorts newest → oldest
+ * ✔ If nothing is left for today, returns [] so AI falls back to generic mode
  */
 
 const Parser = require("rss-parser");
-const rssParser = new Parser({
-  timeout: 10000,
-});
+const rssParser = new Parser({ timeout: 8000 });
 
-// 🔗 Fixed list of feeds (you can edit later if you want)
+// -----------------------------------------------------------------------------
+// FEEDS
+// -----------------------------------------------------------------------------
 const FEEDS = [
-  // ---- India / National ----
+  // India
   "https://www.thehindu.com/news/feeder/default.rss",
   "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
 
-  // ---- World ----
+  // World
   "https://indianexpress.com/feed/",
   "https://www.hindustantimes.com/feeds/rss/world-news/rssfeed.xml",
 
-  // ---- Business / Economy ----
+  // Business
   "https://economictimes.indiatimes.com/rssfeedstopstories.cms",
   "https://www.livemint.com/rss/money",
-
-  // ---- Government of India ----
-  // (you can add PIB or other govt feeds here later)
 ];
 
-/**
- * Simple text cleaner (remove HTML + collapse spaces)
- */
+// -----------------------------------------------------------------------------
+// HELPERS
+// -----------------------------------------------------------------------------
 function clean(s = "") {
-  return String(s)
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return String(s).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-/**
- * Rough category guess based on title keywords.
- * This just helps us map feeds to your Article categories.
- */
+function parseDate(item) {
+  const fields = [
+    item.isoDate,
+    item.pubDate,
+    item.pubdate,
+    item["dc:date"],
+    item.updated,
+    item.published,
+    item.date,
+  ];
+
+  for (const f of fields) {
+    if (!f) continue;
+    const d = new Date(f);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  // Fail safe: treat as *old*, not new
+  return null;
+}
+
+function isOldYear(title) {
+  const match = title.match(/(20\d{2})/);
+  if (!match) return false;
+  const year = parseInt(match[1], 10);
+  const current = new Date().getFullYear();
+  return year < current;
+}
+
 function guessCategory(title = "") {
   const t = title.toLowerCase();
 
-  if (
-    t.includes("india") ||
-    t.includes("delhi") ||
-    t.includes("modi") ||
-    t.includes("parliament") ||
-    t.includes("assembly")
-  ) {
-    return "India";
-  }
-  if (
-    t.includes("rbi") ||
-    t.includes("market") ||
-    t.includes("stock") ||
-    t.includes("bank") ||
-    t.includes("gdp") ||
-    t.includes("inflation")
-  ) {
+  if (t.includes("gdp") || t.includes("rbi") || t.includes("market"))
     return "Business";
-  }
-  if (
-    t.includes("tech") ||
-    t.includes("ai") ||
-    t.includes("startup") ||
-    t.includes("software") ||
-    t.includes("app")
-  ) {
-    return "Tech";
-  }
-  if (
-    t.includes("election") ||
-    t.includes("government") ||
-    t.includes("cabinet") ||
-    t.includes("policy")
-  ) {
-    return "Politics";
-  }
-  if (
-    t.includes("climate") ||
-    t.includes("environment") ||
-    t.includes("weather") ||
-    t.includes("pollution")
-  ) {
-    return "Science";
-  }
-  if (
-    t.includes("match") ||
-    t.includes("tournament") ||
-    t.includes("cricket") ||
-    t.includes("football") ||
-    t.includes("world cup")
-  ) {
-    return "Sports";
-  }
-
+  if (t.includes("modi") || t.includes("cabinet") || t.includes("parliament"))
+    return "India";
+  if (t.includes("weather") || t.includes("climate")) return "Science";
+  if (t.includes("cricket") || t.includes("football")) return "Sports";
+  if (t.includes("ai") || t.includes("tech")) return "Tech";
   return "World";
 }
 
-/**
- * Fetch and normalise a single RSS feed.
- */
+function isBadStory(title, summary) {
+  const t = title.toLowerCase();
+  const s = summary.toLowerCase();
+
+  const junk = ["opinion", "editorial", "newsletter", "blog", "live blog"];
+  return junk.some((x) => t.includes(x) || s.includes(x));
+}
+
+// Local yyyy-mm-dd based on server timezone
+function localDateKey(d) {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+// -----------------------------------------------------------------------------
+// FETCH ONE FEED
+// -----------------------------------------------------------------------------
 async function fetchFeed(url) {
   try {
     const feed = await rssParser.parseURL(url);
+    const feedTitle = clean(feed.title || "");
 
     return (feed.items || []).map((item) => {
       const title = clean(item.title || "");
-      const summary = clean(
-        item.contentSnippet || item.summary || item.description || ""
-      );
 
-      const publishedRaw =
-        item.isoDate ||
-        item.pubDate ||
-        item.pubdate ||
-        item["dc:date"] ||
-        new Date().toISOString();
+      const rawSummary =
+        item.contentSnippet || item.summary || item.description || "";
+      const summaryClean = clean(rawSummary);
+      const summary = summaryClean || title; // ✅ fallback to title if empty
 
-      const publishedAt = new Date(publishedRaw);
+      const publishedAt = parseDate(item);
 
       return {
-        source: "rss",
-        feedTitle: feed.title || "",
-        feedUrl: url,
-        originSite: feed.link || "",
-        link: item.link || "",
         title,
         summary,
-        publishedAt,
+        link: item.link || "",
         category: guessCategory(title),
+        feedUrl: url,
+        feedTitle, // helpful for aiNewsGenerator (sourceName / feedTitle)
+        sourceName: feedTitle || url, // explicit source name
+        publishedAt,
       };
     });
   } catch (err) {
-    console.error(
-      "[liveNewsIngestor] failed to fetch feed",
-      url,
-      "error=",
-      err?.message || err
-    );
+    console.error("[liveNewsIngestor] FEED ERROR:", url, err.message);
     return [];
   }
 }
 
-/**
- * Remove duplicate stories using (title + link) as key.
- */
-function dedupe(stories) {
-  const seen = new Set();
-  const out = [];
-
-  for (const s of stories) {
-    const key = `${(s.link || "").toLowerCase()}|${(s.title || "").toLowerCase()}`;
-    if (!key.trim()) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(s);
-  }
-
-  return out;
-}
-
-/**
- * Helper: filter out OLD stories and those with past years in the title
- * (e.g. "2023") when we are already in 2025.
- */
-function filterFreshStories(stories) {
+// -----------------------------------------------------------------------------
+// FILTER STORIES — ONLY TODAY'S DATE
+// -----------------------------------------------------------------------------
+function filterStories(stories) {
   const now = new Date();
-  const currentYear = now.getFullYear();
-  const maxAgeMs = 3 * 24 * 60 * 60 * 1000; // ~3 days
+  const todayKey = localDateKey(now);
+  const maxAgeMs = 24 * 60 * 60 * 1000; // safety net
 
-  const fresh = stories.filter((s) => {
-    const title = String(s.title || "");
-    const yearMatch = title.match(/(20\d{2})/);
-    if (yearMatch) {
-      const yearNum = parseInt(yearMatch[1], 10);
-      // Drop stories that clearly talk about an older year (2023 etc.)
-      if (Number.isFinite(yearNum) && yearNum < currentYear) {
-        return false;
-      }
-    }
+  return stories.filter((s) => {
+    if (!s.title || !s.link) return false;
 
-    let d = s.publishedAt;
-    if (!(d instanceof Date)) d = new Date(d);
-    if (!(d instanceof Date) || Number.isNaN(d.getTime())) {
-      // No usable date → keep only if title doesn't mention an old year
-      return true;
-    }
+    if (isOldYear(s.title)) return false;
 
-    const ageMs = now.getTime() - d.getTime();
-    if (ageMs < 0) return true; // future timestamps: keep
-    if (ageMs > maxAgeMs) return false; // too old
+    if (isBadStory(s.title, s.summary)) return false;
+
+    if (!(s.publishedAt instanceof Date)) return false;
+
+    const storyKey = localDateKey(s.publishedAt);
+    if (!storyKey) return false;
+
+    // ✅ HARD RULE: must be same calendar date as "today" in server timezone
+    if (storyKey !== todayKey) return false;
+
+    // Optional safety: still keep within 24h window and avoid future timestamps
+    const age = now.getTime() - s.publishedAt.getTime();
+    if (age < 0) return false; // future timestamps → ignore
+    if (age > maxAgeMs) return false; // older than 24h → ignore
 
     return true;
   });
-
-  return fresh;
 }
 
-/**
- * Fetch a pool of live seeds.
- *
- * limit: how many seeds to return (max).
- */
+// -----------------------------------------------------------------------------
+// DEDUPE
+// -----------------------------------------------------------------------------
+function dedupe(stories) {
+  const map = new Map();
+  for (const s of stories) {
+    const key = (s.link + "|" + s.title).toLowerCase();
+    if (!map.has(key)) map.set(key, s);
+  }
+  return [...map.values()];
+}
+
+// -----------------------------------------------------------------------------
+// MAIN FUNCTION
+// -----------------------------------------------------------------------------
 async function fetchLiveSeeds(limit = 10) {
   const all = [];
 
   for (const url of FEEDS) {
-    // eslint-disable-next-line no-await-in-loop
+    // Sequential ensures we don’t flood RSS servers
+    /* eslint-disable no-await-in-loop */
     const items = await fetchFeed(url);
     all.push(...items);
   }
 
   if (!all.length) {
-    console.warn("[liveNewsIngestor] no stories fetched from any feed");
+    console.warn("[liveNewsIngestor] No items fetched from any feed.");
     return [];
   }
 
-  // 1) dedupe
   let filtered = dedupe(all);
-
-  // 2) keep ONLY fresh + current-year stories
-  filtered = filterFreshStories(filtered);
+  filtered = filterStories(filtered);
 
   if (!filtered.length) {
     console.warn(
-      "[liveNewsIngestor] all stories were filtered as too old / past-year; falling back to newest raw items"
+      "[liveNewsIngestor] All items got filtered out for TODAY. " +
+        "Returning [] so AI falls back to generic current-news mode."
     );
-    filtered = dedupe(all);
+    // Return [] → aiNewsGenerator will still generate plausible current
+    // articles using its no-RSS fallback, without being anchored to old dates.
+    return [];
   }
 
-  // 3) Sort newest → oldest
-  filtered.sort(
-    (a, b) =>
-      (b.publishedAt ? new Date(b.publishedAt).getTime() : 0) -
-      (a.publishedAt ? new Date(a.publishedAt).getTime() : 0)
-  );
+  // Sort newest → oldest
+  filtered.sort((a, b) => b.publishedAt - a.publishedAt);
 
-  // 4) Limit count
-  if (filtered.length > limit) {
-    filtered = filtered.slice(0, limit);
-  }
-
-  return filtered;
+  return filtered.slice(0, limit);
 }
 
 module.exports = {

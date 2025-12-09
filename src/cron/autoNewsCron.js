@@ -140,10 +140,19 @@ async function computeAllowedCount() {
   };
 }
 
+/**
+ * MAIN EXECUTION — single cron run
+ * Now always returns a structured result object so admin routes
+ * can respond quickly instead of dealing with undefined.
+ */
 async function runOnceAutoNews({ reason = "interval" } = {}) {
   if (inFlight) {
     console.log("[autoNewsCron] skip — previous run still in flight");
-    return;
+    return {
+      ok: false,
+      skipped: true,
+      reason: "in_flight",
+    };
   }
 
   const now = new Date();
@@ -155,7 +164,13 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       WINDOW_END_HOUR,
       now.getHours()
     );
-    return;
+    return {
+      ok: false,
+      skipped: true,
+      reason: "outside_window",
+      windowStartHour: WINDOW_START_HOUR,
+      windowEndHour: WINDOW_END_HOUR,
+    };
   }
 
   const startedAt = Date.now();
@@ -166,6 +181,13 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
     todayDateKey = key;
     todayCountSaved = 0;
   }
+
+  // we declare these upfront so we can safely refer to them in the return object
+  let seeds = [];
+  let normalized = [];
+  let createdSummaries = [];
+  let skippedDuplicates = 0;
+  let skippedTopicDuplicates = 0;
 
   try {
     const { allowed, usedHour, usedDay } = await computeAllowedCount();
@@ -178,7 +200,15 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       );
       lastRunAt = new Date();
       lastStatus = "success";
-      return;
+
+      return {
+        ok: true,
+        skipped: true,
+        reason: "no_allowance",
+        usedHour,
+        usedDay,
+        allowed,
+      };
     }
 
     const desiredStatus =
@@ -197,10 +227,6 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       categories ? categories.join(",") : "(auto)"
     );
 
-    const createdSummaries = [];
-    let skippedDuplicates = 0;
-    let skippedTopicDuplicates = 0;
-
     const pickedCategory =
       FORCED_CATEGORIES.length > 0
         ? FORCED_CATEGORIES[
@@ -208,10 +234,9 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
           ]
         : undefined;
 
-       // 1) Pull fresh live seeds from RSS
+    // 1) Pull fresh live seeds from RSS
     //    This uses your FEEDS array and drops anything older than 24h or wrong year
     const seedLimit = Math.max(allowed * 3, 10); // pool a few extra, it’s cheap
-    let seeds = [];
     try {
       seeds = await fetchLiveSeeds(seedLimit);
     } catch (e) {
@@ -230,11 +255,10 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       categories: pickedCategory ? [pickedCategory] : categories,
       trendingBias: true,
       mode: "standard",
-      seeds, // <-- NEW: pass RSS seeds into generator
+      seeds, // <-- pass RSS seeds into generator
     });
 
-
-    const normalized = result?.normalized || [];
+    normalized = result?.normalized || [];
 
     if (!normalized.length) {
       console.warn("[autoNewsCron] generator returned 0 articles");
@@ -256,10 +280,20 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
 
       lastRunAt = new Date();
       lastStatus = "error";
-      return;
+
+      return {
+        ok: false,
+        skipped: false,
+        reason: "no_articles_generated",
+        seedsCount: seeds.length,
+        requested: allowed,
+        generated: 0,
+        saved: 0,
+      };
     }
 
     // Create Article docs one by one
+    createdSummaries = [];
     for (const g of normalized) {
       let skipByTopicFingerprint = false;
 
@@ -431,8 +465,23 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       skippedDuplicates,
       skippedTopicDuplicates
     );
+
+    return {
+      ok: true,
+      skipped: false,
+      reason: null,
+      requested: allowed,
+      generated: normalized.length,
+      saved: createdSummaries.length,
+      skippedDuplicates,
+      skippedTopicDuplicates,
+      seedsCount: seeds.length,
+      durationMs: Date.now() - startedAt,
+    };
   } catch (err) {
     console.error("[autoNewsCron] run failed:", err?.message || err);
+
+    const durationMs = Date.now() - startedAt;
 
     try {
       await AiGenerationLog.create({
@@ -443,7 +492,7 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
         countSaved: 0,
         status: "error",
         errorMessage: err?.message || String(err),
-        durationMs: Date.now() - startedAt,
+        durationMs,
         requestStatus: DEFAULT_STATUS,
         categories: FORCED_CATEGORIES || [],
         samples: [],
@@ -458,6 +507,17 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
 
     lastRunAt = new Date();
     lastStatus = "error";
+
+    return {
+      ok: false,
+      skipped: false,
+      reason: "exception",
+      errorMessage: err?.message || String(err),
+      durationMs,
+      seedsCount: seeds.length,
+      generated: normalized.length,
+      saved: createdSummaries.length,
+    };
   } finally {
     inFlight = false;
   }

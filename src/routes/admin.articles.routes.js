@@ -4,6 +4,12 @@
 const express = require('express');
 const router = express.Router();
 
+// NEW: deps for Drive → Cloudinary override
+const fs = require('fs');
+const path = require('path');
+const { v2: cloudinary } = require('cloudinary');
+const { getDriveClient } = require('../services/driveClient');
+
 // Models
 const Article = require('../models/Article');
 const Category = require('../models/Category');
@@ -65,6 +71,97 @@ function sanitizeImageUrl(u) {
 
 console.log('[admin.articles] DEFAULT_IMAGE_PUBLIC_ID =', DEFAULT_PID);
 console.log('[admin.articles] CLOUD_NAME =', CLOUD_NAME);
+
+// ────────────────────────────────────────────────────────────────────────────────
+// NEW: Cloudinary + Drive setup for manual Drive overrides
+// ────────────────────────────────────────────────────────────────────────────────
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
+
+const TEMP_DIR = path.join(__dirname, '../../tmp-drive-manual');
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+const { drive, credSource } = getDriveClient
+  ? getDriveClient()
+  : { drive: null, credSource: 'none' };
+
+// Extract fileId from common Google Drive URLs
+function extractDriveFileId(raw = '') {
+  const s = String(raw || '').trim();
+  if (!s.includes('drive.google.com')) return null;
+
+  // /file/d/<ID>/view
+  const byPath = s.match(/\/file\/d\/([^/]+)/);
+  if (byPath && byPath[1]) return byPath[1];
+
+  // ?id=<ID> or &id=<ID>
+  const byParam = s.match(/[?&]id=([^&]+)/);
+  if (byParam && byParam[1]) return byParam[1];
+
+  return null;
+}
+
+// Download a Drive file by ID → upload to Cloudinary → return { publicId, url }
+async function uploadDriveFileToCloudinary(fileId) {
+  if (!fileId || !drive) {
+    console.warn(
+      '[admin.articles] uploadDriveFileToCloudinary: missing fileId or drive client; credSource =',
+      credSource
+    );
+    return null;
+  }
+
+  const destPath = path.join(TEMP_DIR, `${fileId}.img`);
+  const dest = fs.createWriteStream(destPath);
+
+  try {
+    const response = await drive.files.get(
+      { fileId, alt: 'media' },
+      { responseType: 'stream' }
+    );
+
+    await new Promise((resolve, reject) => {
+      response.data
+        .on('end', resolve)
+        .on('error', reject)
+        .pipe(dest);
+    });
+
+    const uploaded = await cloudinary.uploader.upload(destPath, {
+      folder: process.env.CLOUDINARY_FOLDER
+        ? `${process.env.CLOUDINARY_FOLDER}/manual`
+        : 'news-images/manual',
+      resource_type: 'image',
+    });
+
+    try {
+      if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+    } catch (err) {
+      console.warn('[admin.articles] temp cleanup warning:', err.message || err);
+    }
+
+    return {
+      publicId: uploaded.public_id,
+      url: uploaded.secure_url,
+    };
+  } catch (err) {
+    console.error(
+      '[admin.articles] uploadDriveFileToCloudinary error:',
+      err.message || err
+    );
+    try {
+      if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+    } catch (_) {}
+    return null;
+  }
+}
 
 // ────────────────────────────────────────────────────────────────────────────────
 // Helpers used by PATCH
@@ -231,24 +328,10 @@ function normalizeRemoteImageUrl(raw = '') {
 
   // If it's a Google Drive link, convert it to a direct download URL
   if (s.includes('drive.google.com')) {
-    let fileId = null;
-
-    const byPath = s.match(/\/file\/d\/([^/]+)/);
-    if (byPath && byPath[1]) {
-      fileId = byPath[1];
-    }
-
-    if (!fileId) {
-      const byParam = s.match(/[?&]id=([^&]+)/);
-      if (byParam && byParam[1]) {
-        fileId = byParam[1];
-      }
-    }
-
+    const fileId = extractDriveFileId(s);
     if (fileId) {
       return `https://drive.google.com/uc?export=download&id=${fileId}`;
     }
-
     return s;
   }
 
@@ -450,10 +533,9 @@ router.get('/', async (req, res) => {
 
     const [allItems, total] = await Promise.all([
       Article.find(query)
-           .select(
-      '_id title slug status category summary publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage tags source'
-    )
-
+        .select(
+          '_id title slug status category summary publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage tags source'
+        )
         .sort({ updatedAt: -1, createdAt: -1 })
         .limit(MAX_LIST)
         .populate({
@@ -513,6 +595,8 @@ router.get('/', async (req, res) => {
             .select('_id name slug')
             .lean()
         : [],
+
+
       nameSet.size
         ? Category.find({ name: { $in: Array.from(nameSet) } })
             .select('_id name slug')
@@ -657,6 +741,32 @@ router.patch('/:id', async (req, res) => {
       (patch.imagePublicId === '' || patch.imagePublicId === null)
     ) {
       delete merged.imagePublicId;
+    }
+
+    // NEW: if manual URL is a Google Drive link, resolve it to Cloudinary first
+    if (
+      merged.imageUrl &&
+      typeof merged.imageUrl === 'string' &&
+      merged.imageUrl.includes('drive.google.com')
+    ) {
+      try {
+        const fileId = extractDriveFileId(merged.imageUrl);
+        if (fileId) {
+          const uploaded = await uploadDriveFileToCloudinary(fileId);
+          if (uploaded) {
+            merged.imagePublicId = uploaded.publicId;
+            merged.imageUrl = uploaded.url;
+            // also update patch so later logic skips deriveCloudinaryPublicIdFromUrl
+            patch.imagePublicId = uploaded.publicId;
+            patch.imageUrl = uploaded.url;
+          }
+        }
+      } catch (err) {
+        console.error(
+          '[admin.articles] manual Drive image override failed:',
+          err.message || err
+        );
+      }
     }
 
     const manualUrlProvided =
