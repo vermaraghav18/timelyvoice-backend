@@ -205,11 +205,13 @@ if (String(process.env.TRUST_PROXY || 'true') === 'true') {
 // Compress all responses (JSON, HTML, etc.)
 app.use(compression({ threshold: 0 }));
 
-// ✅ Only enforce canonical domain/https in production
-if (process.env.NODE_ENV === 'production') {
+// ✅ Temporarily disable canonical host redirect on backend to avoid redirect loops
+// If you want canonical redirects, do them at the frontend / CDN level, not here.
+if (false && process.env.NODE_ENV === 'production') {
   const canonicalHost = require('./src/middleware/canonicalHost');
   app.use(canonicalHost());
 }
+
 
 // Strong ETags let browsers/CDNs validate cached JSON quickly
 app.set('etag', 'strong');
