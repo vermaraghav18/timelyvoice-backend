@@ -102,6 +102,11 @@ function guessMimeFromUrl(url = "") {
 // - bad placeholders: "leave it empty", "Leave it empty", '"leave it empty"' etc.
 // - publicIds (no http): build Cloudinary URL
 // - only keep real URLs or resolved Cloudinary URLs
+// Normalize any possible "image" value coming from Mongo
+// - objects: { url, secure_url }
+// - bad placeholders: "leave it empty" etc.
+// - publicIds (no http): build Cloudinary URL
+// - only keep real URLs or resolved Cloudinary URLs
 function normalizeImageField(raw) {
   if (!raw) return "";
 
@@ -119,7 +124,12 @@ function normalizeImageField(raw) {
 
   const s = cleaned;
 
-  // Already a full URL
+  // ❌ Google Drive links render as HTML, not direct images → skip for RSS
+  if (/drive\.google\.com/i.test(s)) {
+    return "";
+  }
+
+  // Already a full URL (Cloudinary, Pexels, etc.)
   if (/^https?:\/\//i.test(s)) return s;
 
   // Otherwise, if we have Cloudinary, assume it's a publicId
@@ -130,6 +140,7 @@ function normalizeImageField(raw) {
   // Unknown non-URL string – treat as no image for RSS safety
   return "";
 }
+
 
 // Decide which image to use for RSS:
 // 1) ogImage (if valid URL or publicId)
