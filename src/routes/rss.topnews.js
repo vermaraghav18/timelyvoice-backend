@@ -132,10 +132,11 @@ function normalizeImageField(raw) {
 }
 
 // Decide which image to use for RSS:
-// 1) ogImage (if valid URL)
+// 1) ogImage (if valid URL or publicId)
 // 2) imageUrl
 // 3) cover.url / cover.secure_url
-// 4) fallback OG hero (Cloudinary default)
+// 4) imagePublicId (NEW)
+// 5) fallback OG hero (Cloudinary default)
 function pickBestImageForRss(article) {
   const coverObj = article.cover || {};
   const coverUrl = normalizeImageField(coverObj.secure_url || coverObj.url);
@@ -144,6 +145,8 @@ function pickBestImageForRss(article) {
     normalizeImageField(article.ogImage),
     normalizeImageField(article.imageUrl),
     coverUrl,
+    // ✅ NEW: also respect imagePublicId so RSS can show auto-picked & default images
+    normalizeImageField(article.imagePublicId),
   ].filter(Boolean);
 
   // If the document has no usable image, fall back to global default OG
@@ -176,8 +179,8 @@ async function handleTopNewsRss(req, res, next) {
       ],
     })
       .select(
-        "title slug summary publishedAt publishAt updatedAt createdAt imageUrl ogImage cover"
-      )
+        "title slug summary publishedAt publishAt updatedAt createdAt imageUrl ogImage cover imagePublicId"
+      ) // ✅ include imagePublicId
       .sort({
         publishedAt: -1,
         publishAt: -1,
