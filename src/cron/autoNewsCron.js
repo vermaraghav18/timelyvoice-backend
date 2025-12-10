@@ -255,7 +255,7 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       categories: pickedCategory ? [pickedCategory] : categories,
       trendingBias: true,
       mode: "standard",
-      seeds, // <-- pass RSS seeds into generator
+      seeds, // <-- title uniqueness + rewrite handled inside aiNewsGenerator
     });
 
     normalized = result?.normalized || [];
