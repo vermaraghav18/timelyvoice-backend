@@ -11,13 +11,16 @@ const Article = require("../models/Article");
 const AiGenerationLog = require("../models/AiGenerationLog");
 const { generateNewsBatch } = require("../services/aiNewsGenerator");
 const { finalizeArticleImages } = require("../services/finalizeArticleImages");
-const { shouldSkipAsDuplicate } = require("../services/aiArticleGuard");
 const slugify = require("slugify");
 const { fetchLiveSeeds } = require("../services/liveNewsIngestor");
 
-// NEW: topic-fingerprint deduper (backed by Mongo TTL)
-const { computeTopicKey } = require("../services/rssDeduper");
-const RssTopicFingerprint = require("../models/RssTopicFingerprint");
+// NEW: advanced AI article guard (source URL + similarity + topic fingerprints)
+const {
+  shouldGenerateFromSeed,
+  markTopicUsed,
+  canonicalizeSourceUrl,
+} = require("../services/aiArticleGuard");
+
 
 const AUTOMATION_MODEL = "openai/gpt-4o-mini";
 
@@ -295,68 +298,36 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
     // Create Article docs one by one
     createdSummaries = [];
     for (const g of normalized) {
-      let skipByTopicFingerprint = false;
+      // --- 1) Run central AI guard on the would-be article topic ---
+      const seedForGuard = {
+        title: g.title,
+        summary: g.summary,
+        category: g.category,
+        link: g.sourceUrl || g.sourceUrlOriginal || "",
+      };
 
-      try {
-        if (g.title) {
-          const topicKey = computeTopicKey(g.title, g.sourceUrl || "");
-
-          if (topicKey) {
-            // eslint-disable-next-line no-await-in-loop
-            const existingTopic =
-              await RssTopicFingerprint.findOneAndUpdate(
-                { topicKey },
-                {
-                  $setOnInsert: {
-                    topicKey,
-                    firstSeenAt: new Date(),
-                  },
-                  $set: {
-                    latestTitle: g.title,
-                    latestLink: g.sourceUrl || "",
-                    lastSeenAt: new Date(),
-                  },
-                },
-                { new: false, upsert: true }
-              ).lean();
-
-            if (existingTopic) {
-              skippedTopicDuplicates += 1;
-              skipByTopicFingerprint = true;
-              console.log(
-                "[autoNewsCron] skipping by topic fingerprint title=%s topicKey=%s",
-                g.title,
-                topicKey
-              );
-            }
-          }
-        }
-      } catch (topicErr) {
-        console.error(
-          "[autoNewsCron] topic fingerprint check failed for title=%s err=%s",
-          g.title,
-          topicErr?.message || topicErr
-        );
-      }
-
-      if (skipByTopicFingerprint) {
-        continue;
-      }
-
-      // DB-level duplicate guard
       // eslint-disable-next-line no-await-in-loop
-      const dup = await shouldSkipAsDuplicate({ title: g.title });
-      if (dup.skip) {
-        skippedDuplicates += 1;
+      const guard = await shouldGenerateFromSeed(seedForGuard);
+
+      if (!guard.ok) {
+        // reason: 'dupe_source' | 'dupe_similar' | 'dupe_topic'
+        if (guard.reason === "dupe_topic") {
+          skippedTopicDuplicates += 1;
+        } else {
+          skippedDuplicates += 1;
+        }
+
         console.log(
-          "[autoNewsCron] skipping duplicate article title=%s matchedSlug=%s score=%s",
-          g.title,
-          dup.matched?.slug || "(unknown)",
-          dup.score != null ? dup.score.toFixed(2) : "n/a"
+          "[autoNewsCron] skipping by guard reason=%s title=%s",
+          guard.reason,
+          g.title
         );
+
+        // Skip to next generated article
         continue;
       }
 
+      // --- 2) Build base slug and payload as before ---
       let baseSlug =
         g.slug ||
         slugify(g.title || "article", {
@@ -364,6 +335,9 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
           strict: true,
         }) ||
         `article-${Date.now()}`;
+
+      const sourceUrl = g.sourceUrl || "";
+      const sourceUrlCanonical = canonicalizeSourceUrl(sourceUrl);
 
       const payload = {
         title: g.title,
@@ -384,10 +358,11 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
         tags: Array.isArray(g.tags) ? g.tags : [],
         body: g.body || "",
         source: "ai-batch",
-        sourceUrl: g.sourceUrl || "",
+        sourceUrl,
+        sourceUrlCanonical, // 👈 NEW: normalized URL for hard dedupe
       };
 
-      // Finalize images
+      // --- 3) Finalize images (unchanged) ---
       // eslint-disable-next-line no-await-in-loop
       const fin = await finalizeArticleImages({
         title: payload.title,
@@ -406,7 +381,7 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
         payload.imageAlt = payload.imageAlt || fin.imageAlt;
       }
 
-      // Ensure slug is unique
+      // --- 4) Ensure slug is unique (unchanged) ---
       let finalSlug = payload.slug;
       let suffix = 2;
       // eslint-disable-next-line no-await-in-loop
@@ -415,20 +390,23 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       }
       payload.slug = finalSlug;
 
-      // Final status + timestamps
+      // --- 5) Final status + timestamps (unchanged) ---
       payload.status =
         desiredStatus === "published" ? "published" : "draft";
       if (payload.status === "published") {
         payload.publishedAt = new Date();
       }
 
-      // NEW: explicit timestamps so cron-created docs sort correctly
       const nowStamp = new Date();
       payload.createdAt = nowStamp;
       payload.updatedAt = nowStamp;
 
+      // --- 6) Save article + update topic fingerprint ---
       // eslint-disable-next-line no-await-in-loop
       const doc = await Article.create(payload);
+
+      // eslint-disable-next-line no-await-in-loop
+      await markTopicUsed(seedForGuard, doc._id);
 
       createdSummaries.push({
         articleId: doc._id,

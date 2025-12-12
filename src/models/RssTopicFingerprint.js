@@ -1,36 +1,42 @@
 // backend/src/models/RssTopicFingerprint.js
-// Stores "seen topics" so the cron can skip duplicate AI articles.
-
 const mongoose = require("mongoose");
 
-const rssTopicFingerprintSchema = new mongoose.Schema(
+const RssTopicFingerprintSchema = new mongoose.Schema(
   {
-    topicKey: {
-      type: String,
-      required: true,
-      unique: true,
-      index: true,
-    },
-    firstSeenAt: {
-      type: Date,
-      default: Date.now,
-      // Auto-delete after 7 days so collection doesn't grow forever
-      expires: 7 * 24 * 60 * 60, // 7 days in seconds
-    },
-    lastSeenAt: {
-      type: Date,
-      default: Date.now,
-    },
-    latestTitle: {
-      type: String,
-    },
-    latestLink: {
-      type: String,
-    },
+    // Normalized topic key like: "box office dhurandhar"
+    key: { type: String, required: true, index: true },
+
+    // Optional category ("Sports", "World", etc.)
+    category: { type: String, index: true },
+
+    // When we first saw this topic in RSS
+    firstSeenAt: { type: Date, default: Date.now },
+
+    // When we last saw a seed/article for this topic
+    lastSeenAt: { type: Date, default: Date.now },
+
+    // How many RSS seeds we have seen for this topic
+    seedCount: { type: Number, default: 0 },
+
+    // How many AI articles we actually generated for this topic
+    articleCount: { type: Number, default: 0 },
+
+    // Optional: which Article documents were generated
+    articleIds: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Article",
+      },
+    ],
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+  }
 );
 
-module.exports =
-  mongoose.models.RssTopicFingerprint ||
-  mongoose.model("RssTopicFingerprint", rssTopicFingerprintSchema);
+RssTopicFingerprintSchema.index({ key: 1, category: 1 }, { unique: true });
+
+module.exports = mongoose.model(
+  "RssTopicFingerprint",
+  RssTopicFingerprintSchema
+);

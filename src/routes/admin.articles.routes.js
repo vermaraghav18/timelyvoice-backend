@@ -413,7 +413,7 @@ router.get('/drafts', async (req, res) => {
 
     const rawDrafts = await Article.find(q)
       .select(
-        '_id title category slug status summary imageUrl imagePublicId createdAt updatedAt'
+        '_id title category slug status summary imageUrl imagePublicId createdAt updatedAt videoUrl' // + videoUrl
       )
       .sort({ createdAt: -1 })
       .limit(200)
@@ -534,7 +534,8 @@ router.get('/', async (req, res) => {
     const [allItems, total] = await Promise.all([
       Article.find(query)
         .select(
-          '_id title slug status category summary publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source'
+          // ⬇⬇ include body + sourceUrl + videoUrl
+          '_id title slug status category summary body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
         )
         .sort({ updatedAt: -1, createdAt: -1 })
         .limit(MAX_LIST)
@@ -595,8 +596,6 @@ router.get('/', async (req, res) => {
             .select('_id name slug')
             .lean()
         : [],
-
-
       nameSet.size
         ? Category.find({ name: { $in: Array.from(nameSet) } })
             .select('_id name slug')
@@ -617,29 +616,28 @@ router.get('/', async (req, res) => {
       categoriesMapByName
     );
 
-   const items = normalized.map((a) => {
-  // Fix the admin "Image URL (quick)" display:
-  // if imageUrl is "leave it empty", replace with real default hero URL
-  const cleaned = sanitizeImageUrl(a.imageUrl);
-  const bestPid = a.imagePublicId || DEFAULT_PID;
+    const items = normalized.map((a) => {
+      // Fix the admin "Image URL (quick)" display:
+      // if imageUrl is "leave it empty", replace with real default hero URL
+      const cleaned = sanitizeImageUrl(a.imageUrl);
+      const bestPid = a.imagePublicId || DEFAULT_PID;
 
-  const imageUrl =
-    cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+      const imageUrl =
+        cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
 
-  // NEW: always send a useful imageAlt back to the admin UI
-  const imageAlt = a.imageAlt || a.title || 'News image';
+      // NEW: always send a useful imageAlt back to the admin UI
+      const imageAlt = a.imageAlt || a.title || 'News image';
 
-  return {
-    ...a,
-    imageUrl,
-    imageAlt,
-    category: toCatText(a.category),
-    categories: Array.isArray(a.categories)
-      ? a.categories.map(toCatText)
-      : [],
-  };
-});
-
+      return {
+        ...a,
+        imageUrl,
+        imageAlt,
+        category: toCatText(a.category),
+        categories: Array.isArray(a.categories)
+          ? a.categories.map(toCatText)
+          : [],
+      };
+    });
 
     res.json({ items, total, page: pageNum, limit: perPage });
   } catch (err) {
@@ -698,6 +696,7 @@ router.patch('/:id', async (req, res) => {
       'author',
       'year',
       'era',
+      'videoUrl', // NEW
     ];
 
     const patch = {};
@@ -814,6 +813,7 @@ router.patch('/:id', async (req, res) => {
       'thumbImage',
       'year',
       'era',
+      'videoUrl', // NEW
     ];
     const toSave = {};
     for (const k of toSaveKeys) {

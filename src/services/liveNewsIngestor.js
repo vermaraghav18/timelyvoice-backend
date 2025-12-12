@@ -21,17 +21,32 @@ const rssParser = new Parser({ timeout: 8000 });
 // FEEDS
 // -----------------------------------------------------------------------------
 const FEEDS = [
-  // India
-  "https://www.thehindu.com/news/feeder/default.rss",
-  "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
+  // ─────────────────────────────
+  // Times of India
+  // ─────────────────────────────
+  "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+  "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms",
+  "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms",
+  "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms",
+  "https://timesofindia.indiatimes.com/rssfeeds/1081479906.cms",
+  "https://timesofindia.indiatimes.com/rssfeeds/4719148.cms",
 
-  // World
-  "https://indianexpress.com/feed/",
-  "https://www.hindustantimes.com/feeds/rss/world-news/rssfeed.xml",
+  // ─────────────────────────────
+  // Indian Express
+  // ─────────────────────────────
+  "https://indianexpress.com/section/business/feed/",
+  "https://indianexpress.com/section/sports/cricket/feed/",
+  "https://indianexpress.com/section/business/economy/feed/",
+  "https://indianexpress.com/section/entertainment/feed/",
+  "https://indianexpress.com/section/news-today/feed/",
+  "https://indianexpress.com/section/trending/feed/",
 
-  // Business
-  "https://economictimes.indiatimes.com/rssfeedstopstories.cms",
-  "https://www.livemint.com/rss/money",
+  // ─────────────────────────────
+  // External RSS (RSS.app XML)
+  // ─────────────────────────────
+  "https://rss.app/feeds/W4xqo13jWuO9K5aD.xml",
+  "https://rss.app/feeds/50EMHbHEY3feCeXR.xml",
+  "https://rss.app/feeds/WhJRNvpVEsR8XVkR.xml",
 ];
 
 // -----------------------------------------------------------------------------
@@ -70,7 +85,8 @@ function isOldYear(title) {
   return year < current;
 }
 
-function guessCategory(title = "") {
+// Title-based fallback categorization
+function guessCategoryFromTitle(title = "") {
   const t = title.toLowerCase();
 
   if (t.includes("gdp") || t.includes("rbi") || t.includes("market"))
@@ -81,6 +97,56 @@ function guessCategory(title = "") {
   if (t.includes("cricket") || t.includes("football")) return "Sports";
   if (t.includes("ai") || t.includes("tech")) return "Tech";
   return "World";
+}
+
+// Feed → category mapping (with fallback to title)
+function guessCategory(url = "", title = "") {
+  const u = url.toLowerCase();
+
+  // Times of India — tune per feed
+  if (u.includes("timesofindia.indiatimes.com/rssfeedstopstories.cms")) {
+    return "Politics"; // general India-focused top stories
+  }
+  if (u.includes("timesofindia.indiatimes.com/rssfeeds/1898055.cms")) {
+    return "Business";
+  }
+  if (u.includes("timesofindia.indiatimes.com/rssfeeds/1081479906.cms")) {
+    return "Sports";
+  }
+  if (u.includes("timesofindia.indiatimes.com/rssfeeds/4719148.cms")) {
+    return "Entertainment";
+  }
+  if (u.includes("timesofindia.indiatimes.com/rssfeeds/-2128936835.cms")) {
+    return "World";
+  }
+  if (u.includes("timesofindia.indiatimes.com/rssfeeds/296589292.cms")) {
+    return "World";
+  }
+
+  // Indian Express section-based feeds
+  if (u.includes("indianexpress.com/section/business/")) {
+    return "Business";
+  }
+  if (u.includes("indianexpress.com/section/sports/")) {
+    return "Sports";
+  }
+  if (u.includes("indianexpress.com/section/entertainment/")) {
+    return "Entertainment";
+  }
+  if (u.includes("indianexpress.com/section/news-today/")) {
+    return "Politics";
+  }
+  if (u.includes("indianexpress.com/section/trending/")) {
+    return "World";
+  }
+
+  // RSS.app feeds — treat as global / mixed news
+  if (u.includes("rss.app/feeds/")) {
+    return "World";
+  }
+
+  // Fallback: infer from title text
+  return guessCategoryFromTitle(title);
 }
 
 function isBadStory(title, summary) {
@@ -122,7 +188,7 @@ async function fetchFeed(url) {
         title,
         summary,
         link: item.link || "",
-        category: guessCategory(title),
+        category: guessCategory(url, title),
         feedUrl: url,
         feedTitle, // helpful for aiNewsGenerator (sourceName / feedTitle)
         sourceName: feedTitle || url, // explicit source name

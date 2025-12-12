@@ -7,11 +7,17 @@
  * ✔ Forces NEW, ORIGINAL HEADLINES (never same as RSS)
  * ✔ Adds automatic title rewrite when model attempts to reuse seed title
  * ✔ Stronger prompt instructions for unique titles
- * ✔ JSON normalization unchanged except title-protection layer
+ * ✔ Body length guidance (automation vs manual)
+ * ✔ Logs body word counts for each normalized article
+ * ✔ Carries RSS source URL/name into normalized articles
+ * ✔ NEW: Computes and exposes sourceUrlCanonical for dedupe
  */
 
 const slugify = require("slugify");
 const { callOpenRouterText, safeParseJSON } = require("./openrouter.service");
+
+// NEW: shared canonicalizer used by the AI guard & cron
+const { canonicalizeSourceUrl } = require("./aiArticleGuard");
 
 // Base model
 const DEFAULT_AUTOMATION_MODEL =
@@ -31,7 +37,6 @@ const MAX_TOKENS_AUTONEWS = parseInt(
 // Allowed categories
 const ALLOWED_CATEGORIES = [
   "World",
-  "India",
   "Business",
   "Tech",
   "Sports",
@@ -100,12 +105,31 @@ function makeSlugFromTitle(title, index) {
 // NORMALIZATION
 // ─────────────────────────────────────────────────────────────
 
-function normalizeOne(raw, index, { defaultPublishAt, seedTitle } = {}) {
+function normalizeOne(
+  raw,
+  index,
+  { defaultPublishAt, seedTitle, seedLink, seedSource } = {}
+) {
   if (!raw || typeof raw !== "object") return null;
 
   let title = String(raw.title || "").trim();
   const body = String(raw.body || "").trim();
   if (!title || !body) return null;
+
+  // ✅ LOG BODY WORD COUNT for monitoring
+  const bodyWordCount = body.split(/\s+/).filter(Boolean).length;
+  try {
+    console.log(
+      "[aiNewsGenerator] normalized article",
+      index,
+      "- title:",
+      title.slice(0, 60),
+      "- bodyWords:",
+      bodyWordCount
+    );
+  } catch (e) {
+    // avoid crashing on logging errors
+  }
 
   // 🔥 NEW FIX — If model copied the RSS title, rewrite it
   if (seedTitle && isTitleSame(title, seedTitle)) {
@@ -169,6 +193,15 @@ function normalizeOne(raw, index, { defaultPublishAt, seedTitle } = {}) {
     ? baseGeo.areas
     : ["country:IN"];
 
+  // NEW: consistently compute canonical source URL
+  const sourceUrlRaw = raw.sourceUrl || seedLink || "";
+  const sourceUrlCanonical =
+    typeof canonicalizeSourceUrl === "function"
+      ? canonicalizeSourceUrl(sourceUrlRaw)
+      : sourceUrlRaw;
+
+  const sourceName = raw.sourceName || seedSource || "";
+
   return {
     title,
     slug,
@@ -182,6 +215,11 @@ function normalizeOne(raw, index, { defaultPublishAt, seedTitle } = {}) {
 
     imageUrl: raw.imageUrl || "",
     imagePublicId: raw.imagePublicId || "",
+
+    // NEW: store original RSS article link + optional source label + canonical URL
+    sourceUrl: sourceUrlRaw,
+    sourceUrlCanonical,
+    sourceName,
 
     seo: {
       imageAlt,
@@ -197,7 +235,7 @@ function normalizeOne(raw, index, { defaultPublishAt, seedTitle } = {}) {
 
     tags,
 
-    // compatibility
+    // compatibility (fields some parts of code still expect)
     imageAlt,
     metaTitle,
     metaDesc: metaDescription,
@@ -253,6 +291,13 @@ async function generateNewsBatch({
       ? categories
       : ALLOWED_CATEGORIES;
 
+  // ✅ Body length policy
+  // mode === "standard" → cron / automation
+  // else               → manual / preview
+  const isAutomation = mode === "standard";
+  const minWords = isAutomation ? 600 : 400;
+  const maxWords = isAutomation ? 900 : 800;
+
   const now = new Date();
   const todayISO = now.toISOString().slice(0, 10);
 
@@ -261,6 +306,8 @@ async function generateNewsBatch({
   let seedNote = "";
   let seedDates = [];
   let seedTitles = [];
+  let seedLinks = [];
+  let seedSources = [];
 
   if (Array.isArray(seeds) && seeds.length) {
     const limitedSeeds = seeds.slice(0, n);
@@ -270,6 +317,12 @@ async function generateNewsBatch({
     );
 
     seedTitles = limitedSeeds.map((s) => s.title || "");
+
+    // NEW: carry through RSS link + source label
+    seedLinks = limitedSeeds.map((s) => s.link || "");
+    seedSources = limitedSeeds.map(
+      (s) => s.sourceName || s.feedTitle || s.feedUrl || ""
+    );
 
     seedBlock = limitedSeeds
       .map((s, idx) => {
@@ -338,11 +391,13 @@ Each must follow the schema:
     "areas": ["country:IN"]
   },
   "tags": ["tag1","tag2"],
-  "body": "600-900 words of factual news writing"
+  "body": "A cohesive, well-structured news article body between ${minWords} and ${maxWords} words of factual news writing."
 }
 
 STRICT RULES:
 - No markdown, no comments, no explanations.
+- For each article, BODY LENGTH MUST be between ${minWords} and ${maxWords} words.
+- If needed, prefer being slightly ABOVE ${minWords} words rather than shorter.
 - publishAt must be within last 24 hours from ${now.toISOString()}.
 `.trim();
 
@@ -354,10 +409,12 @@ ${seedBlock}
 
 Rewrite each story into a full article.
 Remember: YOUR HEADLINE MUST BE ORIGINAL AND NOT BASED ON THE SEED TITLE.
+Ensure each BODY is between ${minWords} and ${maxWords} words.
 `.trim();
   } else {
     userMessage = `
 Generate ${n} realistic news articles with ORIGINAL HEADLINES.
+Each BODY must be between ${minWords} and ${maxWords} words.
 `.trim();
   }
 
@@ -394,12 +451,14 @@ Generate ${n} realistic news articles with ORIGINAL HEADLINES.
 
   const rawArticles = coerceArticlesArray(json);
 
-  // Normalize with title-protection
+  // Normalize with title-protection + RSS origin + canonical URL
   const normalized = rawArticles
     .map((raw, idx) =>
       normalizeOne(raw, idx, {
         defaultPublishAt: seedDates[idx],
         seedTitle: seedTitles[idx],
+        seedLink: seedLinks[idx],
+        seedSource: seedSources[idx],
       })
     )
     .filter(Boolean);

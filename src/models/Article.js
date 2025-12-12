@@ -46,7 +46,8 @@ const ArticleSchema = new mongoose.Schema({
   imageAlt:      { type: String, default: '' },
   ogImage:       { type: String, default: '' },      // social (1200x630)
   thumbImage:    { type: String, default: '' },      // ✅ added (list/grid thumbnails)
-
+  // NEW: optional video URL (Google Drive, Cloudinary, etc.)
+videoUrl: { type: String, default: null },
   // SEO
   metaTitle:   { type: String, default: '' },
   metaDesc:    { type: String, default: '' },
@@ -69,6 +70,7 @@ const ArticleSchema = new mongoose.Schema({
   // Provenance
   source:      { type: String, default: 'automation' },
   sourceUrl:   { type: String, default: '' },        // ✅ added (original link)
+  sourceUrlCanonical: { type: String, index: true },
 
   // Optional geo targeting
   geoMode:   { type: String, enum: ['global','include','exclude'], default: 'global' },

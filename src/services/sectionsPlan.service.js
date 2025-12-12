@@ -1,6 +1,7 @@
 // backend/src/services/sectionsPlan.service.js
 const Section = require("../models/Section");
 const Article = require("../models/Article");
+const Category = require("../models/Category");
 
 /* =============================== Utilities =============================== */
 
@@ -61,6 +62,44 @@ function normArray(v) {
 }
 
 /* ------------------------------------------------------------------
+ * FIX 1 helper: Expand category inputs to also match ObjectId-string categories
+ * - supports:
+ *   - old: category: "World"
+ *   - slug: categorySlug: "world"
+ *   - new: category: "6561abcd..." (ObjectId string)
+ * ------------------------------------------------------------------ */
+async function expandCategoryTokens(cats = []) {
+  const raw = (Array.isArray(cats) ? cats : [cats])
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
+
+  if (!raw.length) return [];
+
+  const lower = raw.map((x) => x.toLowerCase());
+  const objectIdLike = raw.filter((x) => /^[a-f0-9]{24}$/i.test(x));
+
+  let resolvedIds = [];
+  try {
+    const matches = await Category.find(
+      {
+        $or: [
+          { slug: { $in: lower } },
+          { name: { $in: raw } },
+          { name: { $in: raw.map((x) => x.toLowerCase()) } },
+        ],
+      },
+      { _id: 1 }
+    ).lean();
+
+    resolvedIds = (matches || []).map((c) => String(c._id));
+  } catch (_e) {
+    resolvedIds = [];
+  }
+
+  return Array.from(new Set([...raw, ...lower, ...objectIdLike, ...resolvedIds]));
+}
+
+/* ------------------------------------------------------------------
  * Helper: run a flexible query for composite sections
  * - honors status=published
  * - accepts categories against either `category` or `categorySlug`
@@ -72,9 +111,10 @@ async function runQuery({ query = {}, limit = 4, excludeIds = [] } = {}) {
 
   const cats = Array.isArray(query.categories) ? query.categories.filter(Boolean) : [];
   if (cats.length) {
+    const expandedCats = await expandCategoryTokens(cats);
     q.$or = [
-      { category: { $in: cats } },
-      { categorySlug: { $in: cats } },
+      { category: { $in: expandedCats } },
+      { categorySlug: { $in: expandedCats } },
     ];
   }
 
@@ -686,14 +726,16 @@ const canonicalItems = await runQuery({
       if (!secCats.length && targetType === "category") {
         const pageCat = String(targetValue).trim().toLowerCase();
         const pageCatCap = pageCat ? pageCat.charAt(0).toUpperCase() + pageCat.slice(1) : "";
+        const expanded = await expandCategoryTokens([pageCat, pageCatCap]);
         q.$or = [
-          { category: { $in: [pageCat, pageCatCap] } },
-          { categorySlug: { $in: [pageCat, pageCatCap] } },
+          { category: { $in: expanded } },
+          { categorySlug: { $in: expanded } },
         ];
       } else if (secCats.length) {
+        const expanded = await expandCategoryTokens(secCats);
         q.$or = [
-          { category: { $in: secCats } },
-          { categorySlug: { $in: secCats } },
+          { category: { $in: expanded } },
+          { categorySlug: { $in: expanded } },
         ];
       }
 

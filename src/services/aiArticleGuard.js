@@ -3,125 +3,352 @@
 
 /**
  * AI Article Guard
- * ----------------
- * Phase 8: DB-level safety & de-duplication.
+ * -----------------
+ * Centralised duplicate / topic protection for AI news generation.
  *
- * Goal: prevent nearly identical AI headlines from being created
- * repeatedly within a recent time window.
- *
- * Strategy:
- * - Look back N hours (default: 72h) in Article collection
- * - Only consider AI-created articles (source === "ai-batch")
- * - Compare tokenized titles
- * - If token-overlap score >= threshold (default 0.75), treat as duplicate
+ * Layers:
+ *  1) Hard dedupe by canonical source URL (sourceUrlCanonical).
+ *  2) Jaccard title similarity vs recent articles (same category, last 24h).
+ *  3) Topic fingerprints (RssTopicFingerprint) to limit 1 article per topic
+ *     per time window (e.g. 24h) even if RSS keeps shouting about it.
  */
 
-const Article = require("../../src/models/Article");
+const Article = require("../models/Article");
+const RssTopicFingerprint = require("../models/RssTopicFingerprint");
 
-// How far back in time (in hours) to look for duplicates
-const LOOKBACK_HOURS =
-  parseInt(process.env.AI_DUP_LOOKBACK_HOURS || "72", 10) || 72;
+// --------------------------------------------------------------
+// CONFIG
+// --------------------------------------------------------------
 
-// Minimum token overlap score to treat as duplicate
-const DUP_THRESHOLD =
-  Number(process.env.AI_DUP_THRESHOLD || "0.75") || 0.75;
+// How far back to look when checking recent articles for similarity.
+const RECENT_ARTICLE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-// Minimum title length (in characters) to even bother comparing
-const MIN_TITLE_LENGTH = 32;
+// Jaccard similarity threshold (0–1) above which we treat as duplicate.
+const TITLE_SIMILARITY_THRESHOLD = 0.8;
 
-// Simple tokenizer: lowercase, remove punctuation, split on whitespace
-function tokenizeTitle(title = "") {
-  return String(title || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]+/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
+// Per-topic article limit and time window.
+const TOPIC_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+const TOPIC_MAX_ARTICLES_PER_WINDOW = 1;
+
+// --------------------------------------------------------------
+// URL NORMALIZATION
+// --------------------------------------------------------------
+
+function canonicalizeSourceUrl(raw = "") {
+  if (!raw) return "";
+  try {
+    const u = new URL(String(raw).trim());
+
+    // drop query + hash (tracking etc.)
+    u.search = "";
+    u.hash = "";
+
+    // normalize host + path
+    const host = u.hostname.toLowerCase();
+    let pathname = u.pathname || "/";
+
+    // strip trailing slashes
+    if (pathname.length > 1) {
+      pathname = pathname.replace(/\/+$/, "");
+    }
+
+    // special handling for sites that embed IDs in URL (TOI, etc.)
+    // e.g. /articleshow/12345678.cms?from=mdr  →  /articleshow/12345678.cms
+    pathname = pathname.replace(/(articleshow\/\d+)\.cms.*/i, "$1.cms");
+
+    return `${host}${pathname}`; // host + path only
+  } catch {
+    // Fallback: very rough normalization
+    return String(raw).trim().toLowerCase().replace(/[#?].*$/, "");
+  }
 }
 
-// Compute a simple Jaccard-like overlap score between token sets
-function tokenOverlapScore(aTokens = [], bTokens = []) {
-  if (!aTokens.length || !bTokens.length) return 0;
+// --------------------------------------------------------------
+// TOKENIZATION / SIMILARITY
+// --------------------------------------------------------------
 
-  const aSet = new Set(aTokens);
-  const bSet = new Set(bTokens);
+const STOPWORDS = new Set([
+  "the",
+  "a",
+  "an",
+  "of",
+  "for",
+  "to",
+  "on",
+  "in",
+  "by",
+  "at",
+  "as",
+  "and",
+  "or",
+  "but",
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "being",
+  "from",
+  "with",
+  "over",
+  "under",
+  "into",
+  "out",
+  "new",
+  "latest",
+  "today",
+  "live",
+  "update",
+  "updates",
+  "breaking",
+  "report",
+  "reports",
+  "after",
+  "before",
+  "amid",
+  "towards",
+  "toward",
+  "day",
+  "week",
+  "month",
+  "year",
+  "crore",
+  "lakh",
+  "vs",
+  "v",
+  "india",
+  "indian",
+  "world",
+  "global",
+]);
+
+function tokenizeTitle(str = "") {
+  return String(str)
+    .toLowerCase()
+    // remove brackets etc.
+    .replace(/[\[\]\(\)\.\,\:\;\!\?\“\”\"\'\-]/g, " ")
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t && !STOPWORDS.has(t));
+}
+
+function uniqueTokens(tokens) {
+  return Array.from(new Set(tokens));
+}
+
+function jaccardSimilarity(tokensA, tokensB) {
+  const a = uniqueTokens(tokensA);
+  const b = uniqueTokens(tokensB);
+  if (!a.length || !b.length) return 0;
+
+  const setA = new Set(a);
+  const setB = new Set(b);
 
   let intersection = 0;
-  for (const t of aSet) {
-    if (bSet.has(t)) intersection += 1;
+  for (const t of setA) {
+    if (setB.has(t)) intersection += 1;
   }
 
-  const union = aSet.size + bSet.size - intersection;
-  if (!union) return 0;
+  const union = setA.size + setB.size - intersection;
+  if (union === 0) return 0;
   return intersection / union;
 }
 
-/**
- * shouldSkipAsDuplicate({ title })
- *
- * Returns:
- *   { skip: boolean, matched?: { slug, title, createdAt } }
- */
-async function shouldSkipAsDuplicate({ title }) {
-  const cleanTitle = String(title || "").trim();
+// Build a combined title+summary token list for a seed
+function tokensForSeed(seed = {}) {
+  const base = `${seed.title || ""} ${seed.summary || ""}`;
+  return tokenizeTitle(base);
+}
 
-  // If title too short, don't treat as duplicate
-  if (!cleanTitle || cleanTitle.length < MIN_TITLE_LENGTH) {
-    return { skip: false };
+// --------------------------------------------------------------
+// TOPIC KEY
+// --------------------------------------------------------------
+
+function computeTopicKey(seed = {}) {
+  // We build from title + summary.
+  const tokens = tokensForSeed(seed);
+
+  if (!tokens.length) return "";
+
+  // Keep "strong" tokens first (longer words), then slice to fixed size.
+  const sorted = uniqueTokens(tokens).sort((a, b) => b.length - a.length);
+
+  // limit to top 6 tokens for stability
+  const keyTokens = sorted.slice(0, 6).sort(); // sorted for deterministic key
+
+  return keyTokens.join(" ");
+}
+
+// --------------------------------------------------------------
+// DB HELPERS
+// --------------------------------------------------------------
+
+async function existsArticleWithCanonicalSource(seed = {}) {
+  const link =
+    seed.link || seed.url || seed.sourceUrl || seed.source_link || "";
+  const canonical = canonicalizeSourceUrl(link);
+  if (!canonical) return false;
+
+  const existing = await Article.findOne({
+    sourceUrlCanonical: canonical,
+  }).select("_id");
+
+  return !!existing;
+}
+
+async function isTooSimilarToRecentArticles(seed = {}) {
+  const tokensSeed = tokensForSeed(seed);
+  if (!tokensSeed.length) return false;
+
+  const since = new Date(Date.now() - RECENT_ARTICLE_WINDOW_MS);
+
+  const query = {
+    createdAt: { $gte: since },
+  };
+
+  if (seed.category) {
+    query.category = seed.category;
   }
 
-  // Compute time window
-  const now = new Date();
-  const since = new Date(now.getTime() - LOOKBACK_HOURS * 60 * 60 * 1000);
-
-  // Fetch recent AI-batch articles
-  const recent = await Article.find({
-    source: "ai-batch",
-    createdAt: { $gte: since },
-  })
-    .select("slug title createdAt")
-    .sort({ createdAt: -1 })
+  const recent = await Article.find(query)
+    .select("title summary category createdAt")
     .lean();
 
-  if (!recent || !recent.length) {
-    return { skip: false };
-  }
+  for (const art of recent) {
+    const base = `${art.title || ""} ${art.summary || ""}`;
+    const tokensArticle = tokenizeTitle(base);
+    const sim = jaccardSimilarity(tokensSeed, tokensArticle);
 
-  const newTokens = tokenizeTitle(cleanTitle);
-  if (!newTokens.length) {
-    return { skip: false };
-  }
-
-  let bestScore = 0;
-  let bestMatch = null;
-
-  for (const doc of recent) {
-    const oldTitle = String(doc.title || "").trim();
-    if (!oldTitle || oldTitle.length < MIN_TITLE_LENGTH) continue;
-
-    const oldTokens = tokenizeTitle(oldTitle);
-    if (!oldTokens.length) continue;
-
-    const score = tokenOverlapScore(newTokens, oldTokens);
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = doc;
+    if (sim >= TITLE_SIMILARITY_THRESHOLD) {
+      return true;
     }
   }
 
-  if (bestMatch && bestScore >= DUP_THRESHOLD) {
-    return {
-      skip: true,
-      matched: {
-        slug: bestMatch.slug,
-        title: bestMatch.title,
-        createdAt: bestMatch.createdAt,
-      },
-    };
+  return false;
+}
+
+async function wouldExceedTopicLimit(seed = {}) {
+  const topicKey = computeTopicKey(seed);
+  if (!topicKey) return false;
+
+  const category = seed.category || null;
+
+  const fp = await RssTopicFingerprint.findOne({
+    key: topicKey,
+    category,
+  }).lean();
+
+  if (!fp) return false;
+
+  const now = Date.now();
+  const lastSeen = fp.lastSeenAt ? new Date(fp.lastSeenAt).getTime() : 0;
+
+  if (!lastSeen || now - lastSeen > TOPIC_WINDOW_MS) {
+    // Window expired → allow again
+    return false;
   }
 
-  return { skip: false };
+  // Inside the active window – do we already have enough articles?
+  return (fp.articleCount || 0) >= TOPIC_MAX_ARTICLES_PER_WINDOW;
+}
+
+// --------------------------------------------------------------
+// PUBLIC API
+// --------------------------------------------------------------
+
+/**
+ * Decide whether we should generate an AI article for this seed.
+ *
+ * Returns:
+ *   { ok: true }
+ * or { ok: false, reason: 'dupe_source' | 'dupe_similar' | 'dupe_topic' }
+ */
+async function shouldGenerateFromSeed(seed = {}) {
+  // 1) Hard dedupe by canonical source URL (TOI link etc.)
+  if (await existsArticleWithCanonicalSource(seed)) {
+    return { ok: false, reason: "dupe_source" };
+  }
+
+  // 2) Fuzzy similarity vs recent articles (same category, last 24h)
+  if (await isTooSimilarToRecentArticles(seed)) {
+    return { ok: false, reason: "dupe_similar" };
+  }
+
+  // 3) Topic fingerprint window
+  if (await wouldExceedTopicLimit(seed)) {
+    return { ok: false, reason: "dupe_topic" };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Mark that we actually generated & saved an article for this seed/topic.
+ * Call this AFTER Article.create / save.
+ */
+async function markTopicUsed(seed = {}, articleId = null) {
+  const topicKey = computeTopicKey(seed);
+  if (!topicKey) return;
+
+  const category = seed.category || null;
+  const now = new Date();
+
+  const update = {
+    $setOnInsert: {
+      firstSeenAt: now,
+    },
+    $set: {
+      lastSeenAt: now,
+    },
+    $inc: {
+      seedCount: 1,
+      articleCount: 1,
+    },
+  };
+
+  if (articleId) {
+    update.$addToSet = { articleIds: articleId };
+  }
+
+  await RssTopicFingerprint.findOneAndUpdate(
+    { key: topicKey, category },
+    update,
+    { upsert: true, new: true }
+  );
+}
+
+/**
+ * Optional helper: mark that we saw the topic in RSS but did NOT generate
+ * an article (skipped due to guard). This keeps seedCount accurate.
+ */
+async function markSeedSeen(seed = {}) {
+  const topicKey = computeTopicKey(seed);
+  if (!topicKey) return;
+
+  const category = seed.category || null;
+  const now = new Date();
+
+  await RssTopicFingerprint.findOneAndUpdate(
+    { key: topicKey, category },
+    {
+      $setOnInsert: {
+        firstSeenAt: now,
+      },
+      $set: {
+        lastSeenAt: now,
+      },
+      $inc: {
+        seedCount: 1,
+      },
+    },
+    { upsert: true }
+  );
 }
 
 module.exports = {
-  shouldSkipAsDuplicate,
+  shouldGenerateFromSeed,
+  markTopicUsed,
+  markSeedSeen,
+  canonicalizeSourceUrl,
 };

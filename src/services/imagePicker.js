@@ -187,9 +187,17 @@ const BRAND_STRONG_TOKENS = new Set([
   "drdo",
   "railway",
   "railways",
-  "indianrailways"
+  "indianrailways",
+
+  // 🏏 Cricket / sports boards (NEW – make BCCI images win clearly)
+  "bcci",
+  "icc",
+  "ipl",
+  "wpl"
 ]);
 
+// subset we want to treat as *extra* strong sports boards
+const SPORTS_BOARD_BRANDS = new Set(["bcci", "icc", "ipl", "wpl"]);
 
 function strongBrandsFrom(meta) {
   const src = `${meta.title || ""} ${meta.summary || ""} ${
@@ -350,6 +358,22 @@ async function searchDriveCandidates(tokens = [], phrases = []) {
 // -----------------------------------------------------------------------------
 // SCORING ENGINE (IMPROVED + BRANDS + RECENCY)
 // -----------------------------------------------------------------------------
+
+// Some extremely generic “news-y” tokens that should score very weakly,
+// so files like "Important-Global-World-Leaders-summit-meeting.png"
+// don't accidentally beat specific files like "BCCI.png".
+const WEAK_MATCH_TOKENS = new Set([
+  "global",
+  "world",
+  "summit",
+  "meeting",
+  "leader",
+  "leaders",
+  "important",
+  "event",
+  "news"
+]);
+
 function scoreFile(f, tokens, phrases, strongNames, strongBrands) {
   const name = f.name.toLowerCase();
   let score = 0;
@@ -370,11 +394,24 @@ function scoreFile(f, tokens, phrases, strongNames, strongBrands) {
 
   // Brand / institution BOOST
   for (const b of strongBrands) {
-    if (name.includes(b)) score += 8;
+    if (name.includes(b)) {
+      // Sports boards like BCCI / ICC / IPL / WPL get a much bigger bump
+      if (SPORTS_BOARD_BRANDS.has(b)) {
+        score += 18; // ✅ strong preference for BCCI-type images
+      } else {
+        score += 8;
+      }
+    }
   }
 
   // Token scoring with downweights
   for (const t of tokens) {
+    // Ultra-generic "summit / meeting / global / world / leaders" → very weak
+    if (WEAK_MATCH_TOKENS.has(t)) {
+      if (name.includes(t)) score += 1;
+      continue;
+    }
+
     if (["energy", "oil", "gas", "geopolitic", "defence", "security"].includes(t)) {
       if (name.includes(t)) score += 1; // generic topics → weak
       continue;

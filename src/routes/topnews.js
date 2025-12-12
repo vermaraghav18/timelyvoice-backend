@@ -42,14 +42,15 @@ async function getCategoryMap() {
 
   const now = Date.now();
   if (now - catCache.ts > 60 * 1000 || catCache.map.size === 0) {
-    const rows = await Category.find({})
-      .select("_id name slug")
-      .lean();
+    const rows = await Category.find({}).select("_id name slug").lean();
 
     const m = new Map();
     for (const c of rows) {
       const id = (c._id && c._id.toString()) || "";
-      m.set(id, { name: c.name || c.slug || "General", slug: c.slug || c.name || "general" });
+      m.set(id, {
+        name: c.name || c.slug || "General",
+        slug: c.slug || c.name || "general",
+      });
     }
     catCache.map = m;
     catCache.ts = now;
@@ -97,6 +98,10 @@ function resolveCategoryLabel(cat, catMap) {
 
 function stripArticleFields(a, catMap) {
   const { imageUrl, imageAlt } = normalizeMedia(a);
+
+  // ✅ NEW: include videoUrl so frontend can render video on TopNews/Home cards
+  const videoUrl = a.videoUrl || "";
+
   return {
     id: a._id,
     title: a.title,
@@ -104,6 +109,7 @@ function stripArticleFields(a, catMap) {
     summary: a.summary || "",
     imageUrl,
     imageAlt,
+    videoUrl, // ✅ NEW
     publishedAt: a.publishedAt,
     author: a.author,
     category: resolveCategoryLabel(a.category, catMap), // <-- always a clean string
@@ -121,18 +127,18 @@ router.get("/", async (req, res, next) => {
     const page = Math.max(1, Number(req.query.page ?? 1));
     const skip = (page - 1) * limit;
 
-   const now = new Date();
+    const now = new Date();
     const q = {
       status: "published",
       publishedAt: { $lte: now },
     };
 
-
     const [catMap, rows] = await Promise.all([
       getCategoryMap(),
       Article.find(q)
         .select(
-          "title slug summary imageUrl imageAlt cover publishedAt updatedAt author category"
+          // ✅ NEW: select videoUrl from Mongo
+          "title slug summary imageUrl imageAlt cover videoUrl publishedAt updatedAt author category"
         )
         .sort({ publishedAt: -1, updatedAt: -1, createdAt: -1 })
         .skip(skip)
