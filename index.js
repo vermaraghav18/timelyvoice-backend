@@ -306,59 +306,63 @@ function clearCache(prefix = '') {
 }
 
 // Bot detection + SSR cache for crawlers
-const BOT_UA =
-  /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i;
+if (false) {
+  const BOT_UA =
+    /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot/i;
 
-function isBot(req) {
-  const ua = String(req.headers['user-agent'] || '');
-  return BOT_UA.test(ua);
-}
+  function isBot(req) {
+    const ua = String(req.headers['user-agent'] || '');
+    return BOT_UA.test(ua);
+  }
 
-// ultra-simple TTL cache for prerendered HTML
-const SSR_CACHE = new Map(); // key -> { html, exp }
-function ssrCacheGet(key) {
-  const hit = SSR_CACHE.get(key);
-  if (!hit) return null;
-  if (hit.exp <= Date.now()) { SSR_CACHE.delete(key); return null; }
-  return hit.html;
-}
-function ssrCacheSet(key, html, ttlMs = 60_000) { // 60s cache
-  SSR_CACHE.set(key, { html, exp: Date.now() + ttlMs });
-}
+  // ultra-simple TTL cache for prerendered HTML
+  const SSR_CACHE = new Map(); // key -> { html, exp }
+  function ssrCacheGet(key) {
+    const hit = SSR_CACHE.get(key);
+    if (!hit) return null;
+    if (hit.exp <= Date.now()) { SSR_CACHE.delete(key); return null; }
+    return hit.html;
+  }
+  function ssrCacheSet(key, html, ttlMs = 60_000) { // 60s cache
+    SSR_CACHE.set(key, { html, exp: Date.now() + ttlMs });
+  }
 
-// --- Serve SSR (server-side rendered) pages to crawlers ---
-app.use(async (req, res, next) => {
-  if (!req.path.startsWith("/article/")) return next();
-  // Try SSR cache for bots early
-  if (isBot(req)) {
-    const slugForCache = req.path.slice("/article/".length);
-    const cached = ssrCacheGet(`ssr:article:${slugForCache}`);
-    if (cached) {
-      res.setHeader('Cache-Control','public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-      return res.status(200).type('html').send(cached);
+  // --- Serve SSR (server-side rendered) pages to crawlers ---
+  app.use(async (req, res, next) => {
+    if (!req.path.startsWith("/article/")) return next();
+
+    // Try SSR cache for bots early
+    if (isBot(req)) {
+      const slugForCache = req.path.slice("/article/".length);
+      const cached = ssrCacheGet(`ssr:article:${slugForCache}`);
+      if (cached) {
+        res.setHeader('Cache-Control','public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+        return res.status(200).type('html').send(cached);
+      }
     }
-  }
-  if (!isBot(req)) return next(); // humans → SPA/front-end
 
-  const slug = req.path.slice("/article/".length);
-  try {
-    // build base from the incoming request host (works locally and in prod)
-    const base = `${req.protocol}://${req.get('host')}`;
-    const url  = `${base}/ssr/article/${encodeURIComponent(slug)}`;
+    if (!isBot(req)) return next(); // humans → SPA/front-end
 
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`SSR fetch ${r.status}`);
-    const html = await r.text();
+    const slug = req.path.slice("/article/".length);
+    try {
+      // build base from the incoming request host (works locally and in prod)
+      const base = `${req.protocol}://${req.get('host')}`;
+      const url  = `${base}/ssr/article/${encodeURIComponent(slug)}`;
 
-    // cache for bots
-    ssrCacheSet(`ssr:article:${slug}`, html, 60_000);
-    res.setHeader('Cache-Control','public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    return res.status(200).type('html').send(html);
-  } catch (err) {
-    console.error("SSR middleware failed:", err.message);
-    return next(); // fallback to SPA
-  }
-});
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`SSR fetch ${r.status}`);
+      const html = await r.text();
+
+      // cache for bots
+      ssrCacheSet(`ssr:article:${slug}`, html, 60_000);
+      res.setHeader('Cache-Control','public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+      return res.status(200).type('html').send(html);
+    } catch (err) {
+      console.error("SSR middleware failed:", err.message);
+      return next(); // fallback to SPA
+    }
+  });
+}
 
 // Admin ads
 app.use("/api/admin/ads", adminAdsRouter);
