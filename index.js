@@ -66,6 +66,8 @@ const historyPageRoutes = require('./src/routes/historyPageRoutes');
 
 // 6) Models registered early
 const Article = require('./src/models/Article');
+const Category = require('./src/models/Category');
+
 const XSource = require('./src/models/XSource');
 const XItem   = require('./src/models/XItem');
 
@@ -78,7 +80,6 @@ const rssTopNewsRouter = require('./src/routes/rss.topnews');
 require('./cron');
 
 // 7) Cron jobs
-require('./cron'); // old RSS / autmotion cron
 const { startAutoNewsCron } = require("./src/cron/autoNewsCron"); // NEW: AI auto-news robot
 
 
@@ -86,23 +87,30 @@ const { startAutoNewsCron } = require("./src/cron/autoNewsCron"); // NEW: AI aut
 const app = express();
 
 // ---------------- Prerender.io integration ----------------
-prerender.set('prerenderToken', process.env.PRERENDER_TOKEN);
+// IMPORTANT: Do NOT enable prerender unless token exists.
+// Otherwise Googlebot gets 403 and indexing dies.
+if (process.env.PRERENDER_TOKEN) {
+  prerender.set('prerenderToken', process.env.PRERENDER_TOKEN);
 
-// Important to ignore static assets and APIs
-prerender.set('whitelisted', ['/']);
-prerender.set('blacklisted', [
-  '^/api',
-  '\\.css$',
-  '\\.js$',
-  '\\.png$',
-  '\\.jpg$',
-  '\\.jpeg$',
-  '\\.svg$',
-  '\\.gif$',
-  '\\.webp$'
-]);
+  prerender.set('whitelisted', ['/']);
+  prerender.set('blacklisted', [
+    '^/api',
+    '\\.css$',
+    '\\.js$',
+    '\\.png$',
+    '\\.jpg$',
+    '\\.jpeg$',
+    '\\.svg$',
+    '\\.gif$',
+    '\\.webp$'
+  ]);
 
-app.use(prerender);
+  app.use(prerender);
+  console.log('[prerender] enabled');
+} else {
+  console.log('[prerender] disabled (PRERENDER_TOKEN missing)');
+}
+
 
 // ✅ Safe static assets mount (won’t crash if frontend/dist doesn’t exist)
 //const distAssets = path.join(__dirname, '../frontend/dist/assets');
@@ -602,21 +610,12 @@ async function bumpRedirectHit(id) {
   try { await Redirect.updateOne({ _id: id }, { $inc: { hits: 1 } }); } catch (_) {}
 }
 
-// Category & Tag
-const catSchema = new mongoose.Schema({
-  name: { type: String, required: true, trim: true, maxlength: 50 },
-  slug: { type: String, required: true, trim: true, unique: true, index: true },
-  description: { type: String, maxlength: 200 },
-  type: { type: String, enum: ['topic','state','city'], default: 'topic', index: true },
-  previousSlugs: { type: [String], default: [] },
-}, { timestamps: true });
 
 const tagSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 40 },
   slug: { type: String, required: true, trim: true, unique: true, index: true }
 }, { timestamps: true });
 
-const Category = mongoose.models.Category || mongoose.model('Category', catSchema);
 const Tag      = mongoose.models.Tag      || mongoose.model('Tag', tagSchema);
 
 // Media
@@ -1094,32 +1093,82 @@ app.get('/api/articles', optionalAuth, async (req, res) => {
   }
 
   // Category filter (case-insensitive, supports string OR object {name, slug})
-  if (catRaw && catRaw.toLowerCase() !== 'all') {
-    const wantLower = String(catRaw).toLowerCase();
-    and.push({
+ // Category filter (supports string, object, ObjectId, and stringified ObjectId)
+if (catRaw && catRaw.toLowerCase() !== 'all') {
+  const wantLower = String(catRaw).trim().toLowerCase();
+  const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // If user passes an ObjectId string directly
+  const looksLikeObjectId = /^[0-9a-fA-F]{24}$/.test(wantLower);
+
+  // Try resolve slug/name -> Category _id
+  let catDoc = null;
+  try {
+    catDoc = await Category.findOne({
       $or: [
-        // category stored as string
-        {
-          $and: [
-            { $expr: { $eq: [ { $type: "$category" }, "string" ] } },
-            { $expr: { $eq: [ { $toLower: "$category" }, wantLower ] } }
-          ]
-        },
-        // category stored as object { name?, slug? }
-        {
-          $and: [
-            { $expr: { $eq: [ { $type: "$category" }, "object" ] } },
-            {
-              $or: [
-                { $expr: { $eq: [ { $toLower: { $ifNull: ["$category.name", ""] } }, wantLower ] } },
-                { $expr: { $eq: [ { $toLower: { $ifNull: ["$category.slug", ""] } }, wantLower ] } }
-              ]
-            }
-          ]
-        }
-      ]
-    });
-  }
+        { slug: new RegExp(`^${esc(wantLower)}$`, 'i') },
+        { name: new RegExp(`^${esc(catRaw)}$`, 'i') },
+      ],
+    }).select('_id name slug');
+  } catch {}
+
+  const resolvedId = catDoc?._id ? String(catDoc._id) : null;
+
+  and.push({
+    $or: [
+      // category stored as string ("Business", "Health", etc.)
+      {
+        $and: [
+          { $expr: { $eq: [{ $type: "$category" }, "string"] } },
+          { $expr: { $eq: [{ $toLower: "$category" }, wantLower] } },
+        ],
+      },
+
+      // category stored as object {name, slug}
+      {
+        $and: [
+          { $expr: { $eq: [{ $type: "$category" }, "object"] } },
+          {
+            $or: [
+              { $expr: { $eq: [{ $toLower: { $ifNull: ["$category.name", ""] } }, wantLower] } },
+              { $expr: { $eq: [{ $toLower: { $ifNull: ["$category.slug", ""] } }, wantLower] } },
+            ],
+          },
+        ],
+      },
+
+      // category stored as real ObjectId -> match resolved Category._id
+      ...(resolvedId
+        ? [{
+            $and: [
+              { $expr: { $eq: [{ $type: "$category" }, "objectId"] } },
+              { $expr: { $eq: ["$category", catDoc._id] } },
+            ],
+          }]
+        : []),
+
+      // category stored as stringified ObjectId -> match resolved id
+      ...(resolvedId
+        ? [{
+            $and: [
+              { $expr: { $eq: [{ $type: "$category" }, "string"] } },
+              { $expr: { $eq: ["$category", resolvedId] } },
+            ],
+          }]
+        : []),
+
+      // if the query itself is an ObjectId string, match it directly too
+      ...(looksLikeObjectId
+        ? [{
+            $and: [
+              { $expr: { $eq: [{ $type: "$category" }, "objectId"] } },
+              { $expr: { $eq: [{ $toString: "$category" }, wantLower] } },
+            ],
+          }]
+        : []),
+    ],
+  });
+}
 
   // Visibility (public users)
   if (!includeAll) {
@@ -1880,12 +1929,16 @@ app.get('/api/public/categories/:slug/articles', async (req, res, next) => {
       ]
     }).lean();
 
-    if (!cat) return res.json({ items: [], total: 0, page, limit });
+    const slugLc = slug.toLowerCase();
 
-    const lcSlug   = String(cat.slug || '').toLowerCase();
-    const lcName   = String(cat.name || '').toLowerCase();
-    const catIdStr = String(cat._id || '');
-    const catObjId = Types.ObjectId.isValid(catIdStr) ? new Types.ObjectId(catIdStr) : null;
+// If Category doc exists, use its slug/name.
+// If not, fall back to the URL slug itself (so "health" matches Article.category = "Health")
+const lcSlug = (cat?.slug ? String(cat.slug) : slugLc).toLowerCase();
+const lcName = (cat?.name ? String(cat.name) : slugLc).toLowerCase();
+
+const catIdStr = cat?._id ? String(cat._id) : '';
+const catObjId =
+  catIdStr && Types.ObjectId.isValid(catIdStr) ? new Types.ObjectId(catIdStr) : null;
 
     // 2) Robust match: slug/name (strings), stringified ObjectId, and true ObjectId
    // 2) Robust match: trims/lowercases strings, supports object {name,slug},
@@ -1945,7 +1998,8 @@ const matchStage = {
             $map: {
               input: { $ifNull: [ "$categories", [] ] },
               as: "c",
-              in: { $toLower: { $trim: { input: "$$c" } } }
+              in: { $toLower: { $trim: { input: { $toString: "$$c" } } } }
+
             }
           }
         ]
@@ -1975,7 +2029,20 @@ const matchStage = {
             $map: {
               input: { $ifNull: [ "$categories", [] ] },
               as: "c",
-              in: { $toLower: { $trim: { input: { $ifNull: [ "$$c.slug", "" ] } } } }
+              in: {
+  $toLower: {
+    $trim: {
+      input: {
+        $cond: [
+          { $eq: [ { $type: "$$c" }, "object" ] },
+          { $toString: { $ifNull: [ "$$c.slug", "" ] } },
+          ""
+        ]
+      }
+    }
+  }
+}
+
             }
           }
         ]
@@ -1989,7 +2056,20 @@ const matchStage = {
             $map: {
               input: { $ifNull: [ "$categories", [] ] },
               as: "c",
-              in: { $toLower: { $trim: { input: { $ifNull: [ "$$c.name", "" ] } } } }
+              in: {
+  $toLower: {
+    $trim: {
+      input: {
+        $cond: [
+          { $eq: [ { $type: "$$c" }, "object" ] },
+          { $toString: { $ifNull: [ "$$c.name", "" ] } },
+          ""
+        ]
+      }
+    }
+  }
+}
+
             }
           }
         ]
@@ -2037,20 +2117,39 @@ const matchStage = {
 
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
     return res.json({
-      category: { id: String(cat._id), name: cat.name, slug: cat.slug, description: cat.description || '' },
-      items,
-      total,
-      page,
-      limit
-    });
+  category: cat
+    ? { id: String(cat._id), name: cat.name, slug: cat.slug, description: cat.description || '' }
+    : { id: null, name: slug, slug: slug, description: '' },
+  items,
+  total,
+  page,
+  limit
+});
+
   } catch (e) {
     return next(e);
   }
 });
 
+function listEndpointsSafe(app) {
+  const out = [];
+  const stack = app?._router?.stack || [];
+
+  for (const layer of stack) {
+    if (!layer?.route) continue;
+    const path = layer.route.path;
+    const methods = Object.keys(layer.route.methods || {}).map(m => m.toUpperCase());
+    out.push({ path, methods });
+  }
+
+  out.sort((a, b) => a.path.localeCompare(b.path));
+  return out;
+}
+
 app.get('/api/_debug/endpoints', (_req, res) => {
-  res.json(listEndpoints(app));
+  res.json(listEndpointsSafe(app));
 });
+
 
 // 404 for /api/* (keep SPA routes to front-end)
 app.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
