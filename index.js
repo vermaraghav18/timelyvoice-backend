@@ -86,10 +86,249 @@ const { startAutoNewsCron } = require("./src/cron/autoNewsCron"); // NEW: AI aut
 // 9) App init
 const app = express();
 
+/* ================== SSR FOR BOTS (MUST BE REGISTERED EARLY) ================== */
+
+const BOT_UA =
+  /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot|Yandex|Baiduspider|Slurp|Mediapartners-Google/i;
+
+function isBot(req) {
+  const ua = String(req.headers["user-agent"] || "");
+  if (String(req.query?._bot || "") === "1") return true; // force bot mode
+  return BOT_UA.test(ua);
+}
+
+// ultra-simple TTL cache for SSR HTML
+const SSR_CACHE = new Map(); // key -> { html, exp }
+function ssrCacheGet(key) {
+  const hit = SSR_CACHE.get(key);
+  if (!hit) return null;
+  if (hit.exp <= Date.now()) {
+    SSR_CACHE.delete(key);
+    return null;
+  }
+  return hit.html;
+}
+function ssrCacheSet(key, html, ttlMs = 60_000) {
+  SSR_CACHE.set(key, { html, exp: Date.now() + ttlMs });
+}
+
+// minimal HTML escaping
+function escHtml(s = "") {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+// very light “text from HTML” for meta/description fallback
+function stripHtml(html = "") {
+  return String(html).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// OG helpers (single source of truth)
+function isCloudinary(url = "") {
+  return /res\.cloudinary\.com/i.test(String(url || ""));
+}
+
+function isBadOg(url = "") {
+  const u = String(url || "").trim();
+  if (!u) return true;
+
+  // reject Google Drive view links (NOT direct image)
+  if (/drive\.google\.com\/file\/d\//i.test(u)) return true;
+  if (/drive\.google\.com/i.test(u) && /\/view(\?|$)/i.test(u)) return true;
+
+  // accept Cloudinary always
+  if (isCloudinary(u)) return false;
+
+  // accept common direct image extensions
+  if (/\.(png|jpe?g|webp|gif|avif)(\?|#|$)/i.test(u)) return false;
+
+  // everything else is unsafe for OG
+  return true;
+}
+
+function buildCloudinaryOgFromPublicId(publicId) {
+  try {
+    if (!publicId) return "";
+    // cloudinary must already be configured in your file (you already use it elsewhere)
+    return cloudinary.url(publicId, {
+      width: 1200,
+      height: 630,
+      crop: "fill",
+      format: "jpg",
+      secure: true,
+    });
+  } catch {
+    return "";
+  }
+}
+
+// Build SSR HTML for an article slug
+async function renderArticleHtml({ slug }) {
+  const now = new Date();
+
+  const a = await Article.findOne({
+    slug,
+    status: "published",
+    $or: [
+      { publishAt: { $lte: now } },
+      { publishedAt: { $lte: now } },
+      { publishAt: { $exists: false }, publishedAt: { $exists: false } },
+    ],
+  }).lean();
+
+  if (!a) return null;
+
+  // IMPORTANT: canonical MUST be timelyvoice.com (not backend host)
+  const siteBase = "https://timelyvoice.com";
+  const canonical = `${siteBase.replace(/\/+$/, "")}/article/${encodeURIComponent(slug)}`;
+
+  const title = a.metaTitle || a.title || "Article";
+  const description =
+    a.metaDesc ||
+    a.summary ||
+    stripHtml(a.body || "").slice(0, 180) ||
+    "Read the latest update.";
+
+  // ✅ Cloudinary-first OG (never Drive view links)
+  const ogFromPublicId = buildCloudinaryOgFromPublicId(a.imagePublicId);
+  const ogImage =
+    (!isBadOg(ogFromPublicId) ? ogFromPublicId : "") ||
+    (!isBadOg(a.ogImage) ? a.ogImage : "") ||
+    (!isBadOg(a.imageUrl) ? a.imageUrl : "") ||
+    `${siteBase.replace(/\/+$/, "")}/logo-192.png`;
+
+  const imageAlt = a.imageAlt || a.title || "Timely Voice";
+  const publishedTime = a.publishedAt || a.publishAt || a.createdAt || new Date();
+  const authorName = a.author || "Timely Voice";
+  const categoryName =
+    (typeof a.category === "string" && a.category) ||
+    (a.category && typeof a.category === "object" && (a.category.name || a.category.slug)) ||
+    "News";
+
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@type": "NewsArticle",
+    mainEntityOfPage: { "@type": "WebPage", "@id": canonical },
+    headline: title,
+    description,
+    image: [ogImage],
+    datePublished: new Date(publishedTime).toISOString(),
+    dateModified: new Date(a.updatedAt || publishedTime).toISOString(),
+    author: [{ "@type": "Person", name: authorName }],
+    publisher: {
+      "@type": "Organization",
+      name: "Timely Voice",
+      logo: {
+        "@type": "ImageObject",
+        url: `${siteBase.replace(/\/+$/, "")}/logo-192.png`,
+      },
+    },
+  };
+
+  const bodyText = stripHtml(a.body || "");
+  const bodyPreview = bodyText ? escHtml(bodyText) : escHtml(a.summary || "");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${escHtml(title)}</title>
+
+  <meta name="description" content="${escHtml(description)}"/>
+  <link rel="canonical" href="${escHtml(canonical)}"/>
+
+  <meta property="og:type" content="article"/>
+  <meta property="og:title" content="${escHtml(title)}"/>
+  <meta property="og:description" content="${escHtml(description)}"/>
+  <meta property="og:url" content="${escHtml(canonical)}"/>
+  <meta property="og:image" content="${escHtml(ogImage)}"/>
+  <meta property="og:image:alt" content="${escHtml(imageAlt)}"/>
+
+  <meta name="twitter:card" content="summary_large_image"/>
+  <meta name="twitter:title" content="${escHtml(title)}"/>
+  <meta name="twitter:description" content="${escHtml(description)}"/>
+  <meta name="twitter:image" content="${escHtml(ogImage)}"/>
+
+  <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1"/>
+
+  <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
+
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.6;color:#111}
+    .wrap{max-width:820px;margin:0 auto}
+    h1{font-size:30px;line-height:1.2;margin:0 0 12px}
+    .meta{color:#555;font-size:14px;margin-bottom:18px}
+    .summary{font-size:18px;color:#222;margin:16px 0 18px}
+    .content{white-space:pre-wrap}
+    .img{max-width:100%;border-radius:12px;margin:16px 0}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>${escHtml(a.title || title)}</h1>
+    <div class="meta">
+      ${escHtml(authorName)} • ${escHtml(categoryName)} • ${escHtml(new Date(publishedTime).toDateString())}
+    </div>
+    ${ogImage ? `<img class="img" src="${escHtml(ogImage)}" alt="${escHtml(imageAlt)}"/>` : ""}
+    ${a.summary ? `<div class="summary">${escHtml(a.summary)}</div>` : ""}
+    <div class="content">${bodyPreview}</div>
+  </div>
+</body>
+</html>`;
+}
+
+/**
+ * ✅ REAL SSR ENDPOINT (Vercel rewrite targets this)
+ * /ssr/article/:slug -> returns HTML
+ */
+app.get("/ssr/article/:slug", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").trim();
+    if (!slug) return res.status(400).type("text/plain").send("Missing slug");
+
+    const cacheKey = `ssr:article:${slug}`;
+    const cached = ssrCacheGet(cacheKey);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+      return res.status(200).type("html").send(cached);
+    }
+
+    const html = await renderArticleHtml({ slug });
+    if (!html) return res.status(404).type("text/plain").send("Not found");
+
+    ssrCacheSet(cacheKey, html, 60_000);
+    res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+    return res.status(200).type("html").send(html);
+  } catch (e) {
+    console.error("GET /ssr/article/:slug failed:", e?.message || e);
+    return res.status(500).type("text/plain").send("SSR error");
+  }
+});
+
+/**
+ * Debug: confirm SSR route exists on deployed server
+ */
+app.get("/api/_debug/ssr", (_req, res) => {
+  res.json({
+    ok: true,
+    hasSsrRoute: true,
+    versionHint: "SSR_DEPLOY_CHECK__DEC_14__A7F3", // 👈 change this string
+  });
+});
+
+/* ================== END SSR ================== */
+
+
+
 // ---------------- Prerender.io integration ----------------
 // IMPORTANT: Do NOT enable prerender unless token exists.
 // Otherwise Googlebot gets 403 and indexing dies.
-if (process.env.PRERENDER_TOKEN) {
+if (false && process.env.PRERENDER_TOKEN) {
   prerender.set('prerenderToken', process.env.PRERENDER_TOKEN);
 
   prerender.set('whitelisted', ['/']);
@@ -108,7 +347,7 @@ if (process.env.PRERENDER_TOKEN) {
   app.use(prerender);
   console.log('[prerender] enabled');
 } else {
-  console.log('[prerender] disabled (PRERENDER_TOKEN missing)');
+  console.log('[prerender] disabled (SSR handles bots)');
 }
 
 
@@ -304,214 +543,6 @@ function clearCache(prefix = '') {
     if (!prefix || key.startsWith(prefix)) cache.delete(key);
   }
 }
-
-// Bot detection + SSR cache for crawlers
-const BOT_UA =
-  /Googlebot|AdsBot|bingbot|DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|Discordbot|Yandex|Baiduspider|Slurp|Mediapartners-Google/i;
-
-function isBot(req) {
-  const ua = String(req.headers["user-agent"] || "");
-  // allow forcing bot mode for testing
-  if (String(req.query?._bot || "") === "1") return true;
-  return BOT_UA.test(ua);
-}
-
-// ultra-simple TTL cache for SSR HTML
-const SSR_CACHE = new Map(); // key -> { html, exp }
-function ssrCacheGet(key) {
-  const hit = SSR_CACHE.get(key);
-  if (!hit) return null;
-  if (hit.exp <= Date.now()) {
-    SSR_CACHE.delete(key);
-    return null;
-  }
-  return hit.html;
-}
-function ssrCacheSet(key, html, ttlMs = 60_000) {
-  SSR_CACHE.set(key, { html, exp: Date.now() + ttlMs });
-}
-
-// minimal HTML escaping
-function escHtml(s = "") {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-// very light “text from HTML” for meta/description fallback
-function stripHtml(html = "") {
-  return String(html).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
-}
-
-// Build SSR HTML for an article slug
-async function renderArticleHtml({ slug, req }) {
-  // Only published for bots
-  const now = new Date();
-  const a = await Article.findOne({
-    slug,
-    status: "published",
-    $or: [
-      { publishAt: { $lte: now } },
-      { publishedAt: { $lte: now } },
-      { publishAt: { $exists: false }, publishedAt: { $exists: false } },
-    ],
-  })
-    .lean()
-    .exec();
-
-  if (!a) return null;
-
-  const base = `${req.protocol}://${req.get("host")}`.replace(/\/+$/, "");
-  const canonical = `${base}/article/${encodeURIComponent(slug)}`;
-
-  const title = a.metaTitle || a.title || "Article";
-  const description =
-    a.metaDesc ||
-    a.summary ||
-    stripHtml(a.body || "").slice(0, 180) ||
-    "Read the latest update.";
-
-  // images
-  const ogImage =
-    a.ogImage ||
-    a.imageUrl ||
-    `${base}/logo-192.png`;
-
-  const imageAlt = a.imageAlt || a.title || "Timely Voice";
-
-  const publishedTime =
-    a.publishedAt || a.publishAt || a.createdAt || new Date();
-
-  const authorName = a.author || "Timely Voice";
-  const categoryName =
-    (typeof a.category === "string" && a.category) ||
-    (a.category && typeof a.category === "object" && (a.category.name || a.category.slug)) ||
-    "News";
-
-  // JSON-LD (NewsArticle)
-  const jsonLd = {
-    "@context": "https://schema.org",
-    "@type": "NewsArticle",
-    mainEntityOfPage: {
-      "@type": "WebPage",
-      "@id": canonical,
-    },
-    headline: title,
-    description,
-    image: [ogImage],
-    datePublished: new Date(publishedTime).toISOString(),
-    dateModified: new Date(a.updatedAt || publishedTime).toISOString(),
-    author: [{ "@type": "Person", name: authorName }],
-    publisher: {
-      "@type": "Organization",
-      name: "Timely Voice",
-      logo: {
-        "@type": "ImageObject",
-        url: `${base}/logo-192.png`,
-      },
-    },
-  };
-
-  // Body: keep it simple for bots (still readable)
-  const bodyText = stripHtml(a.body || "");
-  const bodyPreview = bodyText ? escHtml(bodyText) : escHtml(a.summary || "");
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>${escHtml(title)}</title>
-
-  <meta name="description" content="${escHtml(description)}"/>
-  <link rel="canonical" href="${escHtml(canonical)}"/>
-
-  <meta property="og:type" content="article"/>
-  <meta property="og:title" content="${escHtml(title)}"/>
-  <meta property="og:description" content="${escHtml(description)}"/>
-  <meta property="og:url" content="${escHtml(canonical)}"/>
-  <meta property="og:image" content="${escHtml(ogImage)}"/>
-  <meta property="og:image:alt" content="${escHtml(imageAlt)}"/>
-
-  <meta name="twitter:card" content="summary_large_image"/>
-  <meta name="twitter:title" content="${escHtml(title)}"/>
-  <meta name="twitter:description" content="${escHtml(description)}"/>
-  <meta name="twitter:image" content="${escHtml(ogImage)}"/>
-
-  <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1"/>
-
-  <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
-
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.6;color:#111}
-    .wrap{max-width:820px;margin:0 auto}
-    h1{font-size:30px;line-height:1.2;margin:0 0 12px}
-    .meta{color:#555;font-size:14px;margin-bottom:18px}
-    .summary{font-size:18px;color:#222;margin:16px 0 18px}
-    .content{white-space:pre-wrap}
-    .img{max-width:100%;border-radius:12px;margin:16px 0}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>${escHtml(a.title || title)}</h1>
-    <div class="meta">
-      ${escHtml(authorName)} • ${escHtml(categoryName)} • ${escHtml(new Date(publishedTime).toDateString())}
-    </div>
-    ${ogImage ? `<img class="img" src="${escHtml(ogImage)}" alt="${escHtml(imageAlt)}"/>` : ""}
-    ${a.summary ? `<div class="summary">${escHtml(a.summary)}</div>` : ""}
-    <div class="content">${bodyPreview}</div>
-  </div>
-</body>
-</html>`;
-}
-
-/**
- * ✅ REAL SSR ENDPOINT (THIS IS WHAT YOUR vercel.json REWRITE TARGETS)
- * /ssr/article/:slug  -> returns HTML for bots
- */
-app.get("/ssr/article/:slug", async (req, res) => {
-  try {
-    const slug = String(req.params.slug || "").trim();
-    if (!slug) return res.status(400).type("text/plain").send("Missing slug");
-
-    const cacheKey = `ssr:article:${slug}`;
-    const cached = ssrCacheGet(cacheKey);
-    if (cached) {
-      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
-      return res.status(200).type("html").send(cached);
-    }
-
-    const html = await renderArticleHtml({ slug, req });
-    if (!html) {
-      // IMPORTANT: keep it a true 404 for missing article slug
-      return res.status(404).type("text/plain").send("Not found");
-    }
-
-    ssrCacheSet(cacheKey, html, 60_000);
-    res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
-    return res.status(200).type("html").send(html);
-  } catch (e) {
-    console.error("GET /ssr/article/:slug failed:", e?.message || e);
-    return res.status(500).type("text/plain").send("SSR error");
-  }
-});
-
-/**
- * Optional safety:
- * If a bot hits the backend at /article/:slug (not via Vercel), redirect it to SSR.
- */
-app.use((req, res, next) => {
-  if (!req.path.startsWith("/article/")) return next();
-  if (!isBot(req)) return next();
-
-  const slug = req.path.slice("/article/".length);
-  res.setHeader("Location", `/ssr/article/${encodeURIComponent(slug)}`);
-  return res.status(308).end();
-});
 
 // Admin ads
 app.use("/api/admin/ads", adminAdsRouter);
