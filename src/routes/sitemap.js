@@ -73,25 +73,28 @@ async function buildAllUrls(origin) {
   // Articles (only published + visible by schedule)
   const now = new Date();
 
-const articles = await Models.Article.find(
-  {
-    status: 'published',
-    // treat publishedAt as the real publish time
-    $or: [
-      { publishedAt: { $lte: now } },
-      { publishedAt: { $exists: false } },
-      { publishedAt: null },
-    ],
-  },
-  { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
-)
-  .sort({ publishedAt: -1, updatedAt: -1, _id: -1 })
-  .lean();
+  const articles = await Models.Article.find(
+    {
+      status: 'published',
+      // treat publishedAt as the real publish time
+      $or: [
+        { publishedAt: { $lte: now } },
+        { publishedAt: { $exists: false } },
+        { publishedAt: null },
+      ],
+    },
+    { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
+  )
+    .sort({ publishedAt: -1, updatedAt: -1, _id: -1 })
+    .lean();
 
-   // Core urls (homepage + key static pages)
+  // Core urls (homepage + key static pages)
   const core = [
-    // Home
+    // Home (SPA is fine to include; discovery is handled by /news)
     { loc: origin, changefreq: 'hourly', priority: '1.0' },
+
+    // ✅ Crawl/discovery hub (STATIC HTML on Vercel)
+    { loc: `${origin}/news`,            changefreq: 'hourly', priority: '0.95' },
 
     // Key sections
     { loc: `${origin}/top-news`,        changefreq: 'hourly', priority: '0.9' },
@@ -105,7 +108,6 @@ const articles = await Models.Article.find(
     { loc: `${origin}/terms`,           changefreq: 'yearly', priority: '0.3' },
     { loc: `${origin}/advertising`,     changefreq: 'yearly', priority: '0.3' },
   ];
-
 
   // Categories -> /category/:slug
   const catUrls = categories.map((c) => ({
