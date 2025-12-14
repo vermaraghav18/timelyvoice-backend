@@ -2437,6 +2437,66 @@ app.get('/api/_debug/endpoints', (_req, res) => {
   res.json(listEndpointsSafe(app));
 });
 
+// ✅ Canonical slug reader (KEEP this endpoint as the source of truth)
+app.get('/api/articles/slug/:slug', optionalAuth, async (req, res) => {
+  try {
+    const isAdmin = req.user?.role === 'admin';
+    const slug = String(req.params.slug || '').trim();
+
+    if (!slug) return res.status(400).json({ error: 'Missing slug' });
+
+    const filter = { slug };
+
+    // public visibility rules
+    if (!isAdmin) {
+      filter.status = 'published';
+      const now = new Date();
+      filter.$or = [
+        { publishAt: { $lte: now } },
+        { publishedAt: { $lte: now } },
+        { publishAt: { $exists: false }, publishedAt: { $exists: false } },
+      ];
+    }
+
+    const a = await Article.findOne(filter).lean();
+    if (!a) return res.status(404).json({ error: 'Not found' });
+
+    return res.json({ ...a, id: a._id, publishedAt: a.publishedAt });
+  } catch (e) {
+    console.error('GET /api/articles/slug/:slug failed:', e?.message || e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
+// ✅ SAFE universal resolver:
+// /api/articles/<something>
+// - if <something> is ObjectId -> return article by id
+// - else -> 308 redirect to canonical slug endpoint
+app.get('/api/articles/:key', optionalAuth, async (req, res) => {
+  try {
+    const key = String(req.params.key || '').trim();
+    if (!key) return res.status(400).json({ error: 'Missing key' });
+
+    // If it's a Mongo ObjectId -> treat as id
+    const isObjectId = /^[0-9a-fA-F]{24}$/.test(key);
+
+    if (isObjectId) {
+      const a = await Article.findById(key).lean();
+      if (!a) return res.status(404).json({ error: 'Not found' });
+      return res.json({ ...a, id: a._id, publishedAt: a.publishedAt });
+    }
+
+    // Otherwise treat it as a slug -> redirect to canonical
+    res.setHeader('Location', `/api/articles/slug/${encodeURIComponent(key)}`);
+    return res.status(308).end();
+  } catch (e) {
+    console.error('GET /api/articles/:key failed:', e?.message || e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
 
 // 404 for /api/* (keep SPA routes to front-end)
 app.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
