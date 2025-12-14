@@ -1651,52 +1651,6 @@ const mapped = visibleItems.map(a => ({
   });
 });
 
-// read by id (ObjectId only) — prevents slugs being treated as ids
-app.get('/api/articles/:id([0-9a-fA-F]{24})', async (req, res) => {
-  try {
-    const a = await Article.findById(req.params.id).lean();
-    if (!a) return res.status(404).json({ error: 'Not found' });
-    res.json({ ...a, id: a._id, publishedAt: a.publishedAt });
-  } catch {
-    res.status(400).json({ error: 'Bad id' });
-  }
-});
-
-// read by slug with redirects (public rules; admin token can see drafts)
-app.get('/api/articles/slug/:slug', optionalAuth, async (req, res) => {
-  const isAdmin = req.user?.role === 'admin';
-  const filter = { slug: req.params.slug };
-
-  if (!isAdmin) {
-    filter.status = 'published';
-    const now = new Date();
-    filter.$or = [
-      { publishAt:   { $lte: now } },
-      { publishedAt: { $lte: now } },
-      { publishAt:   { $exists: false }, publishedAt: { $exists: false } }
-    ];
-  }
-
-  const a = await Article.findOne(filter).lean();
-
-  if (!a) {
-    // slug normalization redirect you already have (keep your existing logic here)
-    // ... (keep the rest of your current handler exactly as-is)
-    return res.status(404).json({ error: 'Not found' });
-  }
-
-  // ... keep the rest of your current handler exactly as-is ...
-  res.json({ ...a, id: a._id, publishedAt: a.publishedAt });
-});
-
-// ✅ SPA-friendly alias: /api/articles/<slug> → redirects to canonical slug endpoint
-app.get('/api/articles/:slug', optionalAuth, (req, res) => {
-  res.setHeader(
-    'Location',
-    `/api/articles/slug/${encodeURIComponent(req.params.slug)}`
-  );
-  return res.status(308).end();
-});
 
 // create
 app.post('/api/articles', auth, async (req, res) => {
