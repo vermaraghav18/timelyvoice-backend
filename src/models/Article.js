@@ -52,6 +52,10 @@ videoUrl: { type: String, default: null },
   metaTitle:   { type: String, default: '' },
   metaDesc:    { type: String, default: '' },
 
+  // ✅ NEW: keep Cloudinary public_id + original source (Drive)
+  videoPublicId: { type: String, default: '' },
+  videoSourceUrl: { type: String, default: '' },
+
   // Other
   readingTime: { type: Number, default: 0 },
 

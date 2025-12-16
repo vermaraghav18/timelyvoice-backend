@@ -3,7 +3,11 @@
 const Article = require('../models/Article');
 const { buildImageVariants } = require('../services/imageVariants');
 const { decideAndAttach } = require('../services/imageStrategy');
-const { uploadDriveImageToCloudinary } = require('../services/googleDriveUploader');
+const {
+  uploadDriveImageToCloudinary,
+  uploadDriveVideoToCloudinary,
+} = require('../services/googleDriveUploader');
+
 const { chooseHeroImage } = require('../services/imagePicker');
 const slugify = require('slugify');
 
@@ -34,11 +38,7 @@ function isPlaceholderPublicId(pid = '') {
       'news-images/defaults/fallback-hero').toLowerCase();
 
   if (s === def) return true;
-  return (
-    s.includes('placeholder') ||
-    s.includes('example') ||
-    s === 'news/default'
-  );
+  return s.includes('placeholder') || s.includes('example') || s === 'news/default';
 }
 
 function ensureSlug(a) {
@@ -79,6 +79,27 @@ function finalizeImageFields(article) {
   if (!article.imageAlt) {
     article.imageAlt = article.title || 'News image';
   }
+}
+
+// ✅ VIDEO helper: Drive URL → Cloudinary video URL
+async function maybeUploadDriveVideo(article) {
+  if (typeof article.videoUrl !== 'string') return;
+
+  const raw = article.videoUrl.trim();
+  if (!raw) return;
+
+  // Only convert Google Drive links
+  if (!raw.includes('drive.google.com')) return;
+
+  // Keep original (optional but useful)
+  article.videoSourceUrl = raw;
+
+  const uploadedVideo = await uploadDriveVideoToCloudinary(raw, {
+    folder: process.env.CLOUDINARY_VIDEO_FOLDER || 'news-videos',
+  });
+
+  article.videoPublicId = uploadedVideo.public_id;
+  article.videoUrl = uploadedVideo.secure_url;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -136,6 +157,9 @@ exports.createOne = async (req, res) => {
       article.imagePublicId = uploaded.public_id;
       article.imageUrl = uploaded.secure_url;
     }
+
+    // ✅ VIDEO: If admin provides Drive video URL, upload to Cloudinary and store Cloudinary URL
+    await maybeUploadDriveVideo(article);
 
     finalizeImageFields(article);
 
@@ -206,6 +230,9 @@ exports.importMany = async (req, res) => {
           article.imageUrl = uploaded.secure_url;
         }
 
+        // ✅ VIDEO: If admin provides Drive video URL, upload to Cloudinary and store Cloudinary URL
+        await maybeUploadDriveVideo(article);
+
         finalizeImageFields(article);
 
         const saved = await Article.create(article);
@@ -274,6 +301,7 @@ exports.previewMany = async (req, res) => {
         article.imageUrl = uploaded.secure_url;
       }
 
+      // NOTE: We do NOT upload video in previewMany (keep preview fast + cheap)
       finalizeImageFields(article);
 
       previews.push({

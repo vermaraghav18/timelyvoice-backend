@@ -128,10 +128,7 @@ async function uploadDriveFileToCloudinary(fileId) {
     );
 
     await new Promise((resolve, reject) => {
-      response.data
-        .on('end', resolve)
-        .on('error', reject)
-        .pipe(dest);
+      response.data.on('end', resolve).on('error', reject).pipe(dest);
     });
 
     const uploaded = await cloudinary.uploader.upload(destPath, {
@@ -308,7 +305,8 @@ function deriveCloudinaryPublicIdFromUrl(url = '') {
 
     let i = 0;
     // skip transformation segments (contain commas or colon)
-    while (i < segs.length && (segs[i].includes(',') || segs[i].includes(':'))) i++;
+    while (i < segs.length && (segs[i].includes(',') || segs[i].includes(':')))
+      i++;
     // skip version like v12345
     if (i < segs.length && /^v\d+$/i.test(segs[i])) i++;
 
@@ -349,8 +347,6 @@ router.post('/', async (req, res, next) => {
 
       for (const key of scrubKeys) {
         if (Object.prototype.hasOwnProperty.call(req.body, key)) {
-          // Optional debug:
-          // console.log('[admin.create] dropping incoming field on create:', key, 'value=', req.body[key]);
           delete req.body[key];
         }
       }
@@ -390,12 +386,14 @@ router.post('/import-image-from-url', async (req, res) => {
       });
     }
 
-    // If you want uploads-from-URL here, wire it back to lib/cloudinary uploader.
     return res
       .status(400)
       .json({ error: 'non_cloudinary_url_not_supported_in_dev_mode' });
   } catch (err) {
-    console.error('[admin.articles] import-image-from-url failed', err?.message || err);
+    console.error(
+      '[admin.articles] import-image-from-url failed',
+      err?.message || err
+    );
     return res.status(500).json({ error: 'upload_failed' });
   }
 });
@@ -413,7 +411,7 @@ router.get('/drafts', async (req, res) => {
 
     const rawDrafts = await Article.find(q)
       .select(
-        '_id title category slug status summary imageUrl imagePublicId createdAt updatedAt videoUrl' // + videoUrl
+        '_id title category slug status summary imageUrl imagePublicId createdAt updatedAt videoUrl'
       )
       .sort({ createdAt: -1 })
       .limit(200)
@@ -456,7 +454,6 @@ router.get('/drafts', async (req, res) => {
       categoriesMapByName
     );
     const drafts = normalizedDrafts.map((a) => {
-      // ensure draft imageUrl never exposes "leave it empty"
       const clean = sanitizeImageUrl(a.imageUrl);
       const bestPid = a.imagePublicId || DEFAULT_PID;
       const imageUrl =
@@ -528,13 +525,11 @@ router.get('/', async (req, res) => {
     const perPage = Math.max(1, Math.min(200, parseInt(limit, 10) || 20));
     const skip = (pageNum - 1) * perPage;
 
-    // NEW: fetch a larger pool, then sort drafts-first in JS, then paginate
     const MAX_LIST = 1000;
 
     const [allItems, total] = await Promise.all([
       Article.find(query)
         .select(
-          // ⬇⬇ include body + sourceUrl + videoUrl
           '_id title slug status category summary body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
         )
         .sort({ updatedAt: -1, createdAt: -1 })
@@ -548,38 +543,30 @@ router.get('/', async (req, res) => {
       Article.countDocuments(query),
     ]);
 
-    // Helper to choose a date for ordering
     function getSortDate(doc) {
       const candidate =
         (doc.publishedAt && new Date(doc.publishedAt)) ||
         (doc.updatedAt && new Date(doc.updatedAt)) ||
         (doc.createdAt && new Date(doc.createdAt));
-      if (!candidate || Number.isNaN(candidate.getTime())) {
-        return new Date(0);
-      }
+      if (!candidate || Number.isNaN(candidate.getTime())) return new Date(0);
       return candidate;
     }
 
-    // Drafts first, then Published (or other) with newest first inside each group
     const sorted = (allItems || []).slice().sort((a, b) => {
       const aStatus = (a.status || '').toString().toLowerCase();
       const bStatus = (b.status || '').toString().toLowerCase();
       const aIsDraft = !aStatus || aStatus === 'draft';
       const bIsDraft = !bStatus || bStatus === 'draft';
 
-      if (aIsDraft !== bIsDraft) {
-        return aIsDraft ? -1 : 1; // drafts come first
-      }
+      if (aIsDraft !== bIsDraft) return aIsDraft ? -1 : 1;
 
       const da = getSortDate(a);
       const db = getSortDate(b);
-      return db - da; // newer first
+      return db - da;
     });
 
-    // Apply pagination after status-aware sorting
     const paged = sorted.slice(skip, skip + perPage);
 
-    // normalize categories
     const idSet = new Set();
     const nameSet = new Set();
     for (const it of paged) {
@@ -617,15 +604,12 @@ router.get('/', async (req, res) => {
     );
 
     const items = normalized.map((a) => {
-      // Fix the admin "Image URL (quick)" display:
-      // if imageUrl is "leave it empty", replace with real default hero URL
       const cleaned = sanitizeImageUrl(a.imageUrl);
       const bestPid = a.imagePublicId || DEFAULT_PID;
 
       const imageUrl =
         cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
 
-      // NEW: always send a useful imageAlt back to the admin UI
       const imageAlt = a.imageAlt || a.title || 'News image';
 
       return {
@@ -657,7 +641,6 @@ router.get('/:id', async (req, res) => {
     const items = normalizeArticlesWithCategories([raw]);
     const a = items[0];
 
-    // Also sanitize here so edit-form never sees "leave it empty"
     const cleaned = sanitizeImageUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
@@ -696,7 +679,10 @@ router.patch('/:id', async (req, res) => {
       'author',
       'year',
       'era',
-      'videoUrl', // NEW
+      'videoUrl',
+      // ✅ NEW:
+      'videoPublicId',
+      'videoSourceUrl',
     ];
 
     const patch = {};
@@ -711,7 +697,6 @@ router.patch('/:id', async (req, res) => {
       patch.publishedAt = new Date();
     }
 
-    // Clean up any "leave it empty" / placeholder values coming from the UI
     if (patch.imageUrl !== undefined) {
       const cleaned = sanitizeImageUrl(patch.imageUrl);
       if (!cleaned || isPlaceholderUrl(cleaned)) {
@@ -760,7 +745,6 @@ router.patch('/:id', async (req, res) => {
           if (uploaded) {
             merged.imagePublicId = uploaded.publicId;
             merged.imageUrl = uploaded.url;
-            // also update patch so later logic skips deriveCloudinaryPublicIdFromUrl
             patch.imagePublicId = uploaded.publicId;
             patch.imageUrl = uploaded.url;
           }
@@ -768,6 +752,53 @@ router.patch('/:id', async (req, res) => {
       } catch (err) {
         console.error(
           '[admin.articles] manual Drive image override failed:',
+          err.message || err
+        );
+      }
+    }
+
+    // ✅ NEW: if videoUrl is a Google Drive link, convert it to Cloudinary video
+    if (
+      merged.videoUrl &&
+      typeof merged.videoUrl === 'string' &&
+      merged.videoUrl.includes('drive.google.com')
+    ) {
+      try {
+        const fileId = extractDriveFileId(merged.videoUrl);
+        if (fileId) {
+          // stream Drive file → Cloudinary video
+          const destPath = path.join(TEMP_DIR, `${fileId}.video`);
+          const dest = fs.createWriteStream(destPath);
+
+          const response = await drive.files.get(
+            { fileId, alt: 'media' },
+            { responseType: 'stream' }
+          );
+
+          await new Promise((resolve, reject) => {
+            response.data.on('end', resolve).on('error', reject).pipe(dest);
+          });
+
+          const uploaded = await cloudinary.uploader.upload(destPath, {
+            folder: process.env.CLOUDINARY_VIDEO_FOLDER || 'news-videos/manual',
+            resource_type: 'video',
+          });
+
+          try {
+            if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+          } catch (_) {}
+
+          merged.videoSourceUrl = merged.videoUrl;
+          merged.videoPublicId = uploaded.public_id;
+          merged.videoUrl = uploaded.secure_url;
+
+          patch.videoSourceUrl = merged.videoSourceUrl;
+          patch.videoPublicId = merged.videoPublicId;
+          patch.videoUrl = merged.videoUrl;
+        }
+      } catch (err) {
+        console.error(
+          '[admin.articles] Drive video override failed:',
           err.message || err
         );
       }
@@ -813,7 +844,10 @@ router.patch('/:id', async (req, res) => {
       'thumbImage',
       'year',
       'era',
-      'videoUrl', // NEW
+      'videoUrl',
+      // ✅ NEW:
+      'videoPublicId',
+      'videoSourceUrl',
     ];
     const toSave = {};
     for (const k of toSaveKeys) {
@@ -947,7 +981,6 @@ router.post('/:id/publish', async (req, res) => {
 
 // ────────────────────────────────────────────────────────────────────────────────
 // AI IMAGE — POST /api/admin/articles/:id/ai-image
-// Generate + attach an AI hero image (Gemini/OpenRouter) and return updated URLs
 router.post('/:id/ai-image', async (req, res) => {
   try {
     if (process.env.AI_IMAGE_ENABLED === 'false') {

@@ -113,7 +113,52 @@ async function uploadDriveImageToCloudinary(fileIdOrUrl, options = {}) {
   });
 }
 
+
+async function uploadDriveVideoToCloudinary(fileIdOrUrl, options = {}) {
+  if (!drive) {
+    throw new Error("Google Drive not initialized (missing credentials)");
+  }
+
+  const fileId = extractDriveFileId(fileIdOrUrl);
+  if (!fileId) {
+    throw new Error("Could not extract Google Drive file id from input");
+  }
+
+  const folder = options.folder || process.env.CLOUDINARY_VIDEO_FOLDER || "news-videos";
+
+  const res = await drive.files.get(
+    { fileId, alt: "media" },
+    { responseType: "stream" }
+  );
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        resource_type: "video",
+      },
+      (err, result) => {
+        if (err) {
+          console.error("[googleDriveUploader] Cloudinary video upload error:", err);
+          return reject(err);
+        }
+        resolve(result);
+      }
+    );
+
+    res.data.on("error", (err) => {
+      console.error("[googleDriveUploader] Drive video stream error:", err);
+      uploadStream.destroy(err);
+      reject(err);
+    });
+
+    res.data.pipe(uploadStream);
+  });
+}
+
+
 module.exports = {
   uploadDriveImageToCloudinary,
+  uploadDriveVideoToCloudinary,
   extractDriveFileId,
 };
