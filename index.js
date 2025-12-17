@@ -403,6 +403,88 @@ async function renderHomeHtml() {
 </html>`;
 }
 
+// Build SSR HTML for tag page (bots need crawlable <a href="/article/..."> links)
+async function renderTagHtml(tagRaw = "") {
+  const siteBase = "https://timelyvoice.com";
+  const tag = String(tagRaw || "").trim();
+
+  if (!tag) return null;
+
+  const canonical = `${siteBase.replace(/\/+$/, "")}/tag/${encodeURIComponent(tag)}`;
+  const title = `Tag: ${tag} — The Timely Voice`;
+  const description = `Latest news tagged “${tag}” on The Timely Voice.`;
+
+  const now = new Date();
+  const rx = new RegExp(`^${escapeRegex(tag)}$`, "i");
+
+  const items = await Article.find({
+  status: "published",
+  $and: [
+    {
+      $or: [
+        { publishAt: { $lte: now } },
+        { publishedAt: { $lte: now } },
+        { publishAt: { $exists: false }, publishedAt: { $exists: false } },
+      ],
+    },
+    {
+      $or: [
+        { tags: rx },                    // tags as array of strings
+        { tags: tagRaw },                // exact tag match
+        { tags: { $in: [tagRaw] } },     // defensive
+      ],
+    },
+  ],
+})
+  .sort({ publishedAt: -1, createdAt: -1, _id: -1 })
+  .limit(80)
+  .select("title slug summary publishedAt publishAt createdAt")
+  .lean();
+
+  const links = items.map((a) => {
+    const url = `${siteBase}/article/${encodeURIComponent(a.slug)}`;
+    const t = escHtml(a.title || a.slug || "Article");
+    const s = escHtml((a.summary || "").slice(0, 180));
+    return `<li style="margin:14px 0">
+      <a href="${escHtml(url)}" style="font-size:18px;font-weight:700;text-decoration:none">${t}</a>
+      ${s ? `<div style="color:#444;margin-top:6px">${s}</div>` : ""}
+    </li>`;
+  }).join("\n");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${escHtml(title)}</title>
+  <meta name="description" content="${escHtml(description)}"/>
+  <link rel="canonical" href="${escHtml(canonical)}"/>
+  <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1"/>
+
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.6;color:#111}
+    .wrap{max-width:900px;margin:0 auto}
+    h1{font-size:30px;line-height:1.2;margin:0 0 8px}
+    .meta{color:#555;margin:0 0 18px}
+    ul{list-style:none;padding:0;margin:0}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>${escHtml(`Tag: ${tag}`)}</h1>
+    <div class="meta">
+      Bot crawl view (humans see the React tag page).
+      • <a href="${siteBase}/sitemap.xml">Sitemap</a>
+    </div>
+    <ul>
+      ${links || "<li>No articles found for this tag.</li>"}
+    </ul>
+  </div>
+</body>
+</html>`;
+}
+
+
 /**
  * ✅ REAL SSR HOME ENDPOINT (Vercel rewrite should target this)
  * /ssr/home -> returns HTML with crawlable internal article links
@@ -423,6 +505,34 @@ app.get("/ssr/home", async (_req, res) => {
     return res.status(200).type("html").send(html);
   } catch (e) {
     console.error("GET /ssr/home failed:", e?.message || e);
+    return res.status(500).type("text/plain").send("SSR error");
+  }
+});
+
+/**
+ * ✅ REAL SSR TAG ENDPOINT (Vercel rewrite targets this)
+ * /ssr/tag/:tag -> returns HTML with crawlable internal article links
+ */
+app.get("/ssr/tag/:tag", async (req, res) => {
+  try {
+    const tag = String(req.params.tag || "").trim();
+    if (!tag) return res.status(400).type("text/plain").send("Missing tag");
+
+    const cacheKey = `ssr:tag:${tag.toLowerCase()}`;
+    const cached = ssrCacheGet(cacheKey);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+      return res.status(200).type("html").send(cached);
+    }
+
+    const html = await renderTagHtml(tag);
+    if (!html) return res.status(404).type("text/plain").send("Not found");
+
+    ssrCacheSet(cacheKey, html, 60_000);
+    res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+    return res.status(200).type("html").send(html);
+  } catch (e) {
+    console.error("GET /ssr/tag/:tag failed:", e?.message || e);
     return res.status(500).type("text/plain").send("SSR error");
   }
 });
