@@ -1515,83 +1515,12 @@ app.get('/api/articles', optionalAuth, async (req, res) => {
     and.push({ $or: [{ title: rx }, { summary: rx }, { author: rx }] });
   }
 
-  // Category filter (case-insensitive, supports string OR object {name, slug})
- // Category filter (supports string, object, ObjectId, and stringified ObjectId)
+ // ✅ Category filter (FINAL: categorySlug only)
 if (catRaw && catRaw.toLowerCase() !== 'all') {
-  const wantLower = String(catRaw).trim().toLowerCase();
-  const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-  // If user passes an ObjectId string directly
-  const looksLikeObjectId = /^[0-9a-fA-F]{24}$/.test(wantLower);
-
-  // Try resolve slug/name -> Category _id
-  let catDoc = null;
-  try {
-    catDoc = await Category.findOne({
-      $or: [
-        { slug: new RegExp(`^${esc(wantLower)}$`, 'i') },
-        { name: new RegExp(`^${esc(catRaw)}$`, 'i') },
-      ],
-    }).select('_id name slug');
-  } catch {}
-
-  const resolvedId = catDoc?._id ? String(catDoc._id) : null;
-
-  and.push({
-    $or: [
-      // category stored as string ("Business", "Health", etc.)
-      {
-        $and: [
-          { $expr: { $eq: [{ $type: "$category" }, "string"] } },
-          { $expr: { $eq: [{ $toLower: "$category" }, wantLower] } },
-        ],
-      },
-
-      // category stored as object {name, slug}
-      {
-        $and: [
-          { $expr: { $eq: [{ $type: "$category" }, "object"] } },
-          {
-            $or: [
-              { $expr: { $eq: [{ $toLower: { $ifNull: ["$category.name", ""] } }, wantLower] } },
-              { $expr: { $eq: [{ $toLower: { $ifNull: ["$category.slug", ""] } }, wantLower] } },
-            ],
-          },
-        ],
-      },
-
-      // category stored as real ObjectId -> match resolved Category._id
-      ...(resolvedId
-        ? [{
-            $and: [
-              { $expr: { $eq: [{ $type: "$category" }, "objectId"] } },
-              { $expr: { $eq: ["$category", catDoc._id] } },
-            ],
-          }]
-        : []),
-
-      // category stored as stringified ObjectId -> match resolved id
-      ...(resolvedId
-        ? [{
-            $and: [
-              { $expr: { $eq: [{ $type: "$category" }, "string"] } },
-              { $expr: { $eq: ["$category", resolvedId] } },
-            ],
-          }]
-        : []),
-
-      // if the query itself is an ObjectId string, match it directly too
-      ...(looksLikeObjectId
-        ? [{
-            $and: [
-              { $expr: { $eq: [{ $type: "$category" }, "objectId"] } },
-              { $expr: { $eq: [{ $toString: "$category" }, wantLower] } },
-            ],
-          }]
-        : []),
-    ],
-  });
+  const slug = String(catRaw).trim().toLowerCase();
+  and.push({ categorySlug: slug });
 }
+
 
   // Visibility (public users)
   if (!includeAll) {
