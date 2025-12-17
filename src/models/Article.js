@@ -32,8 +32,10 @@ const ArticleSchema = new mongoose.Schema({
   bodyHtml:    { type: String, default: '' },        // if you keep both
 
   // Taxonomy
-  category:    { type: String, index: true },
-  tags:        { type: [String], default: [], index: true },
+category:      { type: String, index: true },          // display name (e.g., "Business")
+categorySlug:  { type: String, index: true },          // canonical key (e.g., "business")
+tags:          { type: [String], default: [], index: true },
+
 
     // Timeline (used for History)
   year:       { type: Number, min: 0, max: 4000 },   // 0–4000 (we treat as BC for now)

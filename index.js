@@ -1232,18 +1232,38 @@ async function normalizeIncomingArticle(input = {}) {
     : [];
 
   // category by _id OR slug OR name => store canonical name
-  let categoryName = category;
-  {
-    const ors = [
-      { slug: slugify(String(category || '')) },
-      { name: String(category || '') }
-    ];
-    if (category && mongoose.Types.ObjectId.isValid(String(category))) {
-      ors.push({ _id: category });
-    }
-    const foundCat = await Category.findOne({ $or: ors }).lean();
-    if (foundCat) categoryName = foundCat.name;
+  // category by _id OR slug OR name => store name + canonical slug
+let categoryName = category;
+let categorySlug = slugify(String(categoryName || ''), { lower: true, strict: true });
+
+{
+  const ors = [
+    { slug: slugify(String(category || ''), { lower: true, strict: true }) },
+    { name: new RegExp(`^${escapeRegex(String(category || ''))}$`, 'i') },
+  ];
+
+  if (category && mongoose.Types.ObjectId.isValid(String(category))) {
+    ors.push({ _id: category });
   }
+
+  const foundCat = await Category
+    .findOne({ $or: ors })
+    .select('name slug')
+    .lean();
+
+  if (foundCat) {
+    categoryName = foundCat.name;
+    categorySlug = String(foundCat.slug || '').toLowerCase();
+  }
+}
+
+// final fallback
+if (!categorySlug) {
+  categorySlug =
+    slugify(String(categoryName || ''), { lower: true, strict: true }) ||
+    'general';
+}
+
 
   // tags by slug or name → store names
   const rawTags = Array.isArray(incomingTags) ? incomingTags : [];
@@ -1277,14 +1297,16 @@ async function normalizeIncomingArticle(input = {}) {
     }
   }
 
-  const doc = {
-    title,
-    slug,
-    summary,
-    author,
-    body,
-    category: categoryName,
-    tags: tagsByName,
+ const doc = {
+  title,
+  slug,
+  summary,
+  author,
+  body,
+  category: categoryName,
+  categorySlug,
+  tags: tagsByName,
+
 
     imageUrl: finalImageUrl || imageUrl || '',
     imagePublicId: finalImagePublicId || imagePublicId || '',
@@ -1795,18 +1817,37 @@ app.post('/api/articles', auth, async (req, res) => {
     : [];
 
   // category by _id OR slug OR name => store canonical name
-  let categoryName = category;
-  {
-    const ors = [
-      { slug: slugify(String(category || '')) },
-      { name: String(category || '') }
-    ];
-    if (category && mongoose.Types.ObjectId.isValid(String(category))) {
-      ors.push({ _id: category });
-    }
-    const foundCat = await Category.findOne({ $or: ors }).lean();
-    if (foundCat) categoryName = foundCat.name;
+  // category by _id OR slug OR name => store name + canonical slug
+let categoryName = category;
+let categorySlug = slugify(String(categoryName || ''), { lower: true, strict: true });
+
+{
+  const ors = [
+    { slug: slugify(String(category || ''), { lower: true, strict: true }) },
+    { name: new RegExp(`^${escapeRegex(String(category || ''))}$`, 'i') },
+  ];
+
+  if (category && mongoose.Types.ObjectId.isValid(String(category))) {
+    ors.push({ _id: category });
   }
+
+  const foundCat = await Category
+    .findOne({ $or: ors })
+    .select('name slug')
+    .lean();
+
+  if (foundCat) {
+    categoryName = foundCat.name;
+    categorySlug = String(foundCat.slug || '').toLowerCase();
+  }
+}
+
+if (!categorySlug) {
+  categorySlug =
+    slugify(String(categoryName || ''), { lower: true, strict: true }) ||
+    'general';
+}
+
 
   const rawTags = Array.isArray(incomingTags) ? incomingTags : [];
   const tagsByName = [];
@@ -1842,10 +1883,12 @@ app.post('/api/articles', auth, async (req, res) => {
     publishAt ? new Date(publishAt)
               : (normalizedStatus === 'published' ? new Date() : undefined);
 
-  const baseDoc = {
-    title, slug, summary, author, body,
-    category: categoryName,
-    tags: tagsByName,
+ const baseDoc = {
+  title, slug, summary, author, body,
+  category: categoryName,
+  categorySlug,
+  tags: tagsByName,
+
 
     imageUrl:      finalImageUrl || imageUrl,
     imagePublicId: finalImagePublicId || imagePublicId,
@@ -2007,17 +2050,30 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
       : [];
   }
 
-  if (category !== undefined) {
-    const ors = [
-      { slug: slugify(String(category || '')) },
-      { name: String(category || '') }
-    ];
-    if (category && mongoose.Types.ObjectId.isValid(String(category))) {
-      ors.push({ _id: category });
-    }
-    const catDoc = await Category.findOne({ $or: ors }).lean();
-    update.category = catDoc ? catDoc.name : String(category);
+ if (category !== undefined) {
+  const ors = [
+    { slug: slugify(String(category || ''), { lower: true, strict: true }) },
+    { name: new RegExp(`^${escapeRegex(String(category || ''))}$`, 'i') },
+  ];
+
+  if (category && mongoose.Types.ObjectId.isValid(String(category))) {
+    ors.push({ _id: category });
   }
+
+  const catDoc = await Category
+    .findOne({ $or: ors })
+    .select('name slug')
+    .lean();
+
+  const name = catDoc ? catDoc.name : String(category);
+  const slug = catDoc
+    ? String(catDoc.slug || '').toLowerCase()
+    : (slugify(String(name || ''), { lower: true, strict: true }) || 'general');
+
+  update.category = name;
+  update.categorySlug = slug;
+}
+
 
   // Handle slug change
   if (newSlugRaw !== undefined) {
