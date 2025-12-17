@@ -2452,15 +2452,27 @@ const matchStage = {
     const total = totalAgg?.[0]?.n || 0;
 
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    return res.json({
-  category: cat
-    ? { id: String(cat._id), name: cat.name, slug: cat.slug, description: cat.description || '' }
-    : { id: null, name: slug, slug: slug, description: '' },
-  items,
+    const categoryMeta = cat
+  ? { id: String(cat._id), name: cat.name, slug: cat.slug, description: cat.description || '' }
+  : { id: null, name: slug, slug: slug, description: '' };
+
+const normalizedItems = items.map((it) => ({
+  ...it,
+  // Force consistent category value for frontend:
+  // always Category id when we have a category doc
+  category: categoryMeta.id || it.category,
+  // optional: always include categorySlug for free (helps later)
+  categorySlug: categoryMeta.slug || String(slug || "").toLowerCase(),
+}));
+
+return res.json({
+  category: categoryMeta,
+  items: normalizedItems,
   total,
   page,
-  limit
+  limit,
 });
+
 
   } catch (e) {
     return next(e);
