@@ -1,71 +1,49 @@
-require('dotenv').config();
-const mongoose = require('mongoose');
-const slugify = require('slugify');
-
-const Article = require('../src/models/Article');
 const Category = require('../src/models/Category');
+const Article = require('../src/models/Article');
 
-(async () => {
-  try {
-    await mongoose.connect(process.env.MONGO_URI, {
-      dbName: 'newsdb',
-    });
+async function migrate() {
+  const cursor = Article.find({}).cursor();
+  let count = 0;
 
-    console.log('✅ Connected to MongoDB');
+  for (let doc = await cursor.next(); doc != null; doc = await cursor.next()) {
+    let cat = null;
 
-    const cursor = Article.find({
-      $or: [
-        { categorySlug: { $exists: false } },
-        { categorySlug: '' }
-      ]
-    }).cursor();
-
-    let updated = 0;
-
-    for await (const article of cursor) {
-      let categoryName = article.category;
-      let categorySlug = '';
-
-      if (typeof categoryName === 'string' && categoryName.trim()) {
-        const found = await Category.findOne({
-          $or: [
-            { slug: categoryName.toLowerCase() },
-            { name: new RegExp(`^${categoryName}$`, 'i') }
-          ]
-        }).select('name slug').lean();
-
-        if (found) {
-          categoryName = found.name;
-          categorySlug = found.slug;
-        } else {
-          categorySlug = slugify(categoryName, { lower: true, strict: true }) || 'general';
-        }
-      } else {
-        categoryName = 'General';
-        categorySlug = 'general';
-      }
-
-      await Article.updateOne(
-        { _id: article._id },
-        {
-          $set: {
-            category: categoryName,
-            categorySlug
-          }
-        }
-      );
-
-      updated++;
-      if (updated % 50 === 0) {
-        console.log(`… updated ${updated} articles`);
-      }
+    // Resolve category safely
+    if (doc.category) {
+      cat = await Category.findOne({
+        $or: [
+          { _id: doc.category },
+          { slug: String(doc.category).toLowerCase() },
+          { name: new RegExp(`^${doc.category}$`, 'i') }
+        ]
+      }).lean();
     }
 
-    console.log(`🎉 Migration complete. Updated ${updated} articles.`);
-    process.exit(0);
+    if (!cat) continue;
 
-  } catch (err) {
-    console.error('❌ Migration failed:', err);
-    process.exit(1);
+    const slug = String(cat.slug || '').toLowerCase();
+    if (!slug) continue;
+
+    await Article.updateOne(
+      { _id: doc._id },
+      {
+        $set: {
+          category: cat.name,
+          categorySlug: slug
+        }
+      }
+    );
+
+    if (++count % 100 === 0) {
+      console.log(`… fixed ${count} articles`);
+    }
   }
-})();
+
+  console.log(`✅ CategorySlug fix complete: ${count} articles`);
+  process.exit(0);
+}
+
+migrate().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
