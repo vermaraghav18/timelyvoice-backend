@@ -509,6 +509,31 @@ app.get("/ssr/home", async (_req, res) => {
   }
 });
 
+
+// SSR: Top News page
+app.get("/ssr/top-news", async (req, res) => {
+  try {
+    const articles = await Article.find({ status: "published" })
+      .sort({ publishedAt: -1 })
+      .limit(20)
+      .lean();
+
+    const html = renderHTML({
+      title: "Top News | The Timely Voice",
+      description: "Latest top news headlines from India and around the world.",
+      canonical: "https://timelyvoice.com/top-news",
+      content: renderTopNewsHTML(articles), // reuse SectionRenderer logic
+    });
+
+    res.set("Content-Type", "text/html");
+    res.send(html);
+  } catch (err) {
+    console.error("SSR /top-news error:", err);
+    res.status(500).send("SSR error");
+  }
+});
+
+
 /**
  * ✅ REAL SSR TAG ENDPOINT (Vercel rewrite targets this)
  * /ssr/tag/:tag -> returns HTML with crawlable internal article links
