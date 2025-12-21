@@ -42,7 +42,7 @@ const FALLBACK_OG_URL = buildCloudinaryUrl(
 // ───────────────────────────────────────────────────────────────────────────────
 
 // strip placeholders like "leave it empty" and wrapping quotes
-function sanitizeImageMarker(val) {
+function sanitizeMarker(val) {
   if (!val) return "";
   let s = String(val).trim();
   if (!s) return "";
@@ -52,7 +52,6 @@ function sanitizeImageMarker(val) {
   if (!s) return "";
 
   const lower = s.toLowerCase();
-
   if (
     /^leave\s+(it|this)?\s*empty$/.test(lower) ||
     lower === "leave empty" ||
@@ -89,24 +88,49 @@ function articleUrlFromSlug(slug) {
   return `${SITE_URL}/article/${encodeURIComponent(slug)}`;
 }
 
+// Make MIME detection work for both images + videos
 function guessMimeFromUrl(url = "") {
-  const u = url.toLowerCase();
+  const u = String(url || "")
+    .toLowerCase()
+    .split("?")[0]
+    .split("#")[0];
+
+  // Video
+  if (u.endsWith(".mp4")) return "video/mp4";
+  if (u.endsWith(".webm")) return "video/webm";
+  if (u.endsWith(".mov")) return "video/quicktime";
+  if (u.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
+
+  // Image
   if (u.endsWith(".webp")) return "image/webp";
   if (u.endsWith(".png")) return "image/png";
   if (u.endsWith(".gif")) return "image/gif";
-  return "image/jpeg";
+  if (u.endsWith(".jpg") || u.endsWith(".jpeg")) return "image/jpeg";
+
+  return "application/octet-stream";
+}
+
+// Try to convert Google Drive share links to a direct-ish file URL
+function getDriveFileId(url = "") {
+  const s = String(url || "");
+  if (!s) return "";
+  // /file/d/<id>/
+  const m1 = s.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+  if (m1 && m1[1]) return m1[1];
+  // ?id=<id>
+  const m2 = s.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  if (m2 && m2[1]) return m2[1];
+  return "";
+}
+
+function driveDirectUrl(url = "") {
+  const id = getDriveFileId(url);
+  if (!id) return "";
+  // This is the most commonly usable "direct" link for feeds/downloaders.
+  return `https://drive.google.com/uc?export=download&id=${id}`;
 }
 
 // Normalize any possible "image" value coming from Mongo
-// - objects: { url, secure_url }
-// - bad placeholders: "leave it empty", "Leave it empty", '"leave it empty"' etc.
-// - publicIds (no http): build Cloudinary URL
-// - only keep real URLs or resolved Cloudinary URLs
-// Normalize any possible "image" value coming from Mongo
-// - objects: { url, secure_url }
-// - bad placeholders: "leave it empty" etc.
-// - publicIds (no http): build Cloudinary URL
-// - only keep real URLs or resolved Cloudinary URLs
 function normalizeImageField(raw) {
   if (!raw) return "";
 
@@ -119,7 +143,7 @@ function normalizeImageField(raw) {
     }
   }
 
-  const cleaned = sanitizeImageMarker(raw);
+  const cleaned = sanitizeMarker(raw);
   if (!cleaned) return "";
 
   const s = cleaned;
@@ -129,7 +153,7 @@ function normalizeImageField(raw) {
     return "";
   }
 
-  // Already a full URL (Cloudinary, Pexels, etc.)
+  // Already a full URL
   if (/^https?:\/\//i.test(s)) return s;
 
   // Otherwise, if we have Cloudinary, assume it's a publicId
@@ -137,17 +161,35 @@ function normalizeImageField(raw) {
     return buildCloudinaryUrl(s, "c_fill,g_auto,h_630,w_1200,f_jpg");
   }
 
-  // Unknown non-URL string – treat as no image for RSS safety
   return "";
 }
 
+// Normalize video URL coming from Mongo
+function normalizeVideoField(raw) {
+  if (!raw) return "";
+  const cleaned = sanitizeMarker(raw);
+  if (!cleaned) return "";
+
+  const s = cleaned;
+
+  // If it's a Drive share link, try converting to a direct file URL
+  if (/drive\.google\.com/i.test(s)) {
+    const direct = driveDirectUrl(s);
+    return direct || "";
+  }
+
+  // Must be a URL for RSS safety
+  if (/^https?:\/\//i.test(s)) return s;
+
+  return "";
+}
 
 // Decide which image to use for RSS:
-// 1) ogImage (if valid URL or publicId)
+// 1) ogImage
 // 2) imageUrl
 // 3) cover.url / cover.secure_url
-// 4) imagePublicId (NEW)
-// 5) fallback OG hero (Cloudinary default)
+// 4) imagePublicId
+// 5) fallback OG hero
 function pickBestImageForRss(article) {
   const coverObj = article.cover || {};
   const coverUrl = normalizeImageField(coverObj.secure_url || coverObj.url);
@@ -156,11 +198,9 @@ function pickBestImageForRss(article) {
     normalizeImageField(article.ogImage),
     normalizeImageField(article.imageUrl),
     coverUrl,
-    // ✅ NEW: also respect imagePublicId so RSS can show auto-picked & default images
     normalizeImageField(article.imagePublicId),
   ].filter(Boolean);
 
-  // If the document has no usable image, fall back to global default OG
   return candidates[0] || FALLBACK_OG_URL || "";
 }
 
@@ -173,9 +213,6 @@ async function handleTopNewsRss(req, res, next) {
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
     const now = new Date();
 
-    // Visibility rules similar to public APIs:
-    // - status = published
-    // - publishAt or publishedAt <= now OR both missing
     const rows = await Article.find({
       status: "published",
       $or: [
@@ -190,8 +227,9 @@ async function handleTopNewsRss(req, res, next) {
       ],
     })
       .select(
-        "title slug summary publishedAt publishAt updatedAt createdAt imageUrl ogImage cover imagePublicId"
-      ) // ✅ include imagePublicId
+        // ✅ include videoUrl so RSS can emit video
+        "title slug summary publishedAt publishAt updatedAt createdAt imageUrl ogImage cover imagePublicId videoUrl"
+      )
       .sort({
         publishedAt: -1,
         publishAt: -1,
@@ -203,8 +241,9 @@ async function handleTopNewsRss(req, res, next) {
 
     const nowStr = new Date().toUTCString();
 
+    // ✅ Add MRSS namespace
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
 <channel>
   <title>The Timely Voice — Top News</title>
   <link>${esc(SITE_URL + "/top-news")}</link>
@@ -220,7 +259,12 @@ async function handleTopNewsRss(req, res, next) {
       const pubDate = new Date(pub).toUTCString();
       const desc = a.summary || "";
 
-      const img = pickBestImageForRss(a); // ← always a real URL or fallback OG
+      // ✅ Video-first
+      const video = normalizeVideoField(a.videoUrl);
+      const hasVideo = !!video;
+
+      // ✅ Thumbnail fallback (used for image-only OR as video thumbnail)
+      const img = pickBestImageForRss(a);
       const hasImage = !!img;
 
       xml += `  <item>
@@ -231,7 +275,25 @@ async function handleTopNewsRss(req, res, next) {
     <description><![CDATA[${desc}]]></description>
 `;
 
-      if (hasImage) {
+      if (hasVideo) {
+        const mime = guessMimeFromUrl(video);
+
+        // MRSS video
+        xml += `    <media:content url="${esc(video)}" type="${esc(
+          mime
+        )}" medium="video" />
+`;
+
+        // Thumbnail for readers
+        if (hasImage) {
+          xml += `    <media:thumbnail url="${esc(img)}" />
+`;
+        }
+
+        // Classic RSS enclosure for compatibility
+        xml += `    <enclosure url="${esc(video)}" type="${esc(mime)}" />
+`;
+      } else if (hasImage) {
         const mime = guessMimeFromUrl(img);
         xml += `    <enclosure url="${esc(img)}" type="${esc(mime)}" />
 `;
@@ -245,7 +307,6 @@ async function handleTopNewsRss(req, res, next) {
 </rss>`;
 
     res.set("Content-Type", "application/rss+xml; charset=utf-8");
-    // Shorter cache so new posts appear faster in readers
     res.set("Cache-Control", "public, max-age=60");
     res.status(200).send(xml);
   } catch (err) {
