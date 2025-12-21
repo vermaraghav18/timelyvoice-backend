@@ -29,9 +29,11 @@ function markSitemapDirty() {
 /* -------------------------------------------
    Utils
 -------------------------------------------- */
-const ORIGIN = (process.env.FRONTEND_BASE_URL ||
+const ORIGIN = (
+  process.env.FRONTEND_BASE_URL ||
   process.env.SITE_URL ||
-  "http://localhost:5173")
+  "http://localhost:5173"
+)
   .replace(/\/+$/, "")
   .replace(/^http:\/\//, "https://");
 
@@ -60,37 +62,20 @@ async function buildAllUrls(origin) {
   // Categories (for /category/:slug)
   const categories = await Models.Category.find({}, { slug: 1, updatedAt: 1 }).lean();
 
-  // Tags (for /tag/:slug)
-  // We still load tags if needed for other logic, but we no longer
-  // include tag listing pages in the sitemap because they are NOINDEX
-  // and tend to create duplicate/low-value clusters.
-  const tags = await Models.Tag.find({}, { slug: 1, updatedAt: 1 }).lean();
+  // Tags (we load but DO NOT include tag URLs in sitemap)
+  await Models.Tag.find({}, { slug: 1, updatedAt: 1 }).lean();
 
   // Articles (only published + visible by schedule)
   const now = new Date();
 
-  // ✅ Visibility rules:
-  // - status = published
-  // - publishedAt <= now OR missing/null
-  // - AND publishAt <= now OR missing/null
   const articles = await Models.Article.find(
     {
       status: "published",
-      $and: [
-        {
-          $or: [
-            { publishedAt: { $lte: now } },
-            { publishedAt: { $exists: false } },
-            { publishedAt: null },
-          ],
-        },
-        {
-          $or: [
-            { publishAt: { $lte: now } },
-            { publishAt: { $exists: false } },
-            { publishAt: null },
-          ],
-        },
+      // treat publishedAt as the real publish time
+      $or: [
+        { publishedAt: { $lte: now } },
+        { publishedAt: { $exists: false } },
+        { publishedAt: null },
       ],
     },
     { slug: 1, updatedAt: 1, publishAt: 1, publishedAt: 1, title: 1 }
@@ -100,16 +85,11 @@ async function buildAllUrls(origin) {
 
   // Core urls (homepage + key static pages)
   const core = [
-    // Home (SPA is fine to include; discovery is handled by /news)
     { loc: origin, changefreq: "hourly", priority: "1.0" },
-
-    // ✅ Crawl/discovery hub (STATIC HTML on Vercel)
     { loc: `${origin}/news`, changefreq: "hourly", priority: "0.95" },
-
-    // Key sections
     { loc: `${origin}/top-news`, changefreq: "hourly", priority: "0.9" },
 
-    // Trust / policy pages (important for Google Ads & E-E-A-T)
+    // Trust / policy pages
     { loc: `${origin}/about`, changefreq: "yearly", priority: "0.4" },
     { loc: `${origin}/contact`, changefreq: "yearly", priority: "0.4" },
     { loc: `${origin}/editorial-policy`, changefreq: "yearly", priority: "0.3" },
@@ -127,11 +107,6 @@ async function buildAllUrls(origin) {
     priority: "0.6",
   }));
 
-  // Tags -> /tag/:slug
-  // ❌ We intentionally keep tag listing pages OUT of the main sitemap
-  //    to avoid thin/duplicate index candidates.
-  const tagUrls = []; // intentionally empty
-
   // Articles -> /article/:slug  (prefer updatedAt → publishedAt → publishAt)
   const articleUrls = articles.map((a) => {
     const last = a.updatedAt || a.publishedAt || a.publishAt || new Date();
@@ -143,8 +118,7 @@ async function buildAllUrls(origin) {
     };
   });
 
-  // Only core, categories, and articles should be indexed
-  return [...core, ...catUrls, ...tagUrls, ...articleUrls];
+  return [...core, ...catUrls, ...articleUrls];
 }
 
 function urlsToXml(urls) {
@@ -169,7 +143,7 @@ ${items}
 }
 
 /* -------------------------------------------
-   Google News sitemap (last 48h)
+   Google News sitemap (last 48h) ✅ FIXED
 -------------------------------------------- */
 async function buildNewsXml(origin) {
   if (!Models.Article) {
@@ -181,39 +155,36 @@ async function buildNewsXml(origin) {
   const now = new Date();
   const twoDaysAgo = dayjs(now).subtract(48, "hour").toDate();
 
-  // ✅ Correct logic:
-  // AND(
-  //   OR(publishAt <= now OR missing/null),
-  //   OR(publishedAt >= twoDaysAgo OR (missing publishedAt AND createdAt >= twoDaysAgo))
-  // )
+  // ✅ IMPORTANT: schedule rule AND last-48h rule must both apply
+  const scheduleRule = {
+    $or: [
+      { publishAt: { $lte: now } },
+      { publishAt: { $exists: false } },
+      { publishAt: null },
+    ],
+  };
+
+  const last48hRule = {
+    $or: [
+      { publishedAt: { $gte: twoDaysAgo } },
+      {
+        $and: [
+          { publishedAt: { $exists: false } },
+          { createdAt: { $gte: twoDaysAgo } },
+        ],
+      },
+    ],
+  };
+
   const articles = await Models.Article.find(
     {
       status: "published",
-      $and: [
-        {
-          $or: [
-            { publishAt: { $lte: now } },
-            { publishAt: { $exists: false } },
-            { publishAt: null },
-          ],
-        },
-        {
-          $or: [
-            { publishedAt: { $gte: twoDaysAgo } },
-            {
-              $and: [
-                { publishedAt: { $exists: false } },
-                { createdAt: { $gte: twoDaysAgo } },
-              ],
-            },
-          ],
-        },
-      ],
+      $and: [scheduleRule, last48hRule],
     },
     { slug: 1, title: 1, publishedAt: 1, updatedAt: 1, createdAt: 1 }
   )
     .sort({ publishedAt: -1, createdAt: -1 })
-    .limit(200) // Google News: only last ~48h; 200 is safe
+    .limit(200)
     .lean();
 
   const items = articles
@@ -323,5 +294,5 @@ router.get("/news-sitemap.xml", async (req, res, next) => {
 module.exports = {
   router,
   markSitemapDirty,
-  setModels, // ✅ exported so index.js can inject Article/Category/Tag
+  setModels,
 };
