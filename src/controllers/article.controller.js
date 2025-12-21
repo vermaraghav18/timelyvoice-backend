@@ -56,6 +56,9 @@ function finalizeImageFields(article) {
 // ---------------------------------------------------------
 // LIST ARTICLES (public)
 // ---------------------------------------------------------
+// ---------------------------------------------------------
+// LIST ARTICLES (public) — FIXED CATEGORY LOGIC
+// ---------------------------------------------------------
 exports.list = async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
@@ -65,57 +68,65 @@ exports.list = async (req, res) => {
     const q = {};
     q.status = (req.query.status || 'published').toLowerCase();
 
+    /**
+     * ✅ CATEGORY FILTER — FINAL & CORRECT
+     * Articles store category as STRING (slug or label)
+     * We match ONLY strings, never ObjectId
+     */
     if (req.query.category) {
-      const raw = String(req.query.category);
-      const catDoc = await Category
-        .findOne({ $or: [{ slug: raw }, { slug: slugify(raw) }, { name: raw }] })
-        .select('_id name')
-        .lean();
-
-      if (catDoc) {
-        q.$or = [
-          { category: catDoc.name },
-          { category: catDoc._id },
-        ];
-      } else {
-        q.category = raw;
+      const raw = String(req.query.category).trim();
+      if (raw) {
+        q.category = {
+          $in: [
+            raw,
+            slugify(raw, { lower: true }),
+          ],
+        };
       }
     }
 
-    if (req.query.tag) q.tags = req.query.tag;
-
-    if (req.query.q && String(req.query.q).trim()) {
-      const rx = new RegExp(escRegex(String(req.query.q).trim()), 'i');
-      q.$or = (q.$or || []).concat([{ title: rx }, { summary: rx }, { slug: rx }]);
+    // Tag filter
+    if (req.query.tag) {
+      q.tags = req.query.tag;
     }
 
-    if (String(q.status).toLowerCase() === 'published') {
+    // Search query
+    if (req.query.q && String(req.query.q).trim()) {
+      const rx = new RegExp(escRegex(String(req.query.q).trim()), 'i');
+      q.$or = [{ title: rx }, { summary: rx }, { slug: rx }];
+    }
+
+    // Published visibility
+    if (q.status === 'published') {
       q.publishedAt = { $lte: new Date() };
     }
 
     const PROJECTION = { body: 0, bodyHtml: 0 };
     const SORT = { publishedAt: -1, _id: -1 };
 
-    const cursor = Article
-      .find(q, PROJECTION)
-      .sort(SORT)
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
-      .lean({ getters: true })
-      .maxTimeMS(5000);
+    const [items, total] = await Promise.all([
+      Article.find(q, PROJECTION)
+        .sort(SORT)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean({ getters: true })
+        .maxTimeMS(5000),
 
-    const [rawItems, total] = await Promise.all([
-      cursor.exec(),
       Article.countDocuments(q),
     ]);
 
-    res.json({ page, pageSize: rawItems.length, total, items: rawItems });
+    res.json({
+      page,
+      pageSize: items.length,
+      total,
+      items,
+    });
   } catch (err) {
     console.error('GET /api/articles list error:', err);
     res.status(500).json({ error: 'Failed to list/search articles' });
   }
 };
+
 
 
 // ---------------------------------------------------------
