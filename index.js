@@ -769,6 +769,12 @@ app.use("/api/debug", require("./src/routes/debug.imagePicker.routes"));
 // robots + cached high-traffic endpoints
 app.use("/", robotsRoute);
 app.use("/rss", rssTopNewsRouter);  
+// ✅ RSS: keep caching short + consistent for feed readers
+app.use("/rss", (_req, res, next) => {
+  res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+  next();
+});
+
 app.use('/api/breaking',  cacheRoute(30_000), breakingRoutes);
 app.use('/api/ticker',    cacheRoute(30_000), tickerRoutes);
 app.use('/api/sections',  cacheRoute(60_000), sectionsRouter);
@@ -824,6 +830,9 @@ app.use((req, _res, next) => {
 
 /* -------------------- X-Robots-Tag for sensitive paths -------------------- */
 app.use((req, res, next) => {
+  // ✅ Keep RSS indexable
+  if (req.path.startsWith('/rss')) return next();
+
   // Mark admin and all API endpoints as non-indexable
   if (req.path.startsWith('/api/') || req.path.startsWith('/admin')) {
     res.setHeader('X-Robots-Tag', 'noindex');

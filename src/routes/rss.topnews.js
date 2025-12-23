@@ -88,20 +88,29 @@ function articleUrlFromSlug(slug) {
   return `${SITE_URL}/article/${encodeURIComponent(slug)}`;
 }
 
-// Make MIME detection work for both images + videos
+// ✅ Make MIME detection work for BOTH Cloudinary (no extension) + normal URLs
 function guessMimeFromUrl(url = "") {
-  const u = String(url || "")
-    .toLowerCase()
-    .split("?")[0]
-    .split("#")[0];
+  const raw = String(url || "").toLowerCase();
+  const u = raw.split("?")[0].split("#")[0];
 
-  // Video
+  // ✅ Cloudinary transform hints (these URLs often don't end with .jpg/.png)
+  if (u.includes("f_jpg") || u.includes("f_jpeg")) return "image/jpeg";
+  if (u.includes("f_png")) return "image/png";
+  if (u.includes("f_webp")) return "image/webp";
+
+  // ✅ Cloudinary video URLs often work as mp4 even if format isn't obvious
+  if (u.includes("/video/upload/")) return "video/mp4";
+
+  // ✅ Google Drive "direct" link (no extension)
+  if (u.includes("drive.google.com/uc?export=download")) return "video/mp4";
+
+  // Video by extension
   if (u.endsWith(".mp4")) return "video/mp4";
   if (u.endsWith(".webm")) return "video/webm";
   if (u.endsWith(".mov")) return "video/quicktime";
   if (u.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
 
-  // Image
+  // Image by extension
   if (u.endsWith(".webp")) return "image/webp";
   if (u.endsWith(".png")) return "image/png";
   if (u.endsWith(".gif")) return "image/gif";
@@ -126,7 +135,6 @@ function getDriveFileId(url = "") {
 function driveDirectUrl(url = "") {
   const id = getDriveFileId(url);
   if (!id) return "";
-  // This is the most commonly usable "direct" link for feeds/downloaders.
   return `https://drive.google.com/uc?export=download&id=${id}`;
 }
 
@@ -204,6 +212,33 @@ function pickBestImageForRss(article) {
   return candidates[0] || FALLBACK_OG_URL || "";
 }
 
+// ✅ Build a Cloudinary poster thumbnail from a Cloudinary video URL
+// Example input:
+// https://res.cloudinary.com/<cloud>/video/upload/v123/folder/file.mp4
+// Output poster:
+// https://res.cloudinary.com/<cloud>/video/upload/so_1/folder/file.jpg
+function buildVideoPosterFromCloudinaryVideo(videoUrl = "") {
+  const v = String(videoUrl || "");
+  if (!v) return "";
+  if (!v.includes("res.cloudinary.com") || !v.includes("/video/upload/")) return "";
+
+  // Insert "so_1" transformation right after /video/upload/
+  // and convert extension to .jpg for poster frame
+  const parts = v.split("/video/upload/");
+  if (parts.length !== 2) return "";
+
+  const base = parts[0] + "/video/upload/";
+  let rest = parts[1];
+
+  // remove query/hash
+  rest = rest.split("?")[0].split("#")[0];
+
+  // if already ends with .mp4/.webm/.mov etc, replace extension with .jpg
+  rest = rest.replace(/\.(mp4|webm|mov|m3u8)$/i, ".jpg");
+
+  return `${base}so_1/${rest}`;
+}
+
 // ───────────────────────────────────────────────────────────────────────────────
 // Shared handler for both /top-news and /top-news.xml
 // ───────────────────────────────────────────────────────────────────────────────
@@ -227,7 +262,6 @@ async function handleTopNewsRss(req, res, next) {
       ],
     })
       .select(
-        // ✅ include videoUrl so RSS can emit video
         "title slug summary publishedAt publishAt updatedAt createdAt imageUrl ogImage cover imagePublicId videoUrl"
       )
       .sort({
@@ -241,9 +275,11 @@ async function handleTopNewsRss(req, res, next) {
 
     const nowStr = new Date().toUTCString();
 
-    // ✅ Add MRSS namespace
+    // ✅ Add MRSS + content namespace (for content:encoded)
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
+<rss version="2.0"
+     xmlns:media="http://search.yahoo.com/mrss/"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/">
 <channel>
   <title>The Timely Voice — Top News</title>
   <link>${esc(SITE_URL + "/top-news")}</link>
@@ -263,9 +299,13 @@ async function handleTopNewsRss(req, res, next) {
       const video = normalizeVideoField(a.videoUrl);
       const hasVideo = !!video;
 
-      // ✅ Thumbnail fallback (used for image-only OR as video thumbnail)
+      // ✅ Base image (used as fallback)
       const img = pickBestImageForRss(a);
-      const hasImage = !!img;
+
+      // ✅ If video is Cloudinary, generate a poster so RSS cards look like video
+      const posterFromVideo = hasVideo ? buildVideoPosterFromCloudinaryVideo(video) : "";
+      const thumb = posterFromVideo || img; // prefer video poster; else normal image
+      const hasThumb = !!thumb;
 
       xml += `  <item>
     <title>${esc(a.title || "")}</title>
@@ -278,24 +318,34 @@ async function handleTopNewsRss(req, res, next) {
       if (hasVideo) {
         const mime = guessMimeFromUrl(video);
 
+        // ✅ Provide full HTML content (some readers show video when opened)
+        // Note: RSS readers may still show a thumbnail in the list; that's normal.
+        xml += `    <content:encoded><![CDATA[
+      <p>${desc}</p>
+      <video controls preload="metadata" width="100%">
+        <source src="${video}" type="${mime}" />
+      </video>
+    ]]></content:encoded>
+`;
+
         // MRSS video
         xml += `    <media:content url="${esc(video)}" type="${esc(
           mime
         )}" medium="video" />
 `;
 
-        // Thumbnail for readers
-        if (hasImage) {
-          xml += `    <media:thumbnail url="${esc(img)}" />
+        // Thumbnail for readers/cards
+        if (hasThumb) {
+          xml += `    <media:thumbnail url="${esc(thumb)}" />
 `;
         }
 
         // Classic RSS enclosure for compatibility
         xml += `    <enclosure url="${esc(video)}" type="${esc(mime)}" />
 `;
-      } else if (hasImage) {
-        const mime = guessMimeFromUrl(img);
-        xml += `    <enclosure url="${esc(img)}" type="${esc(mime)}" />
+      } else if (hasThumb) {
+        const mime = guessMimeFromUrl(thumb);
+        xml += `    <enclosure url="${esc(thumb)}" type="${esc(mime)}" />
 `;
       }
 
