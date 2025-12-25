@@ -410,9 +410,11 @@ router.get('/drafts', async (req, res) => {
     };
 
     const rawDrafts = await Article.find(q)
-      .select(
-        '_id title category slug status summary imageUrl imagePublicId createdAt updatedAt videoUrl'
-      )
+    .select(
+  '_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
+)
+
+
       .sort({ createdAt: -1 })
       .limit(200)
       .lean();
@@ -530,7 +532,8 @@ router.get('/', async (req, res) => {
     const [allItems, total] = await Promise.all([
       Article.find(query)
         .select(
-          '_id title slug status category summary body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
+  '_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
+
         )
         .sort({ updatedAt: -1, createdAt: -1 })
         .limit(MAX_LIST)
@@ -667,6 +670,7 @@ router.patch('/:id', async (req, res) => {
       'slug',
       'category',
       'summary',
+      'homepagePlacement',
       'imageUrl',
       'imagePublicId',
       'imageAlt',
@@ -831,6 +835,7 @@ router.patch('/:id', async (req, res) => {
       'slug',
       'category',
       'summary',
+      'homepagePlacement',
       'imageUrl',
       'imagePublicId',
       'imageAlt',

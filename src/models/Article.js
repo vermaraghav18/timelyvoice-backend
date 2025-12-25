@@ -35,6 +35,16 @@ const ArticleSchema = new mongoose.Schema({
 category:      { type: String, index: true },          // display name (e.g., "Business")
 categorySlug:  { type: String, index: true },          // canonical key (e.g., "business")
 tags:          { type: [String], default: [], index: true },
+  // Homepage placement (controls which homepage bucket this article belongs to)
+  homepagePlacement: {
+    type: String,
+    enum: ['none', 'top', 'latest', 'trending'],
+    default: 'none',
+    index: true,
+    lowercase: true,
+    trim: true,
+  },
+
 
 
     // Timeline (used for History)

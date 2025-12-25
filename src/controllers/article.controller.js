@@ -83,6 +83,14 @@ exports.list = async (req, res) => {
           ],
         };
       }
+          // NEW: homepage placement filter (top/latest/trending/none)
+    if (req.query.homepagePlacement) {
+      const hp = String(req.query.homepagePlacement).trim().toLowerCase();
+      if (['none', 'top', 'latest', 'trending'].includes(hp)) {
+        q.homepagePlacement = hp;
+      }
+    }
+
     }
 
     // Tag filter

@@ -55,6 +55,15 @@ function normalizeIncoming(raw = {}) {
   a.slug = a.slug?.trim();
   a.category = a.category?.trim();
 
+    // NEW: normalize homepage placement
+  a.homepagePlacement = String(a.homepagePlacement || 'none').trim().toLowerCase();
+
+  // Safety: allow only the known values
+  if (!['none', 'top', 'latest', 'trending'].includes(a.homepagePlacement)) {
+    a.homepagePlacement = 'none';
+  }
+
+
   if (!Array.isArray(a.tags) && typeof a.tags === 'string') {
     a.tags = a.tags.split(',').map(t => t.trim()).filter(Boolean);
   }
