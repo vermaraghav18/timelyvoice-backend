@@ -67,6 +67,10 @@ const planImageRoutes = require('./src/routes/planImage.routes');
 const articlesRouter = require('./src/routes/articles');
 const historyPageRoutes = require('./src/routes/historyPageRoutes');
 
+const { z } = require('zod');
+const { withValidation } = require('./src/validators/withValidation');
+
+
 // 6) Models registered early
 const Article = require('./src/models/Article');
 const Category = require('./src/models/Category');
@@ -1471,6 +1475,22 @@ async function ensureArticleHasImage(payload = {}) {
 
 /* -------------------- Articles API (public + admin) -------------------- */
 
+// ✅ Query validation for /api/articles and /api/articles/search
+const ArticlesListQuerySchema = z.object({
+  page: z.coerce.number().min(1).optional(),
+    limit: z.coerce.number().min(1).max(500).optional(),
+
+  q: z.string().optional(),
+  category: z.string().optional(),
+  all: z.string().optional(),
+  homepagePlacement: z.enum(["none", "top", "latest", "trending"]).optional(),
+
+  // optional cache-buster if your frontend uses it
+  _t: z.string().optional(),
+}).passthrough();
+
+
+
 // ⬇⬇⬇ ADD THIS WHOLE BLOCK ⬇⬇⬇
 app.get('/api/history/timeline', async (req, res) => {
   try {
@@ -1529,9 +1549,11 @@ app.get('/api/history/timeline', async (req, res) => {
 // ⬆⬆⬆ ADD THIS WHOLE BLOCK ⬆⬆⬆
 
 // list
-app.get('/api/articles', optionalAuth, async (req, res) => {
+app.get('/api/articles', optionalAuth, withValidation(ArticlesListQuerySchema, 'query'), async (req, res) => {
+
   const page  = Math.max(parseInt(req.query.page  || '1', 10), 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 500);
+
   const qRaw  = String(req.query.q || '').trim();
   const catRaw= String(req.query.category || '').trim();
 
@@ -1554,6 +1576,12 @@ if (catRaw && catRaw.toLowerCase() !== 'all') {
   const slug = String(catRaw).trim().toLowerCase();
   and.push({ categorySlug: slug });
 }
+// ✅ Homepage placement filter (strict editorial control)
+if (req.query.homepagePlacement) {
+  const hp = String(req.query.homepagePlacement).toLowerCase();
+  and.push({ homepagePlacement: hp });
+}
+
 
 
   // Visibility (public users)
@@ -1649,7 +1677,8 @@ const mapped = visible.map(a => ({
 
 
 // alias search (same logic so category pages don’t miss items when publishAt is null)
-app.get('/api/articles/search', optionalAuth, async (req, res) => {
+app.get('/api/articles/search', optionalAuth, withValidation(ArticlesListQuerySchema, 'query'), async (req, res) => {
+
   const page   = Math.max(parseInt(req.query.page || '1', 10), 1);
   const limit  = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
   const qRaw   = String(req.query.q || '').trim();
@@ -1660,6 +1689,11 @@ app.get('/api/articles/search', optionalAuth, async (req, res) => {
 
   const now = new Date();
   const match = {};
+
+  if (req.query.homepagePlacement) {
+  match.homepagePlacement = String(req.query.homepagePlacement).toLowerCase();
+}
+
 
   if (qRaw) {
     const rx = new RegExp(qRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
@@ -2288,7 +2322,8 @@ app.get('/api/public/categories/:slug/articles', async (req, res, next) => {
   try {
     const slug = String(req.params.slug || '').trim();
     const page  = Math.max(parseInt(req.query.page  || '1', 10), 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 500);
+
     const skip  = (page - 1) * limit;
 
     // 1) Resolve category by slug OR name (case-insensitive)

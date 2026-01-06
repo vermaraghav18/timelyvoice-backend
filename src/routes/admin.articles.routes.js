@@ -410,11 +410,9 @@ router.get('/drafts', async (req, res) => {
     };
 
     const rawDrafts = await Article.find(q)
-    .select(
-  '_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
-)
-
-
+      .select(
+        '_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
+      )
       .sort({ createdAt: -1 })
       .limit(200)
       .lean();
@@ -532,8 +530,7 @@ router.get('/', async (req, res) => {
     const [allItems, total] = await Promise.all([
       Article.find(query)
         .select(
-  '_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
-
+          '_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
         )
         .sort({ updatedAt: -1, createdAt: -1 })
         .limit(MAX_LIST)
@@ -669,6 +666,7 @@ router.patch('/:id', async (req, res) => {
       'title',
       'slug',
       'category',
+      'categorySlug', // ✅ MUST exist to save it
       'summary',
       'homepagePlacement',
       'imageUrl',
@@ -684,7 +682,6 @@ router.patch('/:id', async (req, res) => {
       'year',
       'era',
       'videoUrl',
-      // ✅ NEW:
       'videoPublicId',
       'videoSourceUrl',
     ];
@@ -692,6 +689,26 @@ router.patch('/:id', async (req, res) => {
     const patch = {};
     for (const k of allowed) {
       if (req.body[k] !== undefined) patch[k] = req.body[k];
+    }
+
+    // ✅ FIX: keep categorySlug always synced
+    // If category changes, force categorySlug = slugify(category)
+    if (
+      Object.prototype.hasOwnProperty.call(patch, 'category') ||
+      Object.prototype.hasOwnProperty.call(patch, 'categorySlug')
+    ) {
+      const catName = String(patch.category || '').trim();
+
+      if (catName) {
+        patch.categorySlug = slugify(catName, { lower: true, strict: true });
+      } else if (patch.categorySlug) {
+        patch.categorySlug = slugify(String(patch.categorySlug), {
+          lower: true,
+          strict: true,
+        });
+      } else {
+        patch.categorySlug = '';
+      }
     }
 
     if (typeof patch.tags === 'string') {
@@ -834,6 +851,7 @@ router.patch('/:id', async (req, res) => {
       'title',
       'slug',
       'category',
+      'categorySlug', // ✅ MUST SAVE THIS
       'summary',
       'homepagePlacement',
       'imageUrl',
@@ -850,10 +868,10 @@ router.patch('/:id', async (req, res) => {
       'year',
       'era',
       'videoUrl',
-      // ✅ NEW:
       'videoPublicId',
       'videoSourceUrl',
     ];
+
     const toSave = {};
     for (const k of toSaveKeys) {
       if (merged[k] !== undefined) toSave[k] = merged[k];

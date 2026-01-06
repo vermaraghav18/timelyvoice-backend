@@ -10,8 +10,6 @@ const { decideAndAttach } = require('../services/imageStrategy');
 const { chooseHeroImage } = require('../services/imagePicker');
 const { buildImageVariants } = require('../services/imageVariants');
 
-
-
 // ---------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------
@@ -52,45 +50,119 @@ function finalizeImageFields(article) {
   if (!article.imageAlt) article.imageAlt = article.title || 'News image';
 }
 
+function normSlug(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  return slugify(s, { lower: true, strict: true });
+}
+
+function syncCategorySlug(obj) {
+  // keeps categorySlug always consistent
+  // supports category as string OR populated object with name/slug
+  let catText = '';
+
+  const c = obj?.category;
+  if (typeof c === 'string') catText = c;
+  else if (c && typeof c === 'object') catText = c.slug || c.name || '';
+
+  const incomingSlug = obj?.categorySlug;
+
+  if (incomingSlug !== undefined && incomingSlug !== null && String(incomingSlug).trim()) {
+    obj.categorySlug = normSlug(incomingSlug);
+    return;
+  }
+
+  if (catText && String(catText).trim()) {
+    obj.categorySlug = normSlug(catText);
+  }
+}
+
+function normalizeHomepagePlacementValue(v) {
+  const raw = String(v || '').trim();
+  if (!raw) return '';
+
+  const lower = raw.toLowerCase();
+
+  // normalize common admin labels -> api values
+  if (lower === 'top stories' || lower === 'topstory' || lower === 'top_story') return 'top';
+  if (lower === 'latest news' || lower === 'latestnews' || lower === 'latest_news') return 'latest';
+  if (lower === 'trending news' || lower === 'trendingnews' || lower === 'trending_news') return 'trending';
+  if (lower === 'none') return 'none';
+
+  // already good
+  if (['top', 'latest', 'trending', 'none'].includes(lower)) return lower;
+
+  return lower; // fallback
+}
 
 // ---------------------------------------------------------
-// LIST ARTICLES (public)
-// ---------------------------------------------------------
-// ---------------------------------------------------------
-// LIST ARTICLES (public) — FIXED CATEGORY LOGIC
+// LIST ARTICLES (public) — FIXED (this is why you were seeing items: [])
 // ---------------------------------------------------------
 exports.list = async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
     const limitReq = Math.max(parseInt(req.query.limit || '0', 10), 0);
-    const limit = Math.min(limitReq || 12, 24);
+    const limit = Math.min(limitReq || 12, 300);
 
     const q = {};
+
+    // status default published
     q.status = (req.query.status || 'published').toLowerCase();
 
-    /**
-     * ✅ CATEGORY FILTER — FINAL & CORRECT
-     * Articles store category as STRING (slug or label)
-     * We match ONLY strings, never ObjectId
-     */
+    // ✅ CATEGORY FILTER — robust:
+    // matches category (string), categorySlug, and also populated category.{name,slug}
     if (req.query.category) {
       const raw = String(req.query.category).trim();
-      if (raw) {
-        q.category = {
-          $in: [
-            raw,
-            slugify(raw, { lower: true }),
+      const rawSlug = normSlug(raw);
+
+      q.$and = q.$and || [];
+      q.$and.push({
+        $or: [
+          { category: raw },
+          { category: rawSlug },
+          { categorySlug: rawSlug },
+
+          // if some docs store populated object
+          { 'category.name': raw },
+          { 'category.slug': rawSlug },
+        ],
+      });
+    }
+
+    // ✅ categorySlug param fallback
+    if (req.query.categorySlug) {
+      const rawSlug = normSlug(req.query.categorySlug);
+      if (rawSlug) {
+        q.$and = q.$and || [];
+        q.$and.push({
+          $or: [
+            { categorySlug: rawSlug },
+            { category: rawSlug },
+            { 'category.slug': rawSlug },
           ],
-        };
-      }
-          // NEW: homepage placement filter (top/latest/trending/none)
-    if (req.query.homepagePlacement) {
-      const hp = String(req.query.homepagePlacement).trim().toLowerCase();
-      if (['none', 'top', 'latest', 'trending'].includes(hp)) {
-        q.homepagePlacement = hp;
+        });
       }
     }
 
+    // ✅ Homepage placement filter
+    // IMPORTANT FIX: support both api values + admin label values
+    if (req.query.homepagePlacement) {
+      const hp = normalizeHomepagePlacementValue(req.query.homepagePlacement);
+
+      // map request -> acceptable stored values
+      const allowed = {
+        top: ['top', 'Top Stories', 'top stories', 'TOP STORIES'],
+        latest: ['latest', 'Latest News', 'latest news', 'LATEST NEWS'],
+        trending: ['trending', 'Trending News', 'trending news', 'TRENDING NEWS', 'Trending'],
+        none: ['none', 'None', 'NONE'],
+      };
+
+      if (allowed[hp]) {
+        q.homepagePlacement = { $in: allowed[hp] };
+      } else {
+        // if it's some custom string, still try exact match
+        q.homepagePlacement = hp;
+      }
     }
 
     // Tag filter
@@ -104,13 +176,22 @@ exports.list = async (req, res) => {
       q.$or = [{ title: rx }, { summary: rx }, { slug: rx }];
     }
 
-    // Published visibility
+    // ✅ Published visibility — THIS WAS YOUR BIG PROBLEM
+    // Previously: publishedAt MUST exist and be <= now
+    // If your article is "published" but publishedAt is missing/null → it returns ZERO.
     if (q.status === 'published') {
-      q.publishedAt = { $lte: new Date() };
+      q.$and = q.$and || [];
+      q.$and.push({
+        $or: [
+          { publishedAt: { $lte: new Date() } },
+          { publishedAt: { $exists: false } },
+          { publishedAt: null },
+        ],
+      });
     }
 
     const PROJECTION = { body: 0, bodyHtml: 0 };
-    const SORT = { publishedAt: -1, _id: -1 };
+    const SORT = { publishedAt: -1, updatedAt: -1, createdAt: -1, _id: -1 };
 
     const [items, total] = await Promise.all([
       Article.find(q, PROJECTION)
@@ -118,7 +199,7 @@ exports.list = async (req, res) => {
         .skip((page - 1) * limit)
         .limit(limit)
         .lean({ getters: true })
-        .maxTimeMS(5000),
+        .maxTimeMS(8000),
 
       Article.countDocuments(q),
     ]);
@@ -135,8 +216,6 @@ exports.list = async (req, res) => {
   }
 };
 
-
-
 // ---------------------------------------------------------
 // GET BY SLUG
 // ---------------------------------------------------------
@@ -145,7 +224,14 @@ exports.getBySlug = async (req, res) => {
     const raw = String(req.params.slug || '').trim();
     if (!raw) return res.status(400).json({ error: 'bad_slug' });
 
-    const publishedFilter = { status: 'published', publishedAt: { $lte: new Date() } };
+    const publishedFilter = {
+      status: 'published',
+      $or: [
+        { publishedAt: { $lte: new Date() } },
+        { publishedAt: { $exists: false } },
+        { publishedAt: null },
+      ],
+    };
 
     let doc = await Article.findOne({ slug: raw, ...publishedFilter })
       .populate({ path: 'category', select: 'name slug', options: { lean: true } })
@@ -155,8 +241,7 @@ exports.getBySlug = async (req, res) => {
 
     const rx = new RegExp(`^${escRegex(raw)}(?:-\\d+)?$`, 'i');
 
-    doc = await Article
-      .findOne({ slug: rx, ...publishedFilter })
+    doc = await Article.findOne({ slug: rx, ...publishedFilter })
       .sort({ publishedAt: -1, createdAt: -1 })
       .lean();
 
@@ -168,7 +253,6 @@ exports.getBySlug = async (req, res) => {
     return res.status(500).json({ error: 'server_error' });
   }
 };
-
 
 // ---------------------------------------------------------
 // CREATE ARTICLE (Google Drive → Cloudinary)
@@ -183,6 +267,9 @@ exports.create = async (req, res) => {
       `article-${Date.now()}`;
 
     payload.status = (payload.status || 'draft').toLowerCase();
+
+    // ✅ ensure categorySlug always exists
+    syncCategorySlug(payload);
 
     if (payload.status === 'published' && !payload.publishedAt) {
       payload.publishedAt = new Date();
@@ -205,29 +292,28 @@ exports.create = async (req, res) => {
 
     const manualOverride = manualUrlProvided(payload);
 
-// AUTO IMAGE (Drive → Cloudinary via imagePicker)
-if (!manualOverride && !payload.imagePublicId) {
-  const pick = await chooseHeroImage({
-    title: payload.title,
-    summary: payload.summary,
-    category: payload.category,
-    tags: payload.tags,
-    slug: payload.slug,
-  });
+    // AUTO IMAGE (Drive → Cloudinary via imagePicker)
+    if (!manualOverride && !payload.imagePublicId) {
+      const pick = await chooseHeroImage({
+        title: payload.title,
+        summary: payload.summary,
+        category: payload.category,
+        tags: payload.tags,
+        slug: payload.slug,
+      });
 
-  if (pick && pick.publicId) {
-    payload.imagePublicId = pick.publicId;
-    if (pick.url && !payload.imageUrl) {
-      payload.imageUrl = pick.url;
+      if (pick && pick.publicId) {
+        payload.imagePublicId = pick.publicId;
+        if (pick.url && !payload.imageUrl) {
+          payload.imageUrl = pick.url;
+        }
+      }
     }
-  }
-}
-
 
     // MANUAL URL → Upload from Drive URL to Cloudinary
     if (manualOverride) {
       const uploaded = await uploadDriveImageToCloudinary(payload.imageUrl, {
-        folder: process.env.CLOUDINARY_FOLDER || 'news-images'
+        folder: process.env.CLOUDINARY_FOLDER || 'news-images',
       });
       payload.imagePublicId = uploaded.public_id;
       payload.imageUrl = uploaded.secure_url;
@@ -243,7 +329,6 @@ if (!manualOverride && !payload.imagePublicId) {
     res.status(500).json({ ok: false, error: String(err.message) });
   }
 };
-
 
 // ---------------------------------------------------------
 // UPDATE ARTICLE (Google Drive → Cloudinary)
@@ -264,34 +349,38 @@ exports.update = async (req, res) => {
         `article-${Date.now()}`;
     }
 
-    doc.status = doc.status.toLowerCase();
+    doc.status = (doc.status || 'draft').toLowerCase();
+
+    // ✅ keep categorySlug synced on update too
+    syncCategorySlug(doc);
+
     if (doc.status === 'published' && !doc.publishedAt) {
       doc.publishedAt = new Date();
     }
 
     const manualOverride = manualUrlProvided(patch);
 
-// AUTO IMAGE (Drive → Cloudinary via imagePicker)
-if (!manualOverride && !doc.imagePublicId) {
-  const pick = await chooseHeroImage({
-    title: doc.title,
-    summary: doc.summary,
-    category: doc.category,
-    tags: doc.tags,
-    slug: doc.slug,
-  });
+    // AUTO IMAGE (Drive → Cloudinary via imagePicker)
+    if (!manualOverride && !doc.imagePublicId) {
+      const pick = await chooseHeroImage({
+        title: doc.title,
+        summary: doc.summary,
+        category: doc.category,
+        tags: doc.tags,
+        slug: doc.slug,
+      });
 
-  if (pick && pick.publicId) {
-    doc.imagePublicId = pick.publicId;
-    if (pick.url && !doc.imageUrl) {
-      doc.imageUrl = pick.url;
+      if (pick && pick.publicId) {
+        doc.imagePublicId = pick.publicId;
+        if (pick.url && !doc.imageUrl) {
+          doc.imageUrl = pick.url;
+        }
+      }
     }
-  }
-}
 
     if (manualOverride) {
       const uploaded = await uploadDriveImageToCloudinary(doc.imageUrl, {
-        folder: process.env.CLOUDINARY_FOLDER || 'news-images'
+        folder: process.env.CLOUDINARY_FOLDER || 'news-images',
       });
       doc.imagePublicId = uploaded.public_id;
       doc.imageUrl = uploaded.secure_url;

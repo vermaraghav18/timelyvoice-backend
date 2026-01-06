@@ -41,13 +41,26 @@ router.get(
   '/',
   withValidation(
     z.object({
-      q: z.string().optional(),
-      status: z.enum(['draft', 'published']).optional(),
-      category: z.string().optional(),
-      tag: z.string().optional(),
-      page: z.coerce.number().min(1).optional(),
-      limit: z.coerce.number().min(1).max(300).optional(),
-    }),
+  q: z.string().optional(),
+  status: z.enum(["draft", "published"]).optional(),
+
+  // existing
+  category: z.string().optional(),
+
+  // ✅ allow your fallback param (your frontend already uses it)
+  categorySlug: z.string().optional(),
+
+  // ✅ allow homepagePlacement filtering
+  homepagePlacement: z
+  .enum(["none", "top", "latest", "trending"])
+  .optional(),
+
+
+  tag: z.string().optional(),
+  page: z.coerce.number().min(1).optional(),
+  limit: z.coerce.number().min(1).max(300).optional(),
+}),
+
     'query'
   ),
   list

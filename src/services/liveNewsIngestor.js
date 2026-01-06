@@ -34,6 +34,7 @@ const FEEDS = [
   // ─────────────────────────────
   // Indian Express
   // ─────────────────────────────
+  "https://publish.tribuneindia.com/city/jalandhar/feed/",
   "https://indianexpress.com/section/business/feed/",
   "https://indianexpress.com/section/sports/cricket/feed/",
   "https://indianexpress.com/section/business/economy/feed/",
@@ -47,6 +48,8 @@ const FEEDS = [
   "https://rss.app/feeds/W4xqo13jWuO9K5aD.xml",
   "https://rss.app/feeds/50EMHbHEY3feCeXR.xml",
   "https://rss.app/feeds/WhJRNvpVEsR8XVkR.xml",
+  "https://rss.app/feeds/1rbNzHzp2RzTogY0.xml",
+  "https://rss.app/feeds/FVTLr4W1gUqbM3fk.xml",
 ];
 
 // -----------------------------------------------------------------------------
