@@ -225,6 +225,11 @@ function looksLikeObjectId(val) {
   return typeof val === 'string' && /^[a-f0-9]{24}$/i.test(val);
 }
 
+function escapeRegex(str = '') {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+
 function normalizeArticlesWithCategories(
   items,
   categoriesMapById = new Map(),
@@ -352,10 +357,65 @@ router.post('/', async (req, res, next) => {
       }
     }
 
+    // ✅ FIX: normalize category + keep categorySlug synced (CREATE)
+    // Supports: category = "India" OR categorySlug = "india" OR category = {id,name,slug}
+    if (
+      req.body &&
+      (Object.prototype.hasOwnProperty.call(req.body, 'category') ||
+        Object.prototype.hasOwnProperty.call(req.body, 'categorySlug'))
+    ) {
+      let incomingName = '';
+      let incomingSlug = '';
+      let incomingId = '';
+
+      if (req.body.category && typeof req.body.category === 'object') {
+        incomingId = String(req.body.category.id || req.body.category._id || '').trim();
+        incomingName = String(req.body.category.name || '').trim();
+        incomingSlug = String(req.body.category.slug || '').trim();
+      } else if (typeof req.body.category === 'string') {
+        incomingName = req.body.category.trim();
+      }
+
+      if (typeof req.body.categorySlug === 'string' && req.body.categorySlug.trim()) {
+        incomingSlug = req.body.categorySlug.trim();
+      }
+
+      let catDoc = null;
+
+      // 1) If we have an id, use it
+      if (incomingId && looksLikeObjectId(incomingId)) {
+        catDoc = await Category.findById(incomingId).select('_id name slug').lean();
+      }
+
+      // 2) Else try slug/name
+      if (!catDoc && (incomingSlug || incomingName)) {
+        const slugGuess = incomingSlug || slugify(incomingName, { lower: true, strict: true });
+        catDoc = await Category.findOne({
+          $or: [
+            { slug: slugGuess },
+            { name: new RegExp(`^${escapeRegex(incomingName || slugGuess)}$`, 'i') },
+          ],
+        })
+          .select('_id name slug')
+          .lean();
+      }
+
+      // ✅ Store normalized values (string name + slug)
+      if (catDoc) {
+        req.body.category = catDoc.name; // IMPORTANT: store name (not object)
+        req.body.categorySlug = String(catDoc.slug || '').toLowerCase();
+      } else {
+        const finalName = (incomingName || incomingSlug || '').trim();
+        req.body.category = finalName || 'General';
+        req.body.categorySlug =
+          slugify(req.body.category, { lower: true, strict: true }) || 'general';
+      }
+    }
+
     return ctrl.createOne(req, res, next);
   } catch (err) {
     console.error('[admin.articles] create wrapper error', err);
-    return res.status(500).json({ error: 'failed_to_create_article' });
+    return res.status(500).json({ error: 'failed_to_create' });
   }
 });
 
@@ -691,25 +751,60 @@ router.patch('/:id', async (req, res) => {
       if (req.body[k] !== undefined) patch[k] = req.body[k];
     }
 
-    // ✅ FIX: keep categorySlug always synced
-    // If category changes, force categorySlug = slugify(category)
-    if (
-      Object.prototype.hasOwnProperty.call(patch, 'category') ||
-      Object.prototype.hasOwnProperty.call(patch, 'categorySlug')
-    ) {
-      const catName = String(patch.category || '').trim();
+    // ✅ FIX: normalize category + keep categorySlug synced
+// Supports: category = "India" OR categorySlug = "india" OR category = {id,name,slug}
+if (
+  Object.prototype.hasOwnProperty.call(patch, 'category') ||
+  Object.prototype.hasOwnProperty.call(patch, 'categorySlug')
+) {
+  let incomingName = '';
+  let incomingSlug = '';
+  let incomingId = '';
 
-      if (catName) {
-        patch.categorySlug = slugify(catName, { lower: true, strict: true });
-      } else if (patch.categorySlug) {
-        patch.categorySlug = slugify(String(patch.categorySlug), {
-          lower: true,
-          strict: true,
-        });
-      } else {
-        patch.categorySlug = '';
-      }
-    }
+  // category can be object {id,name,slug}
+  if (patch.category && typeof patch.category === 'object') {
+    incomingId = String(patch.category.id || patch.category._id || '').trim();
+    incomingName = String(patch.category.name || '').trim();
+    incomingSlug = String(patch.category.slug || '').trim();
+  } else if (typeof patch.category === 'string') {
+    incomingName = patch.category.trim();
+  }
+
+  if (typeof patch.categorySlug === 'string' && patch.categorySlug.trim()) {
+    incomingSlug = patch.categorySlug.trim();
+  }
+
+  // 1) If we have an id, use it
+  let catDoc = null;
+  if (incomingId && looksLikeObjectId(incomingId)) {
+    catDoc = await Category.findById(incomingId).select('_id name slug').lean();
+  }
+
+  // 2) Else if we have slug or name, resolve via Category collection
+  if (!catDoc && (incomingSlug || incomingName)) {
+    const slugGuess = incomingSlug || slugify(incomingName, { lower: true, strict: true });
+    catDoc = await Category.findOne({
+      $or: [
+        { slug: slugGuess },
+        { name: new RegExp(`^${escapeRegex(incomingName || slugGuess)}$`, 'i') },
+      ],
+    })
+      .select('_id name slug')
+      .lean();
+  }
+
+  // ✅ Store normalized values (string name + slug)
+  if (catDoc) {
+    patch.category = catDoc.name;              // IMPORTANT: store name (not object)
+    patch.categorySlug = String(catDoc.slug || '').toLowerCase();
+  } else {
+    // fallback if category isn't in DB yet
+    const finalName = (incomingName || incomingSlug || '').trim();
+    patch.category = finalName || 'General';
+    patch.categorySlug = slugify(patch.category, { lower: true, strict: true }) || 'general';
+  }
+}
+
 
     if (typeof patch.tags === 'string') {
       patch.tags = patch.tags.split(',').map((s) => s.trim()).filter(Boolean);

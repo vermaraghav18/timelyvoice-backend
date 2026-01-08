@@ -1783,138 +1783,169 @@ const mapped = visibleItems.map(a => ({
 
 // create
 app.post('/api/articles', auth, async (req, res) => {
-  const {
-    title, summary, author, body, category = 'General',
-    imageUrl, imagePublicId,
-    status = 'draft',
-    publishAt,
-    geoMode,
-    geoAreas,
-    tags: incomingTags,
-    imageAlt,
-    metaTitle,
-    metaDesc,
-    ogImage,
-  } = req.body || {};
+  try {
+    const {
+      title, summary, author, body,
 
-  // normalize status
-  const allowedStatus = new Set(['draft', 'published']);
-  const normalizedStatus = allowedStatus.has(String(status || 'draft').toLowerCase())
-    ? String(status).toLowerCase()
-    : 'draft';
+      // may come from UI OR from pasted JSON
+      category,
+      categorySlug: categorySlugIn,
+      categoryName: categoryNameIn,
 
-  if (!title || !summary || !author || !body) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
+      imageUrl, imagePublicId,
+      status = 'draft',
+      publishAt,
+      geoMode,
+      geoAreas,
+      tags: incomingTags,
+      imageAlt,
+      metaTitle,
+      metaDesc,
+      ogImage,
+      homepagePlacement, // (optional, if your admin sends it)
+    } = req.body || {};
 
-  const allowedModes = ['global', 'include', 'exclude'];
-  const sanitizedGeoMode = allowedModes.includes(String(geoMode)) ? String(geoMode) : 'global';
-  const sanitizedGeoAreas = Array.isArray(geoAreas)
-    ? geoAreas.map(s => String(s).trim()).filter(Boolean)
-    : [];
+    // ✅ IMPORTANT: use ONE source of truth for incoming category
+    // This supports JSON that sends: category OR categoryName OR categorySlug
+    const categoryInput = String(
+      category ?? categoryNameIn ?? categorySlugIn ?? 'General'
+    ).trim() || 'General';
 
-  // category by _id OR slug OR name => store canonical name
-  // category by _id OR slug OR name => store name + canonical slug
-let categoryName = category;
-let categorySlug = slugify(String(categoryName || ''), { lower: true, strict: true });
+    // normalize status
+    const allowedStatus = new Set(['draft', 'published']);
+    const normalizedStatus = allowedStatus.has(String(status || 'draft').toLowerCase())
+      ? String(status).toLowerCase()
+      : 'draft';
 
-{
-  const ors = [
-    { slug: slugify(String(category || ''), { lower: true, strict: true }) },
-    { name: new RegExp(`^${escapeRegex(String(category || ''))}$`, 'i') },
-  ];
-
-  if (category && mongoose.Types.ObjectId.isValid(String(category))) {
-    ors.push({ _id: category });
-  }
-
-  const foundCat = await Category
-    .findOne({ $or: ors })
-    .select('name slug')
-    .lean();
-
-  if (foundCat) {
-    categoryName = foundCat.name;
-    categorySlug = String(foundCat.slug || '').toLowerCase();
-  }
-}
-
-if (!categorySlug) {
-  categorySlug =
-    slugify(String(categoryName || ''), { lower: true, strict: true }) ||
-    'general';
-}
-
-
-  const rawTags = Array.isArray(incomingTags) ? incomingTags : [];
-  const tagsByName = [];
-  for (const t of rawTags) {
-    const nameOrSlug = String(t).trim();
-    if (!nameOrSlug) continue;
-    const tagDoc = await Tag.findOne({ $or: [{ slug: slugify(nameOrSlug) }, { name: nameOrSlug }] }).lean();
-    tagsByName.push(tagDoc ? tagDoc.name : nameOrSlug);
-  }
-
-  const slug = await uniqueSlugForTitle(title);
-
-  // Auto-pick Cloudinary image if none provided
-  let finalImagePublicId = imagePublicId;
-  let finalImageUrl      = imageUrl;
-  let finalOgImage       = ogImage;
-
-  if (!finalImagePublicId && !finalImageUrl &&
-      String(process.env.CLOUDINARY_AUTOPICK || "").toLowerCase() === "on") {
-    const picked = await pickBestImageForArticle({
-      title,
-      tags: tagsByName,
-      category: categoryName
-    });
-    if (picked) {
-      finalImagePublicId = picked.publicId;
-      finalImageUrl      = picked.imageUrl;
-      finalOgImage       = picked.ogImage;
+    if (!title || !summary || !author || !body) {
+      return res.status(400).json({ error: 'Missing fields' });
     }
+
+    // geo
+    const allowedModes = ['global', 'include', 'exclude'];
+    const sanitizedGeoMode = allowedModes.includes(String(geoMode)) ? String(geoMode) : 'global';
+    const sanitizedGeoAreas = Array.isArray(geoAreas)
+      ? geoAreas.map(s => String(s).trim()).filter(Boolean)
+      : [];
+
+    // ✅ category by _id OR slug OR name => store canonical name + canonical slug
+    let categoryName = categoryInput;
+    let categorySlug = slugify(String(categoryInput || ''), { lower: true, strict: true });
+
+    {
+      const ors = [
+        { slug: slugify(String(categoryInput || ''), { lower: true, strict: true }) },
+        { name: new RegExp(`^${escapeRegex(String(categoryInput || ''))}$`, 'i') },
+      ];
+
+      if (mongoose.Types.ObjectId.isValid(String(categoryInput))) {
+        ors.push({ _id: categoryInput });
+      }
+
+      const foundCat = await Category
+        .findOne({ $or: ors })
+        .select('name slug')
+        .lean();
+
+      if (foundCat) {
+        categoryName = foundCat.name;
+        categorySlug = String(foundCat.slug || '').toLowerCase();
+      }
+    }
+
+    // final fallback
+    if (!categorySlug) {
+      categorySlug =
+        slugify(String(categoryName || ''), { lower: true, strict: true }) ||
+        'general';
+    }
+
+    // tags (store tag names)
+    const rawTags = Array.isArray(incomingTags) ? incomingTags : [];
+    const tagsByName = [];
+    for (const t of rawTags) {
+      const nameOrSlug = String(t).trim();
+      if (!nameOrSlug) continue;
+      const tagDoc = await Tag.findOne({
+        $or: [{ slug: slugify(nameOrSlug) }, { name: nameOrSlug }]
+      }).lean();
+      tagsByName.push(tagDoc ? tagDoc.name : nameOrSlug);
+    }
+
+    const slug = await uniqueSlugForTitle(title);
+
+    // Auto-pick Cloudinary image if none provided
+    let finalImagePublicId = imagePublicId;
+    let finalImageUrl      = imageUrl;
+    let finalOgImage       = ogImage;
+
+    if (!finalImagePublicId && !finalImageUrl &&
+        String(process.env.CLOUDINARY_AUTOPICK || "").toLowerCase() === "on") {
+      const picked = await pickBestImageForArticle({
+        title,
+        tags: tagsByName,
+        category: categoryName
+      });
+      if (picked) {
+        finalImagePublicId = picked.publicId;
+        finalImageUrl      = picked.imageUrl;
+        finalOgImage       = picked.ogImage;
+      }
+    }
+
+    const finalPublishAt =
+      publishAt ? new Date(publishAt)
+                : (normalizedStatus === 'published' ? new Date() : undefined);
+
+    const baseDoc = {
+      title,
+      slug,
+      summary,
+      author,
+      body,
+
+      // ✅ THIS is what fixes your issue:
+      category: categoryName,
+      categorySlug,
+
+      tags: tagsByName,
+
+      imageUrl:      finalImageUrl || imageUrl || '',
+      imagePublicId: finalImagePublicId || imagePublicId || '',
+      ogImage:       finalOgImage || ogImage || '',
+
+      imageAlt: (imageAlt || title || ''),
+      metaTitle: (metaTitle || '').slice(0, 80),
+      metaDesc: (metaDesc || '').slice(0, 200),
+
+      readingTime: estimateReadingTime(body),
+
+      status: normalizedStatus,
+      publishAt: finalPublishAt,
+
+      geoMode: sanitizedGeoMode,
+      geoAreas: sanitizedGeoAreas,
+
+      // optional
+      ...(homepagePlacement ? { homepagePlacement: String(homepagePlacement).toLowerCase() } : {}),
+    };
+
+    await ensureArticleHasImage(baseDoc);
+
+    if (normalizedStatus === 'published') {
+      baseDoc.publishedAt = new Date();
+    } else {
+      baseDoc.publishedAt = undefined;
+    }
+
+    const doc = await Article.create(baseDoc);
+    markSitemapDirty();
+    return res.status(201).json({ ...doc.toObject(), id: doc._id });
+
+  } catch (e) {
+    console.error("POST /api/articles failed:", e?.message || e);
+    return res.status(500).json({ error: "Server error" });
   }
-
-  const finalPublishAt =
-    publishAt ? new Date(publishAt)
-              : (normalizedStatus === 'published' ? new Date() : undefined);
-
- const baseDoc = {
-  title, slug, summary, author, body,
-  category: categoryName,
-  categorySlug,
-  tags: tagsByName,
-
-
-    imageUrl:      finalImageUrl || imageUrl,
-    imagePublicId: finalImagePublicId || imagePublicId,
-
-    imageAlt: (imageAlt || title || ''),
-    metaTitle: (metaTitle || '').slice(0, 80),
-    metaDesc: (metaDesc || '').slice(0, 200),
-    ogImage: (finalOgImage || ogImage || ''),
-
-    readingTime: estimateReadingTime(body),
-
-    status: normalizedStatus,
-    publishAt: finalPublishAt,
-
-    geoMode: sanitizedGeoMode,
-    geoAreas: sanitizedGeoAreas
-  };
-
-  await ensureArticleHasImage(baseDoc);
-
-  if (normalizedStatus === 'published') {
-    baseDoc.publishedAt = new Date();
-  } else {
-    baseDoc.publishedAt = undefined;
-  }
-
-  const doc = await Article.create(baseDoc);
-  markSitemapDirty();
-  res.status(201).json({ ...doc.toObject(), id: doc._id });
 });
 
 // Bulk create articles
@@ -1996,17 +2027,26 @@ app.post('/api/articles/bulk', auth, async (req, res) => {
 
 // update (allow slug changes + write a redirect)
 app.patch('/api/articles/:id', auth, async (req, res) => {
-  const {
-    title, summary, author, body, category, imageUrl, imagePublicId,
-    status, publishAt,
-    geoMode, geoAreas,
-    tags: incomingTags,
-    imageAlt,
-    metaTitle,
-    metaDesc,
-    ogImage,
-    slug: newSlugRaw, // allow changing slug
-  } = req.body || {};
+ const {
+  title, summary, author, body,
+
+  // ✅ accept all category inputs from admin UI
+  category,
+  categorySlug,
+  categoryName,
+
+  imageUrl, imagePublicId,
+  status, publishAt,
+  geoMode, geoAreas,
+  tags: incomingTags,
+  imageAlt,
+  metaTitle,
+  metaDesc,
+  ogImage,
+  slug: newSlugRaw, // allow changing slug
+} = req.body || {};
+
+
 
   // Load existing first to compare slug
   let existing;
@@ -2047,14 +2087,19 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
       : [];
   }
 
- if (category !== undefined) {
+ if (category !== undefined || categorySlugIn !== undefined || categoryNameIn !== undefined) {
+  const categoryInput = (category ?? categoryNameIn ?? categorySlugIn ?? 'General');
+
+  const nameProbe = String(categoryInput || '');
+  const slugProbe = slugify(nameProbe, { lower: true, strict: true });
+
   const ors = [
-    { slug: slugify(String(category || ''), { lower: true, strict: true }) },
-    { name: new RegExp(`^${escapeRegex(String(category || ''))}$`, 'i') },
+    { slug: slugProbe },
+    { name: new RegExp(`^${escapeRegex(nameProbe)}$`, 'i') },
   ];
 
-  if (category && mongoose.Types.ObjectId.isValid(String(category))) {
-    ors.push({ _id: category });
+  if (categoryInput && mongoose.Types.ObjectId.isValid(String(categoryInput))) {
+    ors.push({ _id: categoryInput });
   }
 
   const catDoc = await Category
@@ -2062,7 +2107,7 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
     .select('name slug')
     .lean();
 
-  const name = catDoc ? catDoc.name : String(category);
+  const name = catDoc ? catDoc.name : nameProbe;
   const slug = catDoc
     ? String(catDoc.slug || '').toLowerCase()
     : (slugify(String(name || ''), { lower: true, strict: true }) || 'general');
@@ -2070,6 +2115,7 @@ app.patch('/api/articles/:id', auth, async (req, res) => {
   update.category = name;
   update.categorySlug = slug;
 }
+
 
 
   // Handle slug change
