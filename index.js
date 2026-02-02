@@ -1464,7 +1464,8 @@ if (picked?.chosen) {
   return `(${parts.join(' OR ')})`;
 }).filter(Boolean);
 
-    const expr = `folder=${folder} AND resource_type:image AND (${ors.join(' OR ')})`;
+    const expr = `public_id:${folder}/* AND resource_type:image AND (${ors.join(' OR ')})`;
+
 
     try {
       const res = await cloudinary.search
