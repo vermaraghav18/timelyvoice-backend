@@ -1444,7 +1444,26 @@ if (picked?.chosen) {
     const max = parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || '60', 10);
 
     // Prefer filename/public_id/tags contains
-    const ors = keywords.map(k => `(tags="${k}" OR public_id:*${k}* OR filename:*${k}*)`);
+    const ors = keywords.map((kRaw) => {
+  const k = String(kRaw || '').trim();
+  if (!k) return null;
+
+  const hasSpace = /\s/.test(k);
+
+  const parts = [
+    `tags="${k}"`,
+    `tags:"${k}"`
+  ];
+
+  // only safe for public_id/filename when no spaces
+  if (!hasSpace) {
+    parts.push(`public_id:*${k}*`);
+    parts.push(`filename:*${k}*`);
+  }
+
+  return `(${parts.join(' OR ')})`;
+}).filter(Boolean);
+
     const expr = `folder=${folder} AND resource_type:image AND (${ors.join(' OR ')})`;
 
     try {
