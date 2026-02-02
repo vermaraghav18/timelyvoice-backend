@@ -8,7 +8,8 @@
 
   // Debug logs to confirm .env is loaded (you can remove later)
   console.log('[dotenv] loaded from', path.resolve(__dirname, '.env'));
-  console.log('[env] MONGO_URI present (after destructuring)?', !!MONGO_URI);
+  console.log('[env] MONGO_URI present (safe)?', !!process.env.MONGO_URI);
+
 
 
 
