@@ -1436,51 +1436,71 @@ if (picked?.chosen) {
     // hard cap to keep Cloudinary query reasonable
     return deduped.slice(0, 30);
   }
+async function searchCloudinaryByKeywords(keywords = []) {
+  if (!keywords.length) return [];
 
-  async function searchCloudinaryByKeywords(keywords = []) {
-    if (!keywords.length) return [];
+  const folderRaw = process.env.CLOUDINARY_FOLDER || "news-images";
+  const prefix = String(folderRaw).replace(/\/+$/, "") + "/";
 
-    const folder = process.env.CLOUDINARY_FOLDER || 'news-images';
-    const max = parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || '60', 10);
+  const scanMax = parseInt(process.env.CLOUDINARY_AUTOPICK_SCAN_MAX || "500", 10);
+  const maxPool = parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || "60", 10);
 
-    // Prefer filename/public_id/tags contains
-    const ors = keywords.map((kRaw) => {
-  const k = String(kRaw || '').trim();
-  if (!k) return null;
+  // normalize keywords
+  const kw = keywords
+    .map(k => String(k || "").trim().toLowerCase())
+    .filter(Boolean);
 
-  const hasSpace = /\s/.test(k);
+  if (!kw.length) return [];
 
-  const parts = [
-    `tags="${k}"`,
-    `tags:"${k}"`
-  ];
+  try {
+    let all = [];
+    let next_cursor = undefined;
 
-  // only safe for public_id/filename when no spaces
-  if (!hasSpace) {
-    parts.push(`public_id:*${k}*`);
-    parts.push(`filename:*${k}*`);
-  }
+    // ✅ Cloudinary Admin API listing (NO search DSL)
+    while (all.length < scanMax) {
+      const remaining = scanMax - all.length;
+      const pageSize = Math.min(100, remaining);
 
-  return `(${parts.join(' OR ')})`;
-}).filter(Boolean);
+      const res = await cloudinary.api.resources({
+        type: "upload",
+        resource_type: "image",
+        prefix,             // ✅ folder restriction
+        max_results: pageSize,
+        next_cursor,
+        tags: true          // ✅ we need tags for your scoring logic
+      });
 
-    const expr = `public_id:${folder}/* AND resource_type:image AND (${ors.join(' OR ')})`;
+      const resources = Array.isArray(res?.resources) ? res.resources : [];
+      all.push(...resources);
 
-
-    try {
-      const res = await cloudinary.search
-        .expression(expr)
-        .sort_by('uploaded_at','desc')
-        .with_field('tags')
-        .max_results(Math.min(100, Math.max(10, max)))
-        .execute();
-
-      return Array.isArray(res?.resources) ? res.resources : [];
-    } catch (e) {
-      console.warn('[cloudinary.search] failed:', e?.message || e);
-      return [];
+      next_cursor = res?.next_cursor;
+      if (!next_cursor || resources.length === 0) break;
     }
+
+    if (!all.length) return [];
+
+    // ✅ filter locally: match tags/public_id/filename
+    const filtered = all.filter((r) => {
+      const id = String(r.public_id || "").toLowerCase();
+      const filename = id.split("/").pop() || "";
+      const tags = Array.isArray(r.tags) ? r.tags.map(t => String(t).toLowerCase()) : [];
+
+      return kw.some(k => tags.includes(k) || id.includes(k) || filename.includes(k));
+    });
+
+    // newest first
+    filtered.sort((a, b) => {
+      const da = Date.parse(a.created_at || "") || 0;
+      const db = Date.parse(b.created_at || "") || 0;
+      return db - da;
+    });
+
+    return filtered.slice(0, Math.max(10, maxPool));
+  } catch (e) {
+    console.warn("[cloudinary.api.resources] failed:", e?.message || e);
+    return [];
   }
+}
 
   function scoreImage(resource, { strongSet, weakSet, phraseSet }) {
     const id = String(resource.public_id || '').toLowerCase();
