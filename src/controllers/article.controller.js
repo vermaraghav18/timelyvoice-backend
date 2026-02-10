@@ -1,69 +1,36 @@
 // backend/src/controllers/article.controller.js
 
-const Article = require('../models/Article');
-const Category = require('../models/Category');
-const slugify = require('slugify');
+const Article = require("../models/Article");
+const slugify = require("slugify");
 
-const { extractTags } = require('../services/textFeatures');
-const { uploadDriveImageToCloudinary } = require('../services/googleDriveUploader');
-const { decideAndAttach } = require('../services/imageStrategy');
-const { chooseHeroImage } = require('../services/imagePicker');
-const { buildImageVariants } = require('../services/imageVariants');
+const { extractTags } = require("../services/textFeatures");
+const { finalizeArticleImages } = require("../services/finalizeArticleImages");
+const { buildImageVariants } = require("../services/imageVariants");
 
 // ---------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------
-function escRegex(str = '') {
-  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function normalizeEmptyImages(obj = {}) {
   const o = obj;
-  if (o.imageUrl === '') o.imageUrl = null;
-  if (o.imagePublicId === '') o.imagePublicId = null;
-  if (o.ogImage === '') o.ogImage = null;
-  if (o.thumbImage === '') o.thumbImage = null;
+  if (o.imageUrl === "") o.imageUrl = null;
+  if (o.imagePublicId === "") o.imagePublicId = null;
+  if (o.ogImage === "") o.ogImage = null;
+  if (o.thumbImage === "") o.thumbImage = null;
   return o;
 }
 
-function looksLikeObjectId(val) {
-  return typeof val === 'string' && /^[a-f0-9]{24}$/i.test(val);
-}
-
-function manualUrlProvided(patch) {
-  return (
-    typeof patch.imageUrl === 'string' &&
-    patch.imageUrl.trim() !== '' &&
-    (!patch.imagePublicId || patch.imagePublicId === null)
-  );
-}
-
-function finalizeImageFields(article) {
-  if (!article.imagePublicId) return;
-
-  const v = buildImageVariants(article.imagePublicId);
-
-  if (!article.imageUrl) article.imageUrl = v.hero;
-  if (!article.ogImage) article.ogImage = v.og;
-  if (!article.thumbImage) article.thumbImage = v.thumb;
-
-  if (!article.imageAlt) article.imageAlt = article.title || 'News image';
-}
-
 function normSlug(v) {
-  const s = String(v || '').trim();
-  if (!s) return '';
+  const s = String(v || "").trim();
+  if (!s) return "";
   return slugify(s, { lower: true, strict: true });
 }
 
 function syncCategorySlug(obj) {
-  // keeps categorySlug always consistent
-  // supports category as string OR populated object with name/slug
-  let catText = '';
+  let catText = "";
 
   const c = obj?.category;
-  if (typeof c === 'string') catText = c;
-  else if (c && typeof c === 'object') catText = c.slug || c.name || '';
+  if (typeof c === "string") catText = c;
+  else if (c && typeof c === "object") catText = c.slug || c.name || "";
 
   const incomingSlug = obj?.categorySlug;
 
@@ -77,116 +44,36 @@ function syncCategorySlug(obj) {
   }
 }
 
-function normalizeHomepagePlacementValue(v) {
-  const raw = String(v || '').trim();
-  if (!raw) return '';
+function finalizeImageFields(article) {
+  if (!article.imagePublicId) return;
 
-  const lower = raw.toLowerCase();
+  const v = buildImageVariants(article.imagePublicId);
 
-  // normalize common admin labels -> api values
-  if (lower === 'top stories' || lower === 'topstory' || lower === 'top_story') return 'top';
-  if (lower === 'latest news' || lower === 'latestnews' || lower === 'latest_news') return 'latest';
-  if (lower === 'trending news' || lower === 'trendingnews' || lower === 'trending_news') return 'trending';
-  if (lower === 'none') return 'none';
+  if (!article.imageUrl) article.imageUrl = v.hero;
+  if (!article.ogImage) article.ogImage = v.og;
+  if (!article.thumbImage) article.thumbImage = v.thumb;
 
-  // already good
-  if (['top', 'latest', 'trending', 'none'].includes(lower)) return lower;
-
-  return lower; // fallback
+  if (!article.imageAlt) article.imageAlt = article.title || "News image";
 }
 
 // ---------------------------------------------------------
-// LIST ARTICLES (public) — FIXED (this is why you were seeing items: [])
+// LIST ARTICLES
 // ---------------------------------------------------------
 exports.list = async (req, res) => {
   try {
-    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-    const limitReq = Math.max(parseInt(req.query.limit || '0', 10), 0);
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limitReq = Math.max(parseInt(req.query.limit || "0", 10), 0);
     const limit = Math.min(limitReq || 12, 300);
 
     const q = {};
+    q.status = (req.query.status || "published").toLowerCase();
 
-    // status default published
-    q.status = (req.query.status || 'published').toLowerCase();
-
-    // ✅ CATEGORY FILTER — robust:
-    // matches category (string), categorySlug, and also populated category.{name,slug}
     if (req.query.category) {
       const raw = String(req.query.category).trim();
       const rawSlug = normSlug(raw);
-
       q.$and = q.$and || [];
       q.$and.push({
-        $or: [
-          { category: raw },
-          { category: rawSlug },
-          { categorySlug: rawSlug },
-
-          // if some docs store populated object
-          { 'category.name': raw },
-          { 'category.slug': rawSlug },
-        ],
-      });
-    }
-
-    // ✅ categorySlug param fallback
-    if (req.query.categorySlug) {
-      const rawSlug = normSlug(req.query.categorySlug);
-      if (rawSlug) {
-        q.$and = q.$and || [];
-        q.$and.push({
-          $or: [
-            { categorySlug: rawSlug },
-            { category: rawSlug },
-            { 'category.slug': rawSlug },
-          ],
-        });
-      }
-    }
-
-    // ✅ Homepage placement filter
-    // IMPORTANT FIX: support both api values + admin label values
-    if (req.query.homepagePlacement) {
-      const hp = normalizeHomepagePlacementValue(req.query.homepagePlacement);
-
-      // map request -> acceptable stored values
-      const allowed = {
-        top: ['top', 'Top Stories', 'top stories', 'TOP STORIES'],
-        latest: ['latest', 'Latest News', 'latest news', 'LATEST NEWS'],
-        trending: ['trending', 'Trending News', 'trending news', 'TRENDING NEWS', 'Trending'],
-        none: ['none', 'None', 'NONE'],
-      };
-
-      if (allowed[hp]) {
-        q.homepagePlacement = { $in: allowed[hp] };
-      } else {
-        // if it's some custom string, still try exact match
-        q.homepagePlacement = hp;
-      }
-    }
-
-    // Tag filter
-    if (req.query.tag) {
-      q.tags = req.query.tag;
-    }
-
-    // Search query
-    if (req.query.q && String(req.query.q).trim()) {
-      const rx = new RegExp(escRegex(String(req.query.q).trim()), 'i');
-      q.$or = [{ title: rx }, { summary: rx }, { slug: rx }];
-    }
-
-    // ✅ Published visibility — THIS WAS YOUR BIG PROBLEM
-    // Previously: publishedAt MUST exist and be <= now
-    // If your article is "published" but publishedAt is missing/null → it returns ZERO.
-    if (q.status === 'published') {
-      q.$and = q.$and || [];
-      q.$and.push({
-        $or: [
-          { publishedAt: { $lte: new Date() } },
-          { publishedAt: { $exists: false } },
-          { publishedAt: null },
-        ],
+        $or: [{ category: raw }, { category: rawSlug }, { categorySlug: rawSlug }],
       });
     }
 
@@ -194,25 +81,13 @@ exports.list = async (req, res) => {
     const SORT = { publishedAt: -1, updatedAt: -1, createdAt: -1, _id: -1 };
 
     const [items, total] = await Promise.all([
-      Article.find(q, PROJECTION)
-        .sort(SORT)
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean({ getters: true })
-        .maxTimeMS(8000),
-
+      Article.find(q, PROJECTION).sort(SORT).skip((page - 1) * limit).limit(limit).lean(),
       Article.countDocuments(q),
     ]);
 
-    res.json({
-      page,
-      pageSize: items.length,
-      total,
-      items,
-    });
+    res.json({ page, pageSize: items.length, total, items });
   } catch (err) {
-    console.error('GET /api/articles list error:', err);
-    res.status(500).json({ error: 'Failed to list/search articles' });
+    res.status(500).json({ error: "Failed to list articles" });
   }
 };
 
@@ -221,41 +96,20 @@ exports.list = async (req, res) => {
 // ---------------------------------------------------------
 exports.getBySlug = async (req, res) => {
   try {
-    const raw = String(req.params.slug || '').trim();
-    if (!raw) return res.status(400).json({ error: 'bad_slug' });
+    const slug = String(req.params.slug || "").trim();
+    if (!slug) return res.status(400).json({ error: "bad_slug" });
 
-    const publishedFilter = {
-      status: 'published',
-      $or: [
-        { publishedAt: { $lte: new Date() } },
-        { publishedAt: { $exists: false } },
-        { publishedAt: null },
-      ],
-    };
+    const doc = await Article.findOne({ slug, status: "published" }).lean();
+    if (!doc) return res.status(404).json({ error: "not_found" });
 
-    let doc = await Article.findOne({ slug: raw, ...publishedFilter })
-      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
-      .lean();
-
-    if (doc) return res.json(doc);
-
-    const rx = new RegExp(`^${escRegex(raw)}(?:-\\d+)?$`, 'i');
-
-    doc = await Article.findOne({ slug: rx, ...publishedFilter })
-      .sort({ publishedAt: -1, createdAt: -1 })
-      .lean();
-
-    if (doc) return res.status(308).json({ redirectTo: `/article/${doc.slug}` });
-
-    return res.status(404).json({ error: 'not_found' });
-  } catch (err) {
-    console.error('GET /api/articles/slug/* error:', err);
-    return res.status(500).json({ error: 'server_error' });
+    res.json(doc);
+  } catch {
+    res.status(500).json({ error: "server_error" });
   }
 };
 
 // ---------------------------------------------------------
-// CREATE ARTICLE (Google Drive → Cloudinary)
+// CREATE ARTICLE
 // ---------------------------------------------------------
 exports.create = async (req, res) => {
   try {
@@ -263,136 +117,80 @@ exports.create = async (req, res) => {
 
     payload.slug =
       payload.slug ||
-      slugify(payload.title || 'article', { lower: true, strict: true }) ||
+      slugify(payload.title || "article", { lower: true, strict: true }) ||
       `article-${Date.now()}`;
 
-    payload.status = (payload.status || 'draft').toLowerCase();
-
-    // ✅ ensure categorySlug always exists
+    payload.status = (payload.status || "draft").toLowerCase();
     syncCategorySlug(payload);
 
-    if (payload.status === 'published' && !payload.publishedAt) {
-      payload.publishedAt = new Date();
+    if (!payload.tags || payload.tags.length === 0) {
+      payload.tags = extractTags(
+        { title: payload.title, summary: payload.summary, body: payload.body },
+        8
+      );
     }
 
-    if (!payload.tags || (Array.isArray(payload.tags) && payload.tags.length === 0)) {
-      try {
-        payload.tags = extractTags(
-          {
-            title: payload.title || '',
-            summary: payload.summary || '',
-            body: payload.body || '',
-          },
-          8
-        );
-      } catch (_) {
-        payload.tags = payload.tags || [];
-      }
-    }
+    // ✅ SINGLE SOURCE OF TRUTH FOR IMAGES:
+    // finalizeArticleImages will:
+    // - keep manual imageUrl
+    // - upload drive link if provided manually
+    // - auto-pick from Cloudinary if nothing is provided
+    // - store reason in autoImageDebug
+    const finalized = await finalizeArticleImages(payload);
 
-    const manualOverride = manualUrlProvided(payload);
+    payload.imagePublicId = finalized.imagePublicId;
+    payload.imageUrl = finalized.imageUrl;
+    payload.ogImage = finalized.ogImage;
+    payload.thumbImage = finalized.thumbImage;
+    payload.imageAlt = finalized.imageAlt;
 
-    // AUTO IMAGE (Drive → Cloudinary via imagePicker)
-    if (!manualOverride && !payload.imagePublicId) {
-      const pick = await chooseHeroImage({
-        title: payload.title,
-        summary: payload.summary,
-        category: payload.category,
-        tags: payload.tags,
-        slug: payload.slug,
-      });
+    // ✅ these explain "why" and whether it was auto-picked
+    payload.autoImageDebug = finalized.autoImageDebug || payload.autoImageDebug || null;
+    payload.autoImagePicked =
+      typeof finalized.autoImagePicked === "boolean" ? finalized.autoImagePicked : payload.autoImagePicked;
+    payload.autoImagePickedAt = finalized.autoImagePickedAt || payload.autoImagePickedAt || null;
 
-      if (pick && pick.publicId) {
-        payload.imagePublicId = pick.publicId;
-        if (pick.url && !payload.imageUrl) {
-          payload.imageUrl = pick.url;
-        }
-      }
-    }
-
-    // MANUAL URL → Upload from Drive URL to Cloudinary
-    if (manualOverride) {
-      const uploaded = await uploadDriveImageToCloudinary(payload.imageUrl, {
-        folder: process.env.CLOUDINARY_FOLDER || 'news-images',
-      });
-      payload.imagePublicId = uploaded.public_id;
-      payload.imageUrl = uploaded.secure_url;
-    }
-
+    // extra safety (variants)
     finalizeImageFields(payload);
 
     const doc = await Article.create(payload);
-
-    res.status(201).json({ ok: true, id: String(doc._id), slug: doc.slug });
+    res.status(201).json(doc.toObject());
   } catch (err) {
-    console.error('POST /api/articles create error:', err);
-    res.status(500).json({ ok: false, error: String(err.message) });
+    res.status(500).json({ error: String(err.message) });
   }
 };
 
 // ---------------------------------------------------------
-// UPDATE ARTICLE (Google Drive → Cloudinary)
+// UPDATE ARTICLE
 // ---------------------------------------------------------
 exports.update = async (req, res) => {
   try {
-    const id = req.params.id;
-    const patch = normalizeEmptyImages({ ...req.body });
+    const doc = await Article.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: "not_found" });
 
-    const doc = await Article.findById(id);
-    if (!doc) return res.status(404).json({ ok: false, error: 'Not found' });
-
-    Object.assign(doc, patch);
-
-    if (!doc.slug) {
-      doc.slug =
-        slugify(doc.title || 'article', { lower: true, strict: true }) ||
-        `article-${Date.now()}`;
-    }
-
-    doc.status = (doc.status || 'draft').toLowerCase();
-
-    // ✅ keep categorySlug synced on update too
+    Object.assign(doc, normalizeEmptyImages(req.body));
     syncCategorySlug(doc);
 
-    if (doc.status === 'published' && !doc.publishedAt) {
-      doc.publishedAt = new Date();
-    }
+    // ✅ SINGLE SOURCE OF TRUTH FOR IMAGES (same as create)
+    const finalized = await finalizeArticleImages(doc);
 
-    const manualOverride = manualUrlProvided(patch);
+    doc.imagePublicId = finalized.imagePublicId;
+    doc.imageUrl = finalized.imageUrl;
+    doc.ogImage = finalized.ogImage;
+    doc.thumbImage = finalized.thumbImage;
+    doc.imageAlt = finalized.imageAlt;
 
-    // AUTO IMAGE (Drive → Cloudinary via imagePicker)
-    if (!manualOverride && !doc.imagePublicId) {
-      const pick = await chooseHeroImage({
-        title: doc.title,
-        summary: doc.summary,
-        category: doc.category,
-        tags: doc.tags,
-        slug: doc.slug,
-      });
+    doc.autoImageDebug = finalized.autoImageDebug || doc.autoImageDebug || null;
+    doc.autoImagePicked =
+      typeof finalized.autoImagePicked === "boolean" ? finalized.autoImagePicked : doc.autoImagePicked;
+    doc.autoImagePickedAt = finalized.autoImagePickedAt || doc.autoImagePickedAt || null;
 
-      if (pick && pick.publicId) {
-        doc.imagePublicId = pick.publicId;
-        if (pick.url && !doc.imageUrl) {
-          doc.imageUrl = pick.url;
-        }
-      }
-    }
-
-    if (manualOverride) {
-      const uploaded = await uploadDriveImageToCloudinary(doc.imageUrl, {
-        folder: process.env.CLOUDINARY_FOLDER || 'news-images',
-      });
-      doc.imagePublicId = uploaded.public_id;
-      doc.imageUrl = uploaded.secure_url;
-    }
-
+    // extra safety (variants)
     finalizeImageFields(doc);
 
     await doc.save();
-
-    res.json({ ok: true });
+    res.json(doc.toObject());
   } catch (err) {
-    console.error('PATCH /api/articles/:id update error:', err);
-    res.status(500).json({ ok: false, error: String(err.message) });
+    res.status(500).json({ error: String(err.message) });
   }
 };

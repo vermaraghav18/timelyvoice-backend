@@ -1,31 +1,30 @@
 ﻿// backend/src/routes/admin.articles.routes.js
 // Admin routes for listing, previewing, editing and publishing Article drafts
 
-const express = require('express');
+const express = require("express");
 const router = express.Router();
 
 // NEW: deps for Drive → Cloudinary override
-const fs = require('fs');
-const path = require('path');
-const { v2: cloudinary } = require('cloudinary');
-const { getDriveClient } = require('../services/driveClient');
+const fs = require("fs");
+const path = require("path");
+const { v2: cloudinary } = require("cloudinary");
+const { getDriveClient } = require("../services/driveClient");
 
 // Models
-const Article = require('../models/Article');
-const Category = require('../models/Category');
+const Article = require("../models/Article");
+const Category = require("../models/Category");
 
 // Image strategy + variants
-const { decideAndAttach } = require('../services/imageStrategy');
-const { buildImageVariants } = require('../services/imageVariants');
+const { decideAndAttach } = require("../services/imageStrategy");
+const { buildImageVariants } = require("../services/imageVariants");
 
 // 👇 NEW: AI Image service (OpenRouter / Gemini)
-const { generateAiHeroForArticle } = require('../services/aiImage.service');
+const { generateAiHeroForArticle } = require("../services/aiImage.service");
 
 // Controller for create/import/preview
-const ctrl = require('../controllers/admin.articles.controller');
+const ctrl = require("../controllers/admin.articles.controller");
 
-// If you have auth, wire it
-// const { requireAuthAdmin } = require('../middleware/auth');
+const slugify = require("slugify");
 
 // ────────────────────────────────────────────────────────────────────────────────
 // Default image + URL builder (no Cloudinary SDK magic)
@@ -33,47 +32,44 @@ const ctrl = require('../controllers/admin.articles.controller');
 
 const DEFAULT_PID =
   process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
-  'news-images/defaults/fallback-hero';
+  "news-images/defaults/fallback-hero";
 
 const CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || null;
 
-function buildCloudinaryUrl(publicId, transform = '') {
-  if (!CLOUD_NAME || !publicId) return '';
-  // transform like 'c_fill,g_auto,h_630,w_1200'
+function buildCloudinaryUrl(publicId, transform = "") {
+  if (!CLOUD_NAME || !publicId) return "";
   const base = `https://res.cloudinary.com/${CLOUD_NAME}/image/upload`;
-  const t = transform ? `${transform}/` : '';
+  const t = transform ? `${transform}/` : "";
   return `${base}/${t}${publicId}`;
 }
 
 // Strip placeholders like "leave it empty" etc. and wrapping quotes
 function sanitizeImageUrl(u) {
-  if (!u) return '';
+  if (!u) return "";
   let s = String(u).trim();
-  if (!s) return '';
-
-  // strip wrapping single/double quotes if present
-  s = s.replace(/^['"]+|['"]+$/g, '').trim();
-  if (!s) return '';
+  if (!s) return "";
+  s = s.replace(/^['"]+|['"]+$/g, "").trim();
+  if (!s) return "";
 
   const lower = s.toLowerCase();
 
   if (
     /^leave\s+(it|this)?\s*empty$/.test(lower) ||
-    lower === 'leave empty' ||
-    lower === 'none' ||
-    lower === 'n/a'
+    lower === "leave empty" ||
+    lower === "none" ||
+    lower === "n/a"
   ) {
-    return '';
+    return "";
   }
 
   return s;
 }
 
-console.log('[admin.articles] DEFAULT_IMAGE_PUBLIC_ID =', DEFAULT_PID);
-console.log('[admin.articles] CLOUD_NAME =', CLOUD_NAME);
+console.log("[admin.articles] DEFAULT_IMAGE_PUBLIC_ID =", DEFAULT_PID);
+console.log("[admin.articles] CLOUD_NAME =", CLOUD_NAME);
 
 // ────────────────────────────────────────────────────────────────────────────────
-// NEW: Cloudinary + Drive setup for manual Drive overrides
+// Cloudinary + Drive setup for manual Drive overrides
 // ────────────────────────────────────────────────────────────────────────────────
 
 cloudinary.config({
@@ -83,25 +79,23 @@ cloudinary.config({
   secure: true,
 });
 
-const TEMP_DIR = path.join(__dirname, '../../tmp-drive-manual');
+const TEMP_DIR = path.join(__dirname, "../../tmp-drive-manual");
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
 const { drive, credSource } = getDriveClient
   ? getDriveClient()
-  : { drive: null, credSource: 'none' };
+  : { drive: null, credSource: "none" };
 
 // Extract fileId from common Google Drive URLs
-function extractDriveFileId(raw = '') {
-  const s = String(raw || '').trim();
-  if (!s.includes('drive.google.com')) return null;
+function extractDriveFileId(raw = "") {
+  const s = String(raw || "").trim();
+  if (!s.includes("drive.google.com")) return null;
 
-  // /file/d/<ID>/view
   const byPath = s.match(/\/file\/d\/([^/]+)/);
   if (byPath && byPath[1]) return byPath[1];
 
-  // ?id=<ID> or &id=<ID>
   const byParam = s.match(/[?&]id=([^&]+)/);
   if (byParam && byParam[1]) return byParam[1];
 
@@ -112,7 +106,7 @@ function extractDriveFileId(raw = '') {
 async function uploadDriveFileToCloudinary(fileId) {
   if (!fileId || !drive) {
     console.warn(
-      '[admin.articles] uploadDriveFileToCloudinary: missing fileId or drive client; credSource =',
+      "[admin.articles] uploadDriveFileToCloudinary: missing fileId or drive client; credSource =",
       credSource
     );
     return null;
@@ -123,25 +117,25 @@ async function uploadDriveFileToCloudinary(fileId) {
 
   try {
     const response = await drive.files.get(
-      { fileId, alt: 'media' },
-      { responseType: 'stream' }
+      { fileId, alt: "media" },
+      { responseType: "stream" }
     );
 
     await new Promise((resolve, reject) => {
-      response.data.on('end', resolve).on('error', reject).pipe(dest);
+      response.data.on("end", resolve).on("error", reject).pipe(dest);
     });
 
     const uploaded = await cloudinary.uploader.upload(destPath, {
       folder: process.env.CLOUDINARY_FOLDER
         ? `${process.env.CLOUDINARY_FOLDER}/manual`
-        : 'news-images/manual',
-      resource_type: 'image',
+        : "news-images/manual",
+      resource_type: "image",
     });
 
     try {
       if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
     } catch (err) {
-      console.warn('[admin.articles] temp cleanup warning:', err.message || err);
+      console.warn("[admin.articles] temp cleanup warning:", err.message || err);
     }
 
     return {
@@ -150,7 +144,7 @@ async function uploadDriveFileToCloudinary(fileId) {
     };
   } catch (err) {
     console.error(
-      '[admin.articles] uploadDriveFileToCloudinary error:',
+      "[admin.articles] uploadDriveFileToCloudinary error:",
       err.message || err
     );
     try {
@@ -162,73 +156,80 @@ async function uploadDriveFileToCloudinary(fileId) {
 
 // ────────────────────────────────────────────────────────────────────────────────
 // Helpers used by PATCH
-const PLACEHOLDER_HOSTS = ['your-cdn.example', 'cdn.example.com', 'example.com'];
+// ────────────────────────────────────────────────────────────────────────────────
 
-function isPlaceholderUrl(u = '') {
+const PLACEHOLDER_HOSTS = ["your-cdn.example", "cdn.example.com", "example.com"];
+
+function isPlaceholderUrl(u = "") {
   try {
     const { hostname } = new URL(u);
     if (!hostname) return true;
     return (
       PLACEHOLDER_HOSTS.includes(hostname) ||
-      hostname.endsWith('.example') ||
-      hostname.includes('cdn.example')
+      hostname.endsWith(".example") ||
+      hostname.includes("cdn.example")
     );
   } catch {
-    // invalid URL -> treat as placeholder
     return true;
   }
 }
 
+// 🔥 default placeholder ≠ real image (so autopick must still run)
+function isDefaultPlaceholder(publicId, imageUrl) {
+  return (
+    (typeof publicId === "string" &&
+      (publicId.includes("/defaults/") ||
+        publicId.includes("news-images/default"))) ||
+    (typeof imageUrl === "string" && imageUrl.includes("news-images/default"))
+  );
+}
+
+/**
+ * IMPORTANT CHANGE (PRODUCTION FIX):
+ * Do NOT force DEFAULT_PID into the DB when imagePublicId is empty.
+ * We compute default on GET/LIST already. Storing defaults in DB makes "clear" impossible.
+ */
 function finalizeImageFields(article) {
   if (!article) return;
 
-  // Clean out any junk markers like "leave it empty"
   article.imageUrl = sanitizeImageUrl(article.imageUrl);
   article.ogImage = sanitizeImageUrl(article.ogImage);
   article.thumbImage = sanitizeImageUrl(article.thumbImage);
 
-  const publicId = article.imagePublicId || DEFAULT_PID;
+  // Only build derived URLs if we have a real publicId.
+  const publicId = article.imagePublicId;
   if (!publicId || !CLOUD_NAME) return;
 
-  // hero
-  if (!article.imageUrl) {
-    article.imageUrl = buildCloudinaryUrl(publicId);
-  }
+  if (!article.imageUrl) article.imageUrl = buildCloudinaryUrl(publicId);
 
-  // og
   if (!article.ogImage) {
     article.ogImage = buildCloudinaryUrl(
       publicId,
-      'c_fill,g_auto,h_630,w_1200,f_jpg'
+      "c_fill,g_auto,h_630,w_1200,f_jpg"
     );
   }
 
-  // thumb
   if (!article.thumbImage) {
     article.thumbImage = buildCloudinaryUrl(
       publicId,
-      'c_fill,g_auto,h_300,w_400,f_webp'
+      "c_fill,g_auto,h_300,w_400,f_webp"
     );
   }
 
-  if (!article.imageAlt) {
-    article.imageAlt = article.title || 'News image';
-  }
+  if (!article.imageAlt) article.imageAlt = article.title || "News image";
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
 // CATEGORY NORMALIZATION (so admin never sees ObjectId in UI)
-
-const slugify = require('slugify');
+// ────────────────────────────────────────────────────────────────────────────────
 
 function looksLikeObjectId(val) {
-  return typeof val === 'string' && /^[a-f0-9]{24}$/i.test(val);
+  return typeof val === "string" && /^[a-f0-9]{24}$/i.test(val);
 }
 
-function escapeRegex(str = '') {
-  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function escapeRegex(str = "") {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-
 
 function normalizeArticlesWithCategories(
   items,
@@ -238,13 +239,12 @@ function normalizeArticlesWithCategories(
   return items.map((it) => {
     const a = { ...it };
 
-    // Already populated object?
     if (
       a.category &&
-      typeof a.category === 'object' &&
+      typeof a.category === "object" &&
       (a.category._id || a.category.id || a.category.name)
     ) {
-      const id = String(a.category._id || a.category.id || '');
+      const id = String(a.category._id || a.category.id || "");
       const name = a.category.name || null;
       const slug =
         a.category.slug ||
@@ -253,7 +253,6 @@ function normalizeArticlesWithCategories(
       return a;
     }
 
-    // ObjectId string
     if (looksLikeObjectId(a.category)) {
       const c = categoriesMapById.get(String(a.category));
       if (c) {
@@ -270,8 +269,7 @@ function normalizeArticlesWithCategories(
       return a;
     }
 
-    // Plain string name
-    if (typeof a.category === 'string' && a.category.trim()) {
+    if (typeof a.category === "string" && a.category.trim()) {
       const name = a.category.trim();
       const c = categoriesMapByName.get(name) || null;
       a.category = {
@@ -287,50 +285,45 @@ function normalizeArticlesWithCategories(
   });
 }
 
-// Render-safe category text for admin UI cells
 const toCatText = (v) =>
   Array.isArray(v)
     ? v.map(toCatText).filter(Boolean)
-    : v && typeof v === 'object'
-    ? v.name || v.slug || ''
-    : v || '';
+    : v && typeof v === "object"
+    ? v.name || v.slug || ""
+    : v || "";
 
 // ────────────────────────────────────────────────────────────────────────────────
 // CLOUDINARY PUBLIC ID DERIVER (for pasted image URLs)
+// ────────────────────────────────────────────────────────────────────────────────
 
-function deriveCloudinaryPublicIdFromUrl(url = '') {
-  if (typeof url !== 'string' || !url.includes('/image/upload/')) return null;
+function deriveCloudinaryPublicIdFromUrl(url = "") {
+  if (typeof url !== "string" || !url.includes("/image/upload/")) return null;
   try {
-    // Example: https://res.cloudinary.com/<cloud>/image/upload/c_fill,w_800/v1723456/folder/name/file.jpg
-    const afterUpload = url.split('/image/upload/')[1];
+    const afterUpload = url.split("/image/upload/")[1];
     if (!afterUpload) return null;
 
-    const clean = afterUpload.split(/[?#]/)[0]; // strip query/hash
-    const segs = clean.split('/');
+    const clean = afterUpload.split(/[?#]/)[0];
+    const segs = clean.split("/");
 
     let i = 0;
-    // skip transformation segments (contain commas or colon)
-    while (i < segs.length && (segs[i].includes(',') || segs[i].includes(':')))
+    while (i < segs.length && (segs[i].includes(",") || segs[i].includes(":")))
       i++;
-    // skip version like v12345
     if (i < segs.length && /^v\d+$/i.test(segs[i])) i++;
 
-    const publicPath = segs.slice(i).join('/');
+    const publicPath = segs.slice(i).join("/");
     if (!publicPath) return null;
 
-    return publicPath.replace(/\.[a-z0-9]+$/i, '') || null; // drop extension
+    return publicPath.replace(/\.[a-z0-9]+$/i, "") || null;
   } catch {
     return null;
   }
 }
 
-// Normalize remote image URLs (Google Drive → direct download URL)
-function normalizeRemoteImageUrl(raw = '') {
-  const s = String(raw || '').trim();
+function normalizeRemoteImageUrl(raw = "") {
+  const s = String(raw || "").trim();
   if (!s) return null;
 
-  // If it's a Google Drive link, convert it to a direct download URL
-  if (s.includes('drive.google.com')) {
+  if (s.includes("drive.google.com")) {
     const fileId = extractDriveFileId(s);
     if (fileId) {
       return `https://drive.google.com/uc?export=download&id=${fileId}`;
@@ -342,161 +335,241 @@ function normalizeRemoteImageUrl(raw = '') {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// CREATE (single) — POST /api/admin/articles
-// Wrap createOne so that CREATE always ignores incoming image fields and
-// forces auto-pick from Drive / strategy layer.
-router.post('/', async (req, res, next) => {
+// ✅ NEW: FORCE RE-PICK IMAGE — POST /api/admin/articles/:id/repick-image
+// (easy for Postman, no guessing)
+// ────────────────────────────────────────────────────────────────────────────────
+router.post("/:id/repick-image", async (req, res) => {
   try {
-    if (req.body && typeof req.body === 'object') {
-      const scrubKeys = ['imageUrl', 'imagePublicId', 'ogImage', 'thumbImage'];
+    const { id } = req.params;
 
-      for (const key of scrubKeys) {
+    const article = await Article.findById(id).lean();
+    if (!article) return res.status(404).json({ ok: false, error: "not_found" });
+
+    // Clear image fields so autopick is allowed
+    article.imagePublicId = null;
+    article.imageUrl = null;
+    article.ogImage = null;
+    article.thumbImage = null;
+
+    // Clear old debug so it doesn't confuse you
+    article.autoImageDebug = null;
+    article._autoImageDebug = null;
+    article.autoImagePicked = false;
+    article.autoImagePickedAt = null;
+
+    await decideAndAttach(article, {
+      imageStrategy: "cloudinary",
+      fallbacks: ["stock"],
+    });
+
+    finalizeImageFields(article);
+
+    const toSave = {
+      imagePublicId: article.imagePublicId || null,
+      imageUrl: article.imageUrl || null,
+      ogImage: article.ogImage || null,
+      thumbImage: article.thumbImage || null,
+      imageAlt: article.imageAlt || null,
+      autoImageDebug: article.autoImageDebug || article._autoImageDebug || null,
+      autoImagePicked: !!article.autoImagePicked,
+      autoImagePickedAt: article.autoImagePickedAt || new Date(),
+    };
+
+    const updated = await Article.findByIdAndUpdate(
+      id,
+      { $set: toSave },
+      { new: true }
+    ).lean();
+
+    return res.json({ ok: true, article: updated });
+  } catch (err) {
+    console.error("[admin.articles] repick-image error", err);
+    return res.status(500).json({ ok: false, error: "repick_failed" });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────────
+// CREATE (single) — POST /api/admin/articles
+router.post("/", async (req, res, next) => {
+  try {
+    if (req.body && typeof req.body === "object") {
+      for (const key of ["imageUrl", "ogImage", "thumbImage"]) {
         if (Object.prototype.hasOwnProperty.call(req.body, key)) {
-          delete req.body[key];
+          const cleaned = sanitizeImageUrl(req.body[key]);
+          if (!cleaned || isPlaceholderUrl(cleaned)) delete req.body[key];
+          else req.body[key] = cleaned;
         }
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(req.body, "imagePublicId") &&
+        String(req.body.imagePublicId || "").trim() === ""
+      ) {
+        delete req.body.imagePublicId;
       }
     }
 
-    // ✅ FIX: normalize category + keep categorySlug synced (CREATE)
-    // Supports: category = "India" OR categorySlug = "india" OR category = {id,name,slug}
     if (
       req.body &&
-      (Object.prototype.hasOwnProperty.call(req.body, 'category') ||
-        Object.prototype.hasOwnProperty.call(req.body, 'categorySlug'))
+      (Object.prototype.hasOwnProperty.call(req.body, "category") ||
+        Object.prototype.hasOwnProperty.call(req.body, "categorySlug"))
     ) {
-      let incomingName = '';
-      let incomingSlug = '';
-      let incomingId = '';
+      let incomingName = "";
+      let incomingSlug = "";
+      let incomingId = "";
 
-      if (req.body.category && typeof req.body.category === 'object') {
-        incomingId = String(req.body.category.id || req.body.category._id || '').trim();
-        incomingName = String(req.body.category.name || '').trim();
-        incomingSlug = String(req.body.category.slug || '').trim();
-      } else if (typeof req.body.category === 'string') {
+      if (req.body.category && typeof req.body.category === "object") {
+        incomingId = String(
+          req.body.category.id || req.body.category._id || ""
+        ).trim();
+        incomingName = String(req.body.category.name || "").trim();
+        incomingSlug = String(req.body.category.slug || "").trim();
+      } else if (typeof req.body.category === "string") {
         incomingName = req.body.category.trim();
       }
 
-      if (typeof req.body.categorySlug === 'string' && req.body.categorySlug.trim()) {
+      if (
+        typeof req.body.categorySlug === "string" &&
+        req.body.categorySlug.trim()
+      ) {
         incomingSlug = req.body.categorySlug.trim();
       }
 
       let catDoc = null;
 
-      // 1) If we have an id, use it
       if (incomingId && looksLikeObjectId(incomingId)) {
-        catDoc = await Category.findById(incomingId).select('_id name slug').lean();
-      }
-
-      // 2) Else try slug/name
-      if (!catDoc && (incomingSlug || incomingName)) {
-        const slugGuess = incomingSlug || slugify(incomingName, { lower: true, strict: true });
-        catDoc = await Category.findOne({
-          $or: [
-            { slug: slugGuess },
-            { name: new RegExp(`^${escapeRegex(incomingName || slugGuess)}$`, 'i') },
-          ],
-        })
-          .select('_id name slug')
+        catDoc = await Category.findById(incomingId)
+          .select("_id name slug")
           .lean();
       }
 
-      // ✅ Store normalized values (string name + slug)
+      if (!catDoc && (incomingSlug || incomingName)) {
+        const slugGuess =
+          incomingSlug ||
+          slugify(incomingName, { lower: true, strict: true });
+        catDoc = await Category.findOne({
+          $or: [
+            { slug: slugGuess },
+            {
+              name: new RegExp(
+                `^${escapeRegex(incomingName || slugGuess)}$`,
+                "i"
+              ),
+            },
+          ],
+        })
+          .select("_id name slug")
+          .lean();
+      }
+
       if (catDoc) {
-        req.body.category = catDoc.name; // IMPORTANT: store name (not object)
-        req.body.categorySlug = String(catDoc.slug || '').toLowerCase();
+        req.body.category = catDoc.name;
+        req.body.categorySlug = String(catDoc.slug || "").toLowerCase();
       } else {
-        const finalName = (incomingName || incomingSlug || '').trim();
-        req.body.category = finalName || 'General';
+        const finalName = (incomingName || incomingSlug || "").trim();
+        req.body.category = finalName || "General";
         req.body.categorySlug =
-          slugify(req.body.category, { lower: true, strict: true }) || 'general';
+          slugify(req.body.category, { lower: true, strict: true }) || "general";
       }
     }
 
     return ctrl.createOne(req, res, next);
   } catch (err) {
-    console.error('[admin.articles] create wrapper error', err);
-    return res.status(500).json({ error: 'failed_to_create' });
+    console.error("[admin.articles] create wrapper error", err);
+    return res.status(500).json({ error: "failed_to_create" });
   }
 });
 
 // BULK IMPORT — POST /api/admin/articles/import
-router.post('/import', ctrl.importMany);
+router.post("/import", ctrl.importMany);
 
 // PREVIEW BULK IMPORT (no DB writes) — POST /api/admin/articles/preview-import
-router.post('/preview-import', ctrl.previewMany);
+router.post("/preview-import", ctrl.previewMany);
 
 // IMPORT IMAGE FROM URL (Cloudinary + Google Drive support)
-// POST /api/admin/articles/import-image-from-url
-router.post('/import-image-from-url', async (req, res) => {
+router.post("/import-image-from-url", async (req, res) => {
   try {
     const { url } = req.body || {};
-    if (!url || typeof url !== 'string' || !url.trim()) {
-      return res.status(400).json({ error: 'url_required' });
+    if (!url || typeof url !== "string" || !url.trim()) {
+      return res.status(400).json({ error: "url_required" });
     }
 
     const normalized = normalizeRemoteImageUrl(url);
 
     const maybePid = deriveCloudinaryPublicIdFromUrl(normalized);
     if (maybePid) {
-      const built = buildCloudinaryUrl(maybePid);
       return res.json({
         ok: true,
         publicId: maybePid,
-        url: built,
+        url: buildCloudinaryUrl(maybePid),
       });
     }
 
-    return res
-      .status(400)
-      .json({ error: 'non_cloudinary_url_not_supported_in_dev_mode' });
+    if (normalized.includes("drive.google.com")) {
+      const fileId = extractDriveFileId(normalized);
+      if (!fileId) {
+        return res.status(400).json({ error: "drive_file_id_not_found" });
+      }
+
+      const uploaded = await uploadDriveFileToCloudinary(fileId);
+      if (!uploaded) {
+        return res.status(500).json({ error: "drive_upload_failed" });
+      }
+
+      return res.json({
+        ok: true,
+        publicId: uploaded.publicId,
+        url: uploaded.url,
+      });
+    }
+
+    return res.status(400).json({ error: "unsupported_url" });
   } catch (err) {
     console.error(
-      '[admin.articles] import-image-from-url failed',
+      "[admin.articles] import-image-from-url failed",
       err?.message || err
     );
-    return res.status(500).json({ error: 'upload_failed' });
+    return res.status(500).json({ error: "upload_failed" });
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────────
 // LIST DRAFTS — GET /api/admin/articles/drafts
-router.get('/drafts', async (req, res) => {
+router.get("/drafts", async (req, res) => {
   try {
     const q = {
       $and: [
-        { $or: [{ status: 'draft' }, { status: { $exists: false } }] },
+        { $or: [{ status: "draft" }, { status: { $exists: false } }] },
         { $or: [{ publishedAt: { $exists: false } }, { publishedAt: null }] },
       ],
     };
 
     const rawDrafts = await Article.find(q)
       .select(
-        '_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
+        "_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl autoImageDebug _autoImageDebug autoImagePicked autoImagePickedAt"
       )
       .sort({ createdAt: -1 })
       .limit(200)
       .lean();
 
-    // normalize categories for drafts as well
     const idSet = new Set();
     const nameSet = new Set();
     for (const it of rawDrafts) {
       const c = it.category;
       if (!c) continue;
-      if (typeof c === 'object' && (c._id || c.id)) continue;
+      if (typeof c === "object" && (c._id || c.id)) continue;
       if (looksLikeObjectId(c)) idSet.add(String(c));
-      else if (typeof c === 'string' && c.trim()) nameSet.add(c.trim());
+      else if (typeof c === "string" && c.trim()) nameSet.add(c.trim());
     }
 
     const [docsById, docsByName] = await Promise.all([
       idSet.size
         ? Category.find({ _id: { $in: Array.from(idSet) } })
-            .select('_id name slug')
+            .select("_id name slug")
             .lean()
         : [],
       nameSet.size
         ? Category.find({ name: { $in: Array.from(nameSet) } })
-            .select('_id name slug')
+            .select("_id name slug")
             .lean()
         : [],
     ]);
@@ -513,11 +586,12 @@ router.get('/drafts', async (req, res) => {
       categoriesMapById,
       categoriesMapByName
     );
+
     const drafts = normalizedDrafts.map((a) => {
       const clean = sanitizeImageUrl(a.imageUrl);
       const bestPid = a.imagePublicId || DEFAULT_PID;
       const imageUrl =
-        clean || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+        clean || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : "");
 
       return {
         ...a,
@@ -526,34 +600,32 @@ router.get('/drafts', async (req, res) => {
         categories: Array.isArray(a.categories)
           ? a.categories.map(toCatText)
           : [],
+        autoImageDebug: a.autoImageDebug || a._autoImageDebug || null,
       };
     });
 
     res.json(drafts);
   } catch (err) {
-    console.error('[admin.articles] drafts error', err);
-    res.status(500).json({ error: 'failed_to_list_drafts' });
+    console.error("[admin.articles] drafts error", err);
+    res.status(500).json({ error: "failed_to_list_drafts" });
   }
 });
 
 // DELETE — DELETE /api/admin/articles/:id
-router.delete('/:id', async (req, res) => {
+router.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const doc = await Article.findByIdAndDelete(id).lean();
-
-    if (!doc) return res.status(404).json({ error: 'not_found' });
-
+    if (!doc) return res.status(404).json({ error: "not_found" });
     return res.json({ ok: true, deletedId: id });
   } catch (err) {
-    console.error('[admin.articles] delete error', err);
-    return res.status(500).json({ error: 'failed_to_delete_article' });
+    console.error("[admin.articles] delete error", err);
+    return res.status(500).json({ error: "failed_to_delete_article" });
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────────
 // LIST — GET /api/admin/articles
-router.get('/', async (req, res) => {
+router.get("/", async (req, res) => {
   try {
     const { status, category, q, page = 1, limit = 20 } = req.query;
 
@@ -565,17 +637,21 @@ router.get('/', async (req, res) => {
       const catDoc = await Category.findOne({
         $or: [{ slug: raw }, { slug: slugify(raw) }, { name: raw }],
       })
-        .select('_id name')
+        .select("_id name")
         .lean();
+
       if (catDoc) {
         and.push({ $or: [{ category: catDoc.name }, { category: catDoc._id }] });
       } else {
-        and.push({ $or: [{ 'category.slug': raw }, { category: raw }] });
+        and.push({ $or: [{ "category.slug": raw }, { category: raw }] });
       }
     }
 
     if (q) {
-      const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const rx = new RegExp(
+        String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i"
+      );
       and.push({ $or: [{ title: rx }, { summary: rx }, { body: rx }] });
     }
 
@@ -590,13 +666,13 @@ router.get('/', async (req, res) => {
     const [allItems, total] = await Promise.all([
       Article.find(query)
         .select(
-          '_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl'
+          "_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl autoImageDebug _autoImageDebug autoImagePicked autoImagePickedAt"
         )
         .sort({ updatedAt: -1, createdAt: -1 })
         .limit(MAX_LIST)
         .populate({
-          path: 'category',
-          select: 'name slug',
+          path: "category",
+          select: "name slug",
           options: { lean: true },
         })
         .lean(),
@@ -613,10 +689,10 @@ router.get('/', async (req, res) => {
     }
 
     const sorted = (allItems || []).slice().sort((a, b) => {
-      const aStatus = (a.status || '').toString().toLowerCase();
-      const bStatus = (b.status || '').toString().toLowerCase();
-      const aIsDraft = !aStatus || aStatus === 'draft';
-      const bIsDraft = !bStatus || bStatus === 'draft';
+      const aStatus = (a.status || "").toString().toLowerCase();
+      const bStatus = (b.status || "").toString().toLowerCase();
+      const aIsDraft = !aStatus || aStatus === "draft";
+      const bIsDraft = !bStatus || bStatus === "draft";
 
       if (aIsDraft !== bIsDraft) return aIsDraft ? -1 : 1;
 
@@ -627,50 +703,18 @@ router.get('/', async (req, res) => {
 
     const paged = sorted.slice(skip, skip + perPage);
 
-    const idSet = new Set();
-    const nameSet = new Set();
-    for (const it of paged) {
-      const c = it.category;
-      if (!c) continue;
-      if (typeof c === 'object' && (c._id || c.id)) continue;
-      if (looksLikeObjectId(c)) idSet.add(String(c));
-      else if (typeof c === 'string' && c.trim()) nameSet.add(c.trim());
-    }
-
-    const [docsById, docsByName] = await Promise.all([
-      idSet.size
-        ? Category.find({ _id: { $in: Array.from(idSet) } })
-            .select('_id name slug')
-            .lean()
-        : [],
-      nameSet.size
-        ? Category.find({ name: { $in: Array.from(nameSet) } })
-            .select('_id name slug')
-            .lean()
-        : [],
-    ]);
-
-    const categoriesMapById = new Map(
-      (docsById || []).map((d) => [String(d._id), d])
-    );
-    const categoriesMapByName = new Map(
-      (docsByName || []).map((d) => [d.name, d])
-    );
-
     const normalized = normalizeArticlesWithCategories(
       paged,
-      categoriesMapById,
-      categoriesMapByName
+      new Map(),
+      new Map()
     );
 
     const items = normalized.map((a) => {
       const cleaned = sanitizeImageUrl(a.imageUrl);
       const bestPid = a.imagePublicId || DEFAULT_PID;
-
       const imageUrl =
-        cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
-
-      const imageAlt = a.imageAlt || a.title || 'News image';
+        cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : "");
+      const imageAlt = a.imageAlt || a.title || "News image";
 
       return {
         ...a,
@@ -680,23 +724,29 @@ router.get('/', async (req, res) => {
         categories: Array.isArray(a.categories)
           ? a.categories.map(toCatText)
           : [],
+        autoImageDebug: a.autoImageDebug || a._autoImageDebug || null,
       };
     });
 
     res.json({ items, total, page: pageNum, limit: perPage });
   } catch (err) {
-    console.error('[admin.articles] list error', err);
-    res.status(500).json({ error: 'failed_to_list_articles' });
+    console.error("[admin.articles] list error", err);
+    res.status(500).json({ error: "failed_to_list_articles" });
   }
 });
 
 // GET ONE — GET /api/admin/articles/:id
-router.get('/:id', async (req, res) => {
+router.get("/:id", async (req, res) => {
   try {
     const raw = await Article.findById(req.params.id)
-      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .populate({
+        path: "category",
+        select: "name slug",
+        options: { lean: true },
+      })
       .lean();
-    if (!raw) return res.status(404).json({ error: 'not_found' });
+
+    if (!raw) return res.status(404).json({ error: "not_found" });
 
     const items = normalizeArticlesWithCategories([raw]);
     const a = items[0];
@@ -704,46 +754,47 @@ router.get('/:id', async (req, res) => {
     const cleaned = sanitizeImageUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
-      cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+      cleaned || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : "");
 
     a.category = toCatText(a.category);
     a.categories = Array.isArray(a.categories)
       ? a.categories.map(toCatText)
       : [];
+    a.autoImageDebug = a.autoImageDebug || a._autoImageDebug || null;
+
     res.json(a);
   } catch (err) {
-    console.error('[admin.articles] get error', err);
-    res.status(500).json({ error: 'failed_to_get_article' });
+    console.error("[admin.articles] get error", err);
+    res.status(500).json({ error: "failed_to_get_article" });
   }
 });
 
 // ────────────────────────────────────────────────────────────────────────────────
-// PATCH (fix): normalize placeholders + rebuild image URLs
-// PATCH /api/admin/articles/:id
-router.patch('/:id', async (req, res) => {
+// PATCH — PATCH /api/admin/articles/:id
+router.patch("/:id", async (req, res) => {
   try {
     const allowed = [
-      'title',
-      'slug',
-      'category',
-      'categorySlug', // ✅ MUST exist to save it
-      'summary',
-      'homepagePlacement',
-      'imageUrl',
-      'imagePublicId',
-      'imageAlt',
-      'ogImage',
-      'thumbImage',
-      'status',
-      'tags',
-      'body',
-      'bodyHtml',
-      'author',
-      'year',
-      'era',
-      'videoUrl',
-      'videoPublicId',
-      'videoSourceUrl',
+      "title",
+      "slug",
+      "category",
+      "categorySlug",
+      "summary",
+      "homepagePlacement",
+      "imageUrl",
+      "imagePublicId",
+      "imageAlt",
+      "ogImage",
+      "thumbImage",
+      "status",
+      "tags",
+      "body",
+      "bodyHtml",
+      "author",
+      "year",
+      "era",
+      "videoUrl",
+      "videoPublicId",
+      "videoSourceUrl",
     ];
 
     const patch = {};
@@ -751,108 +802,119 @@ router.patch('/:id', async (req, res) => {
       if (req.body[k] !== undefined) patch[k] = req.body[k];
     }
 
-    // ✅ FIX: normalize category + keep categorySlug synced
-// Supports: category = "India" OR categorySlug = "india" OR category = {id,name,slug}
-if (
-  Object.prototype.hasOwnProperty.call(patch, 'category') ||
-  Object.prototype.hasOwnProperty.call(patch, 'categorySlug')
-) {
-  let incomingName = '';
-  let incomingSlug = '';
-  let incomingId = '';
+    const hasPatch = (k) => Object.prototype.hasOwnProperty.call(patch, k);
+    const nonEmptyStr = (v) => typeof v === "string" && v.trim().length > 0;
 
-  // category can be object {id,name,slug}
-  if (patch.category && typeof patch.category === 'object') {
-    incomingId = String(patch.category.id || patch.category._id || '').trim();
-    incomingName = String(patch.category.name || '').trim();
-    incomingSlug = String(patch.category.slug || '').trim();
-  } else if (typeof patch.category === 'string') {
-    incomingName = patch.category.trim();
-  }
+    if (hasPatch("category") || hasPatch("categorySlug")) {
+      let incomingName = "";
+      let incomingSlug = "";
+      let incomingId = "";
 
-  if (typeof patch.categorySlug === 'string' && patch.categorySlug.trim()) {
-    incomingSlug = patch.categorySlug.trim();
-  }
+      if (patch.category && typeof patch.category === "object") {
+        incomingId = String(patch.category.id || patch.category._id || "").trim();
+        incomingName = String(patch.category.name || "").trim();
+        incomingSlug = String(patch.category.slug || "").trim();
+      } else if (typeof patch.category === "string") {
+        incomingName = patch.category.trim();
+      }
 
-  // 1) If we have an id, use it
-  let catDoc = null;
-  if (incomingId && looksLikeObjectId(incomingId)) {
-    catDoc = await Category.findById(incomingId).select('_id name slug').lean();
-  }
+      if (typeof patch.categorySlug === "string" && patch.categorySlug.trim()) {
+        incomingSlug = patch.categorySlug.trim();
+      }
 
-  // 2) Else if we have slug or name, resolve via Category collection
-  if (!catDoc && (incomingSlug || incomingName)) {
-    const slugGuess = incomingSlug || slugify(incomingName, { lower: true, strict: true });
-    catDoc = await Category.findOne({
-      $or: [
-        { slug: slugGuess },
-        { name: new RegExp(`^${escapeRegex(incomingName || slugGuess)}$`, 'i') },
-      ],
-    })
-      .select('_id name slug')
-      .lean();
-  }
+      let catDoc = null;
+      if (incomingId && looksLikeObjectId(incomingId)) {
+        catDoc = await Category.findById(incomingId).select("_id name slug").lean();
+      }
 
-  // ✅ Store normalized values (string name + slug)
-  if (catDoc) {
-    patch.category = catDoc.name;              // IMPORTANT: store name (not object)
-    patch.categorySlug = String(catDoc.slug || '').toLowerCase();
-  } else {
-    // fallback if category isn't in DB yet
-    const finalName = (incomingName || incomingSlug || '').trim();
-    patch.category = finalName || 'General';
-    patch.categorySlug = slugify(patch.category, { lower: true, strict: true }) || 'general';
-  }
-}
+      if (!catDoc && (incomingSlug || incomingName)) {
+        const slugGuess =
+          incomingSlug || slugify(incomingName, { lower: true, strict: true });
+        catDoc = await Category.findOne({
+          $or: [
+            { slug: slugGuess },
+            { name: new RegExp(`^${escapeRegex(incomingName || slugGuess)}$`, "i") },
+          ],
+        })
+          .select("_id name slug")
+          .lean();
+      }
 
-
-    if (typeof patch.tags === 'string') {
-      patch.tags = patch.tags.split(',').map((s) => s.trim()).filter(Boolean);
-    }
-    if (patch.status === 'published') {
-      patch.publishedAt = new Date();
-    }
-
-    if (patch.imageUrl !== undefined) {
-      const cleaned = sanitizeImageUrl(patch.imageUrl);
-      if (!cleaned || isPlaceholderUrl(cleaned)) {
-        delete patch.imageUrl;
+      if (catDoc) {
+        patch.category = catDoc.name;
+        patch.categorySlug = String(catDoc.slug || "").toLowerCase();
       } else {
-        patch.imageUrl = cleaned;
+        const finalName = (incomingName || incomingSlug || "").trim();
+        patch.category = finalName || "General";
+        patch.categorySlug =
+          slugify(patch.category, { lower: true, strict: true }) || "general";
       }
     }
 
-    if (
-      patch.imagePublicId !== undefined &&
-      String(patch.imagePublicId).trim() === ''
-    ) {
-      patch.imagePublicId = null;
+    if (typeof patch.tags === "string") {
+      patch.tags = patch.tags
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+
+    if (patch.status === "published") {
+      patch.publishedAt = new Date();
+    }
+
+    /**
+     * PRODUCTION FIX:
+     * If imageUrl is present in PATCH:
+     * - empty/null/placeholder => set to null (CLEAR) (DO NOT delete key)
+     * - valid string => set cleaned string
+     */
+    if (hasPatch("imageUrl")) {
+      const cleaned = sanitizeImageUrl(patch.imageUrl);
+      if (!cleaned || isPlaceholderUrl(cleaned)) patch.imageUrl = null;
+      else patch.imageUrl = cleaned;
+    }
+
+    /**
+     * Same treatment for ogImage/thumbImage if they appear in PATCH.
+     */
+    if (hasPatch("ogImage")) {
+      const cleaned = sanitizeImageUrl(patch.ogImage);
+      patch.ogImage = cleaned ? cleaned : null;
+    }
+    if (hasPatch("thumbImage")) {
+      const cleaned = sanitizeImageUrl(patch.thumbImage);
+      patch.thumbImage = cleaned ? cleaned : null;
+    }
+
+    if (hasPatch("imagePublicId")) {
+      const pid = patch.imagePublicId;
+      if (pid === null) {
+        patch.imagePublicId = null;
+      } else if (typeof pid === "string" && pid.trim() === "") {
+        patch.imagePublicId = null;
+      } else {
+        patch.imagePublicId = String(pid).trim();
+      }
     }
 
     const current = await Article.findById(req.params.id).lean();
-    if (!current) return res.status(404).json({ error: 'not_found' });
+    if (!current) return res.status(404).json({ error: "not_found" });
 
     const merged = { ...current, ...patch };
 
-    if (
-      Object.prototype.hasOwnProperty.call(patch, 'imageUrl') &&
-      (patch.imageUrl === '' || patch.imageUrl === null)
-    ) {
-      delete merged.imageUrl;
+    // if default placeholder currently, treat as NO image (allow autopick)
+    if (isDefaultPlaceholder(merged.imagePublicId, merged.imageUrl)) {
+      merged.imagePublicId = null;
+      merged.imageUrl = null;
+      merged.ogImage = null;
+      merged.thumbImage = null;
     }
 
-    if (
-      Object.prototype.hasOwnProperty.call(patch, 'imagePublicId') &&
-      (patch.imagePublicId === '' || patch.imagePublicId === null)
-    ) {
-      delete merged.imagePublicId;
-    }
-
-    // NEW: if manual URL is a Google Drive link, resolve it to Cloudinary first
+    // Google Drive manual image -> upload to Cloudinary
     if (
       merged.imageUrl &&
-      typeof merged.imageUrl === 'string' &&
-      merged.imageUrl.includes('drive.google.com')
+      typeof merged.imageUrl === "string" &&
+      merged.imageUrl.includes("drive.google.com")
     ) {
       try {
         const fileId = extractDriveFileId(merged.imageUrl);
@@ -867,104 +929,157 @@ if (
         }
       } catch (err) {
         console.error(
-          '[admin.articles] manual Drive image override failed:',
+          "[admin.articles] manual Drive image override failed:",
           err.message || err
         );
       }
     }
 
-    // ✅ NEW: if videoUrl is a Google Drive link, convert it to Cloudinary video
-    if (
-      merged.videoUrl &&
-      typeof merged.videoUrl === 'string' &&
-      merged.videoUrl.includes('drive.google.com')
-    ) {
-      try {
-        const fileId = extractDriveFileId(merged.videoUrl);
-        if (fileId) {
-          // stream Drive file → Cloudinary video
-          const destPath = path.join(TEMP_DIR, `${fileId}.video`);
-          const dest = fs.createWriteStream(destPath);
-
-          const response = await drive.files.get(
-            { fileId, alt: 'media' },
-            { responseType: 'stream' }
-          );
-
-          await new Promise((resolve, reject) => {
-            response.data.on('end', resolve).on('error', reject).pipe(dest);
-          });
-
-          const uploaded = await cloudinary.uploader.upload(destPath, {
-            folder: process.env.CLOUDINARY_VIDEO_FOLDER || 'news-videos/manual',
-            resource_type: 'video',
-          });
-
-          try {
-            if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
-          } catch (_) {}
-
-          merged.videoSourceUrl = merged.videoUrl;
-          merged.videoPublicId = uploaded.public_id;
-          merged.videoUrl = uploaded.secure_url;
-
-          patch.videoSourceUrl = merged.videoSourceUrl;
-          patch.videoPublicId = merged.videoPublicId;
-          patch.videoUrl = merged.videoUrl;
-        }
-      } catch (err) {
-        console.error(
-          '[admin.articles] Drive video override failed:',
-          err.message || err
-        );
-      }
-    }
-
+    // if manual URL provided and is Cloudinary URL -> derive publicId
     const manualUrlProvided =
-      Object.prototype.hasOwnProperty.call(patch, 'imageUrl') &&
-      typeof patch.imageUrl === 'string' &&
-      patch.imageUrl.trim() !== '' &&
-      !patch.imagePublicId;
+      hasPatch("imageUrl") &&
+      typeof patch.imageUrl === "string" &&
+      patch.imageUrl.trim() !== "" &&
+      !hasPatch("imagePublicId");
 
     if (manualUrlProvided && !merged.imagePublicId) {
       const maybePid = deriveCloudinaryPublicIdFromUrl(merged.imageUrl);
-      if (maybePid) {
-        merged.imagePublicId = maybePid;
-      }
+      if (maybePid) merged.imagePublicId = maybePid;
     }
 
-    await decideAndAttach(merged, {
-      imageStrategy: 'cloudinary',
-      fallbacks: ['stock'],
-    });
+    // ─────────────────────────────────────────────────────────────
+    // ✅ PHASE 3 AUTO-PICK UPDATE (SAFE + PREDICTABLE)
+    // Rules:
+    // 1) If admin provides NON-EMPTY imageUrl/imagePublicId in this PATCH => MANUAL (never autopick)
+    // 2) If admin clears imageUrl/imagePublicId (null/empty) => NOT manual; stays autopick-eligible
+    // 3) If admin changes tags/category and the image was auto-picked before => re-autopick
+    // 4) If there is NO real image (or only default placeholder) and admin sets tags/category => autopick
+    // 5) Title/body edits alone do NOT trigger autopick
+    // ─────────────────────────────────────────────────────────────
+
+    const manualOverrideInPatch =
+      (hasPatch("imageUrl") && nonEmptyStr(patch.imageUrl)) ||
+      (hasPatch("imagePublicId") && nonEmptyStr(patch.imagePublicId));
+
+    const clearingImageInPatch =
+      !manualOverrideInPatch &&
+      (hasPatch("imageUrl") || hasPatch("imagePublicId")) &&
+      ((hasPatch("imageUrl") && !nonEmptyStr(patch.imageUrl)) ||
+        (hasPatch("imagePublicId") && !nonEmptyStr(patch.imagePublicId)));
+
+    const affectsPick =
+      hasPatch("tags") || hasPatch("category") || hasPatch("categorySlug");
+
+    const wasAutoPicked = !!current.autoImagePicked;
+
+    const currentHasRealImage =
+      (typeof current.imagePublicId === "string" &&
+        current.imagePublicId.trim() &&
+        !isDefaultPlaceholder(current.imagePublicId, "")) ||
+      (typeof current.imageUrl === "string" &&
+        current.imageUrl.trim() &&
+        !isDefaultPlaceholder("", current.imageUrl));
+
+    // If admin manually overrides image in this PATCH => lock as manual
+    if (manualOverrideInPatch) {
+      merged.autoImagePicked = false;
+      merged.autoImagePickedAt = null;
+
+      merged._autoImageDebug = {
+        mode: "manual",
+        updatedAt: new Date().toISOString(),
+        imagePublicId: merged.imagePublicId || null,
+        imageUrl: merged.imageUrl || null,
+      };
+      merged.autoImageDebug = null;
+    }
+
+
+    // ✅ If admin manually sets imagePublicId, force URLs to match it
+if (
+  manualOverrideInPatch &&
+  typeof merged.imagePublicId === "string" &&
+  merged.imagePublicId.trim()
+) {
+  merged.imageUrl = null;
+  merged.ogImage = null;
+  merged.thumbImage = null;
+}
+
+    // If admin is clearing image fields => ensure they are truly cleared and NOT manual
+    if (clearingImageInPatch) {
+      merged.imagePublicId = null;
+      merged.imageUrl = null;
+      merged.ogImage = null;
+      merged.thumbImage = null;
+
+      // Clearing means: not manual, and not auto-picked (until a pick happens)
+      merged.autoImagePicked = false;
+      merged.autoImagePickedAt = null;
+
+      // Remove manual debug if it existed (this was the proven bug)
+      merged.autoImageDebug = null;
+      merged._autoImageDebug = null;
+    }
+
+    const shouldAutoPick =
+      !manualOverrideInPatch &&
+      affectsPick &&
+      (wasAutoPicked || !currentHasRealImage);
+
+    if (shouldAutoPick) {
+      // Clear current image so decideAndAttach can choose again
+      merged.imagePublicId = null;
+      merged.imageUrl = null;
+      merged.ogImage = null;
+      merged.thumbImage = null;
+
+      // Clear old debug so it doesn't confuse the admin
+      merged.autoImageDebug = null;
+      merged._autoImageDebug = null;
+      merged.autoImagePicked = false;
+      merged.autoImagePickedAt = null;
+
+      await decideAndAttach(merged, {
+        imageStrategy: "cloudinary",
+        fallbacks: ["stock"],
+      });
+    }
+
+    // Only finalize URLs if we have something (and never force defaults into DB)
     finalizeImageFields(merged);
 
+    // Keep og/thumb in sync if imageUrl exists and og/thumb missing
     if (!merged.thumbImage && merged.imageUrl) merged.thumbImage = merged.imageUrl;
     if (!merged.ogImage && merged.imageUrl) merged.ogImage = merged.imageUrl;
 
     const toSaveKeys = [
-      'title',
-      'slug',
-      'category',
-      'categorySlug', // ✅ MUST SAVE THIS
-      'summary',
-      'homepagePlacement',
-      'imageUrl',
-      'imagePublicId',
-      'imageAlt',
-      'status',
-      'tags',
-      'body',
-      'bodyHtml',
-      'author',
-      'publishedAt',
-      'ogImage',
-      'thumbImage',
-      'year',
-      'era',
-      'videoUrl',
-      'videoPublicId',
-      'videoSourceUrl',
+      "title",
+      "slug",
+      "category",
+      "categorySlug",
+      "summary",
+      "homepagePlacement",
+      "imageUrl",
+      "imagePublicId",
+      "imageAlt",
+      "status",
+      "tags",
+      "body",
+      "bodyHtml",
+      "author",
+      "publishedAt",
+      "ogImage",
+      "thumbImage",
+      "year",
+      "era",
+      "videoUrl",
+      "videoPublicId",
+      "videoSourceUrl",
+      "autoImageDebug",
+      "_autoImageDebug",
+      "autoImagePicked",
+      "autoImagePickedAt",
     ];
 
     const toSave = {};
@@ -977,10 +1092,14 @@ if (
       { $set: toSave },
       { new: true }
     )
-      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .populate({
+        path: "category",
+        select: "name slug",
+        options: { lean: true },
+      })
       .lean();
 
-    if (!updated) return res.status(404).json({ error: 'not_found' });
+    if (!updated) return res.status(404).json({ error: "not_found" });
 
     const items = normalizeArticlesWithCategories([updated]);
     const a = items[0];
@@ -988,59 +1107,42 @@ if (
     const cleanedUrl = sanitizeImageUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
-      cleanedUrl || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+      cleanedUrl || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : "");
 
     a.category = toCatText(a.category);
-    a.categories = Array.isArray(a.categories)
-      ? a.categories.map(toCatText)
-      : [];
+    a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
+    a.autoImageDebug = a.autoImageDebug || a._autoImageDebug || null;
+
     res.json(a);
   } catch (err) {
-    console.error('[admin.articles] patch error', err);
-    res.status(500).json({ error: 'failed_to_update_article' });
+    console.error("[admin.articles] patch error", err);
+    res.status(500).json({ error: "failed_to_update_article" });
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────────
 // SET DEFAULT IMAGE — POST /api/admin/articles/:id/use-default-image
-router.post('/:id/use-default-image', async (req, res) => {
+router.post("/:id/use-default-image", async (req, res) => {
   try {
     const { id } = req.params;
-
-    console.log(
-      '[admin.use-default-image] id =',
-      id,
-      'DEFAULT_PID =',
-      DEFAULT_PID,
-      'CLOUD_NAME =',
-      CLOUD_NAME
-    );
 
     if (!DEFAULT_PID || !CLOUD_NAME) {
       return res.status(500).json({
         ok: false,
-        error: 'no_default_image_configured',
+        error: "no_default_image_configured",
       });
     }
 
     const article = await Article.findById(id);
     if (!article) {
-      return res.status(404).json({ ok: false, error: 'not_found' });
+      return res.status(404).json({ ok: false, error: "not_found" });
     }
 
-    // Force the default image
     article.imagePublicId = DEFAULT_PID;
     article.imageUrl = null;
     article.ogImage = null;
     article.thumbImage = null;
 
     finalizeImageFields(article);
-
-    console.log('[admin.use-default-image] saved URLs =', {
-      imageUrl: article.imageUrl,
-      ogImage: article.ogImage,
-      thumbImage: article.thumbImage,
-    });
 
     await article.save();
 
@@ -1052,59 +1154,65 @@ router.post('/:id/use-default-image', async (req, res) => {
       thumbImage: article.thumbImage,
     });
   } catch (err) {
-    console.error('[admin.articles] use-default-image error:', err);
+    console.error("[admin.articles] use-default-image error:", err);
     return res
       .status(500)
       .json({ ok: false, error: String(err.message || err) });
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────────
 // PUBLISH — POST /api/admin/articles/:id/publish
-router.post('/:id/publish', async (req, res) => {
+router.post("/:id/publish", async (req, res) => {
   try {
     const updated = await Article.findByIdAndUpdate(
       req.params.id,
-      { $set: { status: 'published', publishedAt: new Date() } },
+      { $set: { status: "published", publishedAt: new Date() } },
       { new: true }
     )
-      .populate({ path: 'category', select: 'name slug', options: { lean: true } })
+      .populate({
+        path: "category",
+        select: "name slug",
+        options: { lean: true },
+      })
       .lean();
 
-    if (!updated) return res.status(404).json({ error: 'not_found' });
+    if (!updated) return res.status(404).json({ error: "not_found" });
 
     const items = normalizeArticlesWithCategories([updated]);
     const a = items[0];
+
     const cleanedUrl = sanitizeImageUrl(a.imageUrl);
     const bestPid = a.imagePublicId || DEFAULT_PID;
     a.imageUrl =
-      cleanedUrl || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : '');
+      cleanedUrl || (bestPid && CLOUD_NAME ? buildCloudinaryUrl(bestPid) : "");
+
     a.category = toCatText(a.category);
     a.categories = Array.isArray(a.categories)
       ? a.categories.map(toCatText)
       : [];
+    a.autoImageDebug = a.autoImageDebug || a._autoImageDebug || null;
+
     res.json(a);
 
     try {
-      const { publishEverywhere } = require('../services/socialPublisher');
+      const { publishEverywhere } = require("../services/socialPublisher");
       Promise.resolve()
         .then(() => publishEverywhere(updated))
         .catch(() => {});
     } catch (_) {}
   } catch (err) {
-    console.error('[admin.articles] publish error', err);
-    res.status(500).json({ error: 'failed_to_publish' });
+    console.error("[admin.articles] publish error", err);
+    res.status(500).json({ error: "failed_to_publish" });
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────────
 // AI IMAGE — POST /api/admin/articles/:id/ai-image
-router.post('/:id/ai-image', async (req, res) => {
+router.post("/:id/ai-image", async (req, res) => {
   try {
-    if (process.env.AI_IMAGE_ENABLED === 'false') {
+    if (process.env.AI_IMAGE_ENABLED === "false") {
       return res.status(403).json({
         ok: false,
-        error: 'ai_image_disabled',
+        error: "ai_image_disabled",
       });
     }
 
@@ -1114,7 +1222,7 @@ router.post('/:id/ai-image', async (req, res) => {
     if (!result) {
       return res.status(404).json({
         ok: false,
-        error: 'ai_image_failed',
+        error: "ai_image_failed",
       });
     }
 
@@ -1127,10 +1235,10 @@ router.post('/:id/ai-image', async (req, res) => {
       thumbImage: result.thumbImage,
     });
   } catch (err) {
-    console.error('[admin.articles] /:id/ai-image error:', err);
+    console.error("[admin.articles] /:id/ai-image error", err);
     return res.status(500).json({
       ok: false,
-      error: err.message || 'ai_image_failed',
+      error: err.message || "ai_image_failed",
     });
   }
 });

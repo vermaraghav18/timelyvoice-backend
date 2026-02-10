@@ -1,44 +1,45 @@
 // backend/src/controllers/admin.articles.controller.js
 
-const Article = require('../models/Article');
-const { buildImageVariants } = require('../services/imageVariants');
-const { decideAndAttach } = require('../services/imageStrategy');
+const Article = require("../models/Article");
+const { buildImageVariants } = require("../services/imageVariants");
+const { decideAndAttach } = require("../services/imageStrategy");
 const {
   uploadDriveImageToCloudinary,
   uploadDriveVideoToCloudinary,
-} = require('../services/googleDriveUploader');
+} = require("../services/googleDriveUploader");
 
-const { chooseHeroImage } = require('../services/imagePicker');
-const slugify = require('slugify');
+const slugify = require("slugify");
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
-const PLACEHOLDER_HOSTS = ['example.com', 'cdn.example', 'your-cdn.example'];
+const PLACEHOLDER_HOSTS = ["example.com", "cdn.example", "your-cdn.example"];
 
-function isPlaceholderUrl(url = '') {
+function isPlaceholderUrl(url = "") {
   if (!url) return true;
   try {
     const { hostname } = new URL(url);
     return (
       !hostname ||
       PLACEHOLDER_HOSTS.includes(hostname) ||
-      hostname.includes('example')
+      hostname.includes("example")
     );
   } catch {
     return true;
   }
 }
 
-function isPlaceholderPublicId(pid = '') {
+function isPlaceholderPublicId(pid = "") {
   if (!pid) return true;
-  const s = pid.toLowerCase();
-  const def =
-    (process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
-      'news-images/defaults/fallback-hero').toLowerCase();
+  const s = String(pid).toLowerCase();
+
+  const def = String(
+    process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
+      "news-images/defaults/fallback-hero"
+  ).toLowerCase();
 
   if (s === def) return true;
-  return s.includes('placeholder') || s.includes('example') || s === 'news/default';
+  return s.includes("placeholder") || s.includes("example") || s === "news/default";
 }
 
 function ensureSlug(a) {
@@ -50,24 +51,31 @@ function ensureSlug(a) {
 function normalizeIncoming(raw = {}) {
   const a = { ...raw };
 
-  a.status = a.status || 'draft';
+  a.status = a.status || "draft";
   a.title = a.title?.trim();
   a.slug = a.slug?.trim();
   a.category = a.category?.trim();
 
-    // NEW: normalize homepage placement
-  a.homepagePlacement = String(a.homepagePlacement || 'none').trim().toLowerCase();
+  // normalize homepage placement
+  a.homepagePlacement = String(a.homepagePlacement || "none")
+    .trim()
+    .toLowerCase();
 
-  // Safety: allow only the known values
-  if (!['none', 'top', 'latest', 'trending'].includes(a.homepagePlacement)) {
-    a.homepagePlacement = 'none';
+  if (!["none", "top", "latest", "trending"].includes(a.homepagePlacement)) {
+    a.homepagePlacement = "none";
   }
 
-
-  if (!Array.isArray(a.tags) && typeof a.tags === 'string') {
-    a.tags = a.tags.split(',').map(t => t.trim()).filter(Boolean);
+  if (!Array.isArray(a.tags) && typeof a.tags === "string") {
+    a.tags = a.tags
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
   }
   if (!Array.isArray(a.tags)) a.tags = [];
+
+  // IMPORTANT: empty strings should not block autopick
+  if (typeof a.imageUrl === "string" && !a.imageUrl.trim()) delete a.imageUrl;
+  if (typeof a.imagePublicId === "string" && !a.imagePublicId.trim()) delete a.imagePublicId;
 
   if (isPlaceholderPublicId(a.imagePublicId)) delete a.imagePublicId;
   if (isPlaceholderUrl(a.imageUrl)) delete a.imageUrl;
@@ -86,33 +94,41 @@ function finalizeImageFields(article) {
   if (!article.thumbImage) article.thumbImage = vars.thumb;
 
   if (!article.imageAlt) {
-    article.imageAlt = article.title || 'News image';
+    article.imageAlt = article.title || "News image";
   }
 }
 
 // ✅ VIDEO helper: Drive URL → Cloudinary video URL
 async function maybeUploadDriveVideo(article) {
-  if (typeof article.videoUrl !== 'string') return;
+  if (typeof article.videoUrl !== "string") return;
 
   const raw = article.videoUrl.trim();
   if (!raw) return;
 
-  // Only convert Google Drive links
-  if (!raw.includes('drive.google.com')) return;
+  if (!raw.includes("drive.google.com")) return;
 
-  // Keep original (optional but useful)
   article.videoSourceUrl = raw;
 
   const uploadedVideo = await uploadDriveVideoToCloudinary(raw, {
-    folder: process.env.CLOUDINARY_VIDEO_FOLDER || 'news-videos',
+    folder: process.env.CLOUDINARY_VIDEO_FOLDER || "news-videos",
   });
 
   article.videoPublicId = uploadedVideo.public_id;
   article.videoUrl = uploadedVideo.secure_url;
 }
 
+// helper: treat as a real manual URL only if it starts with http(s)
+function isRealManualHttpUrl(u) {
+  if (typeof u !== "string") return false;
+  const s = u.trim();
+  if (!s) return false;
+  if (!/^https?:\/\//i.test(s)) return false;
+  if (isPlaceholderUrl(s)) return false;
+  return true;
+}
+
 // ─────────────────────────────────────────────────────────────
-// CREATE ARTICLE — FULL GOOGLE DRIVE → CLOUDINARY SUPPORT
+// CREATE ARTICLE — DB-FIRST AUTOPICK (ImageLibrary → Cloudinary → Default)
 // ─────────────────────────────────────────────────────────────
 exports.createOne = async (req, res) => {
   try {
@@ -120,69 +136,61 @@ exports.createOne = async (req, res) => {
 
     ensureSlug(article);
 
-    article.status = article.status.toLowerCase();
-    if (article.status === 'published' && !article.publishedAt) {
+    article.status = String(article.status || "draft").toLowerCase();
+    if (article.status === "published" && !article.publishedAt) {
       article.publishedAt = new Date();
     }
 
-    // ✔️ FIXED LOGIC: Only real URLs bypass the auto-picker
+    // ✅ Manual imageUrl provided → upload to Cloudinary and lock it in
     const manualUrlProvided =
-      typeof article.imageUrl === 'string' &&
-      article.imageUrl.trim().startsWith('http') &&
-      !article.imagePublicId;
+      isRealManualHttpUrl(article.imageUrl) && !article.imagePublicId;
 
-    // AUTO PICK
-    if (!manualUrlProvided && !article.imagePublicId) {
-      const pick = await chooseHeroImage({
-        title: article.title,
-        summary: article.summary,
-        category: article.category,
-        tags: article.tags,
-        slug: article.slug,
-      });
-
-      if (pick) {
-        console.log('[imagePicker] createOne chooseHeroImage:', {
-          title: article.title,
-          why: pick.why,
-          publicId: pick.publicId,
-          url: pick.url,
-        });
-      }
-
-      if (pick && pick.publicId) {
-        article.imagePublicId = pick.publicId;
-        if (pick.url && !article.imageUrl) {
-          article.imageUrl = pick.url;
-        }
-      }
-    }
-
-    // Manual URL provided (actual URL)
     if (manualUrlProvided) {
+      const sourceUrl = article.imageUrl;
+
       const uploaded = await uploadDriveImageToCloudinary(article.imageUrl, {
-        folder: process.env.CLOUDINARY_FOLDER || 'news-images',
+        folder: process.env.CLOUDINARY_FOLDER || "news-images",
       });
+
       article.imagePublicId = uploaded.public_id;
       article.imageUrl = uploaded.secure_url;
+
+      article.autoImageDebug = {
+        mode: "manual",
+        sourceUrl,
+        uploadedTo: "cloudinary",
+        publicId: uploaded.public_id || null,
+        url: uploaded.secure_url || null,
+        pickedAt: new Date().toISOString(),
+      };
+
+      // manual means not auto-picked
+      article.autoImagePicked = false;
+      article.autoImagePickedAt = null;
+    } else {
+      // ✅ AUTO PICK (DB-first strategy)
+      await decideAndAttach(article);
+
+      // decideAndAttach sets:
+      // - article.imagePublicId / imageUrl
+      // - article.autoImageDebug
+      // - article.autoImagePicked / autoImagePickedAt
     }
 
-    // ✅ VIDEO: If admin provides Drive video URL, upload to Cloudinary and store Cloudinary URL
     await maybeUploadDriveVideo(article);
 
     finalizeImageFields(article);
 
     const saved = await Article.create(article);
-
-    return res.json({ ok: true, id: saved._id, slug: saved.slug });
+    return res.json(saved.toObject());
   } catch (err) {
-    console.error('[admin.articles] createOne error:', err);
+    console.error("[admin.articles] createOne error:", err);
     return res.status(500).json({ ok: false, error: String(err.message) });
   }
 };
 
 // ─────────────────────────────────────────────────────────────
-// IMPORT MANY
+// IMPORT MANY — DB-FIRST AUTOPICK (ImageLibrary → Cloudinary → Default)
 // ─────────────────────────────────────────────────────────────
 exports.importMany = async (req, res) => {
   try {
@@ -194,52 +202,39 @@ exports.importMany = async (req, res) => {
         let article = normalizeIncoming(raw);
         ensureSlug(article);
 
-        article.status = article.status.toLowerCase();
-        if (article.status === 'published' && !article.publishedAt) {
+        article.status = String(article.status || "draft").toLowerCase();
+        if (article.status === "published" && !article.publishedAt) {
           article.publishedAt = new Date();
         }
 
-        // ✔️ FIXED LOGIC HERE TOO
         const manualUrlProvided =
-          typeof article.imageUrl === 'string' &&
-          article.imageUrl.trim().startsWith('http') &&
-          !article.imagePublicId;
-
-        if (!manualUrlProvided && !article.imagePublicId) {
-          const pick = await chooseHeroImage({
-            title: article.title,
-            summary: article.summary,
-            category: article.category,
-            tags: article.tags,
-            slug: article.slug,
-          });
-
-          if (pick) {
-            console.log('[imagePicker] importMany chooseHeroImage:', {
-              title: article.title,
-              why: pick.why,
-              publicId: pick.publicId,
-              url: pick.url,
-            });
-          }
-
-          if (pick && pick.publicId) {
-            article.imagePublicId = pick.publicId;
-            if (pick.url && !article.imageUrl) {
-              article.imageUrl = pick.url;
-            }
-          }
-        }
+          isRealManualHttpUrl(article.imageUrl) && !article.imagePublicId;
 
         if (manualUrlProvided) {
+          const sourceUrl = article.imageUrl;
+
           const uploaded = await uploadDriveImageToCloudinary(article.imageUrl, {
-            folder: process.env.CLOUDINARY_FOLDER || 'news-images',
+            folder: process.env.CLOUDINARY_FOLDER || "news-images",
           });
+
           article.imagePublicId = uploaded.public_id;
           article.imageUrl = uploaded.secure_url;
+
+          article.autoImageDebug = {
+            mode: "manual",
+            sourceUrl,
+            uploadedTo: "cloudinary",
+            publicId: uploaded.public_id || null,
+            url: uploaded.secure_url || null,
+            pickedAt: new Date().toISOString(),
+          };
+
+          article.autoImagePicked = false;
+          article.autoImagePickedAt = null;
+        } else {
+          await decideAndAttach(article);
         }
 
-        // ✅ VIDEO: If admin provides Drive video URL, upload to Cloudinary and store Cloudinary URL
         await maybeUploadDriveVideo(article);
 
         finalizeImageFields(article);
@@ -253,13 +248,13 @@ exports.importMany = async (req, res) => {
 
     return res.json({ ok: true, results });
   } catch (err) {
-    console.error('[importMany]', err);
+    console.error("[importMany]", err);
     return res.status(500).json({ ok: false, error: String(err.message) });
   }
 };
 
 // ─────────────────────────────────────────────────────────────
-// PREVIEW MANY
+// PREVIEW MANY — DB-FIRST AUTOPICK (NO DB WRITES)
 // ─────────────────────────────────────────────────────────────
 exports.previewMany = async (req, res) => {
   try {
@@ -270,47 +265,14 @@ exports.previewMany = async (req, res) => {
       let article = normalizeIncoming(raw);
       ensureSlug(article);
 
-      // ✔️ FIX APPLIED HERE ALSO
       const manualUrlProvided =
-        typeof article.imageUrl === 'string' &&
-        article.imageUrl.trim().startsWith('http') &&
-        !article.imagePublicId;
+        isRealManualHttpUrl(article.imageUrl) && !article.imagePublicId;
 
+      // ✅ Preview should NOT upload manual images (keep preview cheap)
       if (!manualUrlProvided && !article.imagePublicId) {
-        const pick = await chooseHeroImage({
-          title: article.title,
-          summary: article.summary,
-          category: article.category,
-          tags: article.tags,
-          slug: article.slug,
-        });
-
-        if (pick) {
-          console.log('[imagePicker] previewMany chooseHeroImage:', {
-            title: article.title,
-            why: pick.why,
-            publicId: pick.publicId,
-            url: pick.url,
-          });
-        }
-
-        if (pick && pick.publicId) {
-          article.imagePublicId = pick.publicId;
-          if (pick.url && !article.imageUrl) {
-            article.imageUrl = pick.url;
-          }
-        }
+        await decideAndAttach(article);
       }
 
-      if (manualUrlProvided) {
-        const uploaded = await uploadDriveImageToCloudinary(article.imageUrl, {
-          folder: process.env.CLOUDINARY_FOLDER || 'news-images',
-        });
-        article.imagePublicId = uploaded.public_id;
-        article.imageUrl = uploaded.secure_url;
-      }
-
-      // NOTE: We do NOT upload video in previewMany (keep preview fast + cheap)
       finalizeImageFields(article);
 
       previews.push({
@@ -319,12 +281,15 @@ exports.previewMany = async (req, res) => {
         imagePublicId: article.imagePublicId,
         imageUrl: article.imageUrl,
         ogImage: article.ogImage,
+        thumbImage: article.thumbImage,
+        autoImageDebug: article.autoImageDebug || article._autoImageDebug || null,
+        autoImagePicked: article.autoImagePicked || false,
       });
     }
 
-    res.json({ ok: true, previews });
+    return res.json({ ok: true, previews });
   } catch (err) {
-    console.error('[previewMany]', err);
-    res.status(500).json({ ok: false, error: String(err.message) });
+    console.error("[previewMany]", err);
+    return res.status(500).json({ ok: false, error: String(err.message) });
   }
 };

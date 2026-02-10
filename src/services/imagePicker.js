@@ -1,712 +1,453 @@
 // -----------------------------------------------------------------------------
-// imagePicker.js  (Google Drive → Cloudinary Hybrid Auto-Image System)
-// CLEANED VERSION: never returns default image; only real Drive picks or null
+// backend/src/services/imagePicker.js
+// CLOUDINARY-ONLY Auto-Image System (STRICT TAG-FIRST, NORMALIZED + STEMMED)
+// -----------------------------------------------------------------------------
+// RULES (NO EXCEPTIONS):
+// 1) If article has tags → ONLY Cloudinary images with matching tags are allowed
+// 2) If no tag-matching images → RETURN null (never pick random)
+// 3) Context / public_id are SECONDARY signals (after tags)
+// 4) Prefer >= 2 tag matches if possible (but gracefully fall back to 1 if none)
+// 5) If article tags are only "generic" (world/news/etc) → RETURN null
+// 6) Accept tags in multiple shapes (string/array/objects) and normalize them
+// 7) Expand compound tags like "iran_missile" / "iran-missile" into tokens
 // -----------------------------------------------------------------------------
 
-const fs = require("fs");
-const path = require("path");
 const { v2: cloudinary } = require("cloudinary");
-const Article = require("../models/Article");
-const { getDriveClient } = require("./driveClient");
 
 // -----------------------------------------------------------------------------
 // CONFIG
 // -----------------------------------------------------------------------------
-const DRIVE_FOLDER_ID =
-  process.env.GOOGLE_DRIVE_NEWS_FOLDER_ID ||
-  process.env.GOOGLE_DRIVE_FOLDER_ID;
-
-const TEMP_DIR = path.join(__dirname, "../../tmp-drive-images");
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
-}
-
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
-  secure: true
+  secure: true,
 });
 
-const { drive, credSource } = getDriveClient();
+const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || "news-images";
+const MAX_CANDIDATES = Number(process.env.CLOUDINARY_AUTOPICK_MAX || 80);
+const MIN_SCORE = Number(process.env.CLOUDINARY_AUTOPICK_MIN_SCORE || 3);
+
+// Prefer at least this many tag matches (but we will fall back to 1 if none)
+const MIN_TAG_MATCHES = Number(process.env.CLOUDINARY_AUTOPICK_MIN_TAG_MATCHES || 2);
+
+// Exclude prefixes from auto-pick (comma-separated)
+// Default excludes AI folder inside the configured folder.
+const EXCLUDE_PREFIXES = (process.env.CLOUDINARY_AUTOPICK_EXCLUDE_PREFIXES || `${CLOUDINARY_FOLDER}/ai/`)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 
 // -----------------------------------------------------------------------------
-// TEXT UTILS
+// UTILS
 // -----------------------------------------------------------------------------
 const STOPWORDS = new Set([
-  "the",
-  "a",
-  "an",
-  "of",
-  "for",
-  "to",
-  "on",
-  "in",
-  "by",
-  "at",
-  "as",
-  "and",
-  "or",
-  "but",
-  "is",
-  "are",
-  "was",
-  "were",
-  "be",
-  "been",
-  "being",
-  "from",
-  "with",
-  "over",
-  "under",
-  "into",
-  "out",
-  "new",
-  "latest",
-  "says",
-  "said",
-  "report",
-  "minister",
-  "ministry",
-  "govt",
-  "government"
-  // ❌ REMOVED: india, indian, country
+  "the","a","an","of","for","to","on","in","by","at","as","and","or","but",
+  "is","are","was","were","be","been","being","from","with","over","under",
+  "into","out","new","latest","says","said","report"
 ]);
 
-function tokenize(str = "") {
-  return String(str)
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, " ")
-    .split(/[\s-]+/g)
-    .filter(Boolean);
-}
+// "generic" tags that are too broad to decide an image
+const GENERIC_TAGS = new Set([
+  "world","india","news","politics","business","sports","technology","tech",
+  "entertainment","breaking","latest","update","general"
+]);
 
-function dedupe(a) {
-  return Array.from(new Set(a));
+function dedupe(arr) {
+  return Array.from(new Set(arr));
 }
 
 function stem(t) {
+  if (!t) return "";
   if (t.endsWith("ies")) return t.slice(0, -3) + "y";
   if (t.endsWith("s") && t.length > 3) return t.slice(0, -1);
   return t;
 }
 
-function ngrams(tokens, n) {
-  const out = [];
-  for (let i = 0; i <= tokens.length - n; i++) {
-    out.push(tokens.slice(i, i + n).join(" "));
+// Normalize hashtags and junk ("#Iran " -> "iran")
+function normalizeTag(raw = "") {
+  const s = String(raw || "").trim().toLowerCase();
+  if (!s) return "";
+  const noHash = s.replace(/^#+/g, "");
+  // keep underscore and hyphen (we will tokenize them later)
+  const clean = noHash.replace(/[^a-z0-9_-]/g, "");
+  return clean;
+}
+
+function normStemTag(raw = "") {
+  return stem(normalizeTag(raw));
+}
+
+function isGenericTag(t) {
+  return GENERIC_TAGS.has(t);
+}
+
+// Split tag into token parts, supporting underscore + hyphen
+function splitTagTokens(tag = "") {
+  return String(tag)
+    .toLowerCase()
+    .split(/[_-]+/g)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+// Expand a raw tag into multiple normalized tokens:
+// "iran_missiles" -> ["iran","missile","iran_missile"]
+function expandTag(raw = "") {
+  const base = normalizeTag(raw);
+  if (!base) return [];
+  const parts = splitTagTokens(base);
+  const expanded = [base, ...parts].map(stem).filter(Boolean);
+  return expanded.filter((t) => !STOPWORDS.has(t) && t.length >= 3);
+}
+
+// Accept tags in multiple shapes and normalize them (base tokens only)
+function normalizeArticleTags(input) {
+  if (typeof input === "string") {
+    return input
+      .split(/[,|]/g)
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .map(normStemTag)
+      .filter(Boolean);
   }
+
+  if (Array.isArray(input)) {
+    return input
+      .map((x) => {
+        if (typeof x === "string") return x;
+        if (x && typeof x === "object") return x.value || x.label || x.name || "";
+        return "";
+      })
+      .map(normStemTag)
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
+// -----------------------------------------------------------------------------
+// CLOUDINARY LOAD
+// -----------------------------------------------------------------------------
+async function loadCloudinaryCandidates(folder, limit) {
+  const outMap = new Map();
+
+  // We try multiple expressions because Cloudinary “folders” behave differently
+  // depending on folder mode (fixed vs dynamic/DAM).
+  const expressions = [
+    // fixed folder mode: folder is part of public_id
+    `resource_type:image AND type:upload AND public_id:${folder}/*`,
+    // dynamic folder mode / DAM: folder stored in asset_folder
+    `resource_type:image AND type:upload AND asset_folder:${folder}`,
+    // fallback (some accounts expose folder field)
+    `resource_type:image AND type:upload AND folder:${folder}`,
+  ];
+
+  async function runSearch(expression) {
+    let nextCursor = null;
+
+    while (outMap.size < limit) {
+      const q = cloudinary.search
+        .expression(expression)
+        .sort_by("created_at", "desc")
+        .max_results(Math.min(100, limit - outMap.size))
+        .with_field("tags")
+        .with_field("context");
+
+      if (nextCursor) q.next_cursor(nextCursor);
+
+      const res = await q.execute();
+
+      for (const r of res.resources || []) {
+        if (r?.public_id && !outMap.has(r.public_id)) outMap.set(r.public_id, r);
+      }
+
+      if (!res.next_cursor) break;
+      nextCursor = res.next_cursor;
+    }
+  }
+
+  // Run each expression until we have enough candidates
+  for (const expr of expressions) {
+    try {
+      await runSearch(expr);
+      if (outMap.size >= limit) break;
+    } catch (e) {
+      console.log("[imagePicker] Cloudinary search failed for expression", { expr, err: e?.message });
+    }
+  }
+
+  let out = Array.from(outMap.values());
+
+  // Exclude disallowed prefixes (supports both folder style and naming style)
+  out = out.filter((a) => {
+    const pid = a?.public_id || "";
+    return !EXCLUDE_PREFIXES.some((pref) => pid.startsWith(pref));
+  });
+
+  console.log("[imagePicker] Candidates loaded (Search API)", {
+    folder,
+    totalAfterFilter: out.length,
+    excludedPrefixes: EXCLUDE_PREFIXES,
+    sample: out.slice(0, 5).map(x => ({ public_id: x.public_id, tags: x.tags || [], context: x?.context?.custom || null })),
+  });
+
   return out;
 }
 
-// -----------------------------------------------------------------------------
-// STRONG NAMES (leaders)
-// -----------------------------------------------------------------------------
-function strongNamesFrom(title, summary) {
-  const toks = tokenize(`${title} ${summary}`);
 
-  return dedupe(
-    toks.filter((t) =>
-      /^(modi|rahul|rajnath|gandhi|singh|ambani|adani|shah|yogi|kejriwal|trump|biden|musk|putin|vladimir|xi|jinping|zelensky|netanyahu|sunak|scholz|macron)$/.test(
-        t
-      )
-    )
-  );
+// -----------------------------------------------------------------------------
+// ASSET HELPERS
+// -----------------------------------------------------------------------------
+function getAssetTags(asset) {
+  // 1) PRIMARY: editorial tags stored in context metadata (reliable)
+  const ctxCustom = asset?.context?.custom || {};
+  const ctxTagsRaw =
+    ctxCustom.article_tags ||
+    ctxCustom.tags ||
+    ctxCustom.keywords ||
+    "";
+
+  const ctxTags = String(ctxTagsRaw || "")
+    .split(/[,|]/g)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  // 2) SECONDARY: Cloudinary asset tags (often empty for auto-tags)
+  const assetTags = Array.isArray(asset?.tags) ? asset.tags : [];
+
+  const mergedRaw = dedupe([...ctxTags, ...assetTags]);
+
+  // expand compound tags into tokens + normalize
+  const expanded = mergedRaw.flatMap(expandTag);
+  const base = mergedRaw.map(normStemTag).filter(Boolean);
+
+  return dedupe([...expanded, ...base]);
 }
 
-// All strong-name tokens we care about for filtering filenames
-const ALL_STRONG_NAME_TOKENS = [
-  "modi",
-  "rahul",
-  "rajnath",
-  "gandhi",
-  "singh",
-  "ambani",
-  "adani",
-  "shah",
-  "yogi",
-  "kejriwal",
-  "trump",
-  "biden",
-  "musk",
-  "putin",
-  "vladimir",
-  "xi",
-  "jinping",
-  "zelensky",
-  "netanyahu",
-  "sunak",
-  "scholz",
-  "macron"
-];
+function getAssetContextText(asset) {
+  const ctx = asset?.context?.custom || {};
+  return Object.values(ctx)
+    .filter((v) => typeof v === "string")
+    .join(" ")
+    .toLowerCase();
+}
 
-// Returns true if filename contains some *other* strong leader name
-// that is NOT part of the article strongNames list.
-function containsOtherStrongName(fileNameLower, articleStrongNames) {
-  const allowed = new Set(
-    (articleStrongNames || []).map((s) => String(s).toLowerCase())
-  );
-
-  for (const token of ALL_STRONG_NAME_TOKENS) {
-    if (!fileNameLower.includes(token)) continue;
-    if (!allowed.has(token)) {
-      // file has a strong leader who is not in this article
-      return true;
-    }
-  }
-  return false;
+function getAssetIdText(asset) {
+  return String(asset?.public_id || "").toLowerCase();
 }
 
 // -----------------------------------------------------------------------------
-// BRAND / INSTITUTION STRONG TOKENS (IndiGo, RBI, GDP, Market, etc.)
+// SCORING (AFTER TAG FILTER)
 // -----------------------------------------------------------------------------
-const BRAND_STRONG_TOKENS = new Set([
-  // Airlines
-  "indigo",
-  "airindia",
-  "vistara",
-  "spicejet",
-  "akasa",
-  "goair",
-  "airasia",
+function scoreAsset(asset, tokens) {
+  const tags = getAssetTags(asset);
+  const ctx = getAssetContextText(asset);
+  const pid = getAssetIdText(asset);
 
-  // Financial / markets / regulators
-  "rbi",
-  "sebi",
-  "sensex",
-  "nifty",
-  "gdp",
-  "bse",
-  "nse",
-  "stock",
-  "market",
-  "markets",
-
-  // Institutions
-  "isro",
-  "drdo",
-  "railway",
-  "railways",
-  "indianrailways",
-
-  // 🏏 Cricket / sports boards (NEW – make BCCI images win clearly)
-  "bcci",
-  "icc",
-  "ipl",
-  "wpl"
-]);
-
-// subset we want to treat as *extra* strong sports boards
-const SPORTS_BOARD_BRANDS = new Set(["bcci", "icc", "ipl", "wpl"]);
-
-function strongBrandsFrom(meta) {
-  const src = `${meta.title || ""} ${meta.summary || ""} ${
-    meta.slug || ""
-  } ${(meta.tags || []).join(" ")}`;
-  const toks = tokenize(src);
-  return dedupe(toks.filter((t) => BRAND_STRONG_TOKENS.has(t)));
-}
-
-// -----------------------------------------------------------------------------
-// GENERIC TOKENS WE DON'T WANT IN DRIVE QUERY (but still score on)
-// -----------------------------------------------------------------------------
-const GENERIC_QUERY_TOKENS = new Set([
-  "india",
-  "indian",
-  "global",
-  "world",
-  "summit",
-  "meeting",
-  "talks",
-  "ties",
-  "relation",
-  "relations",
-  "growth",
-  "economy",
-  "economic",
-  "market",
-  "markets",
-  "business",
-  "policy",
-  "reform",
-  "update",
-  "latest",
-  "breaking",
-  "event",
-  "news"
-]);
-
-// -----------------------------------------------------------------------------
-// NEGATIVE PENALTY
-// -----------------------------------------------------------------------------
-function negativePenalty(name, strong) {
-  const famous = [
-    "modi",
-    "rahul",
-    "rajnath",
-    "gandhi",
-    "singh",
-    "ambani",
-    "adani",
-    "shah",
-    "yogi",
-    "kejriwal",
-    "trump",
-    "biden",
-    "musk"
-  ];
-
-  for (const f of famous) {
-    if (name.includes(f) && !strong.includes(f)) return -3;
-  }
-  return 0;
-}
-
-// -----------------------------------------------------------------------------
-// TOKEN / PHRASE BUILDER
-// -----------------------------------------------------------------------------
-function buildTokens(meta) {
-  const raw = dedupe(
-    tokenize(`${meta.title || ""} ${meta.summary || ""} ${meta.slug || ""}`)
-  )
-    .map(stem)
-    .filter((t) => !STOPWORDS.has(t) && t.length >= 3);
-
-  if (meta.category) {
-    raw.push(...tokenize(meta.category).map((t) => stem(t)));
-  }
-
-  (meta.tags || []).forEach((t) =>
-    raw.push(...tokenize(String(t)).map((x) => stem(x)))
-  );
-
-  const tokens = dedupe(raw);
-
-  const titleToks = tokenize(meta.title || "")
-    .map(stem)
-    .filter((t) => !STOPWORDS.has(t));
-
-  // Base phrases from the actual title
-  const basePhrases = [
-    ...ngrams(titleToks, 3),
-    ...ngrams(titleToks, 2)
-  ];
-
-  // Extra hard-coded phrases ONLY if they actually appear in text
-  const extraPhrases = [];
-  const textLower = `${meta.title || ""} ${meta.summary || ""}`.toLowerCase();
-
-  if (textLower.includes("election commission")) {
-    extraPhrases.push("election commission");
-  }
-  if (textLower.includes("supreme court")) {
-    extraPhrases.push("supreme court");
-  }
-  if (textLower.includes("lok sabha")) {
-    extraPhrases.push("lok sabha");
-  }
-  if (textLower.includes("union budget")) {
-    extraPhrases.push("union budget");
-  }
-  if (textLower.includes("defence minister")) {
-    extraPhrases.push("defence minister");
-  }
-
-  const phrases = dedupe([...basePhrases, ...extraPhrases]);
-
-  return { tokens, phrases };
-}
-
-// -----------------------------------------------------------------------------
-// SEARCH GOOGLE DRIVE
-// -----------------------------------------------------------------------------
-async function searchDriveCandidates(tokens = [], phrases = []) {
-  if (!drive) return [];
-
-  const qParts = [];
-
-  for (const t of tokens) {
-    if (t.length < 3) continue;
-    // Don’t use super-generic words to build the Drive query
-    if (GENERIC_QUERY_TOKENS.has(t)) continue;
-    qParts.push(`name contains '${t}'`);
-  }
-
-  for (const p of phrases) {
-    const plain = p.replace(/\s+/g, "");
-    const hyph = p.replace(/\s+/g, "-");
-    qParts.push(`name contains '${plain}'`);
-    qParts.push(`name contains '${hyph}'`);
-  }
-
-  // Always filter to images only
-  const baseFilter = `'${DRIVE_FOLDER_ID}' in parents and mimeType contains 'image/'`;
-
-  const query = qParts.length
-    ? `${baseFilter} and (${qParts.join(" or ")})`
-    : baseFilter;
-
-  const res = await drive.files.list({
-    q: query,
-    fields: "files(id, name, mimeType, modifiedTime)",
-    pageSize: 100
-  });
-
-  return res.data.files || [];
-}
-
-// -----------------------------------------------------------------------------
-// SCORING ENGINE (IMPROVED + BRANDS + RECENCY)
-// -----------------------------------------------------------------------------
-
-// Some extremely generic “news-y” tokens that should score very weakly,
-// so files like "Important-Global-World-Leaders-summit-meeting.png"
-// don't accidentally beat specific files like "BCCI.png".
-const WEAK_MATCH_TOKENS = new Set([
-  "global",
-  "world",
-  "summit",
-  "meeting",
-  "leader",
-  "leaders",
-  "important",
-  "event",
-  "news"
-]);
-
-function scoreFile(f, tokens, phrases, strongNames, strongBrands) {
-  const name = f.name.toLowerCase();
   let score = 0;
+  const matchedTags = [];
+  const matchedContext = [];
+  const matchedTokens = [];
 
-  // Phrase match — strongest
-  for (const p of phrases) {
-    const plain = p.replace(/\s+/g, "");
-    const hyph = p.replace(/\s+/g, "-");
-    if (name.includes(plain) || name.includes(hyph) || name.includes(p)) {
-      score += 7;
-    }
-  }
-
-  // Strong-name BOOST (leaders)
-  for (const s of strongNames) {
-    if (name.includes(s)) score += 10;
-  }
-
-  // Brand / institution BOOST
-  for (const b of strongBrands) {
-    if (name.includes(b)) {
-      // Sports boards like BCCI / ICC / IPL / WPL get a much bigger bump
-      if (SPORTS_BOARD_BRANDS.has(b)) {
-        score += 18; // ✅ strong preference for BCCI-type images
-      } else {
-        score += 8;
-      }
-    }
-  }
-
-  // Token scoring with downweights
   for (const t of tokens) {
-    // Ultra-generic "summit / meeting / global / world / leaders" → very weak
-    if (WEAK_MATCH_TOKENS.has(t)) {
-      if (name.includes(t)) score += 1;
+    if (tags.includes(t)) {
+      score += 8;
+      matchedTags.push(t);
       continue;
     }
-
-    if (["energy", "oil", "gas", "geopolitic", "defence", "security"].includes(t)) {
-      if (name.includes(t)) score += 1; // generic topics → weak
+    if (ctx.includes(t)) {
+      score += 4;
+      matchedContext.push(t);
       continue;
     }
-
-    if (name.includes(t)) score += 2;
-  }
-
-  const matchedTokens = tokens.filter((t) => name.includes(t));
-  if (matchedTokens.length >= 2) score += 2;
-
-  score += negativePenalty(name, strongNames);
-
-  // Recency bias using modifiedTime
-  if (f.modifiedTime) {
-    const now = Date.now();
-    const modifiedMs = new Date(f.modifiedTime).getTime();
-    if (!Number.isNaN(modifiedMs)) {
-      const ageMs = now - modifiedMs;
-      const sixMonths = 180 * 24 * 60 * 60 * 1000;
-      const twoYears = 730 * 24 * 60 * 60 * 1000;
-
-      if (ageMs <= sixMonths) {
-        score += 2; // very recent
-      } else if (ageMs <= twoYears) {
-        score += 1; // moderately recent
-      } else {
-        // very old: no bonus (or small penalty later if needed)
-      }
+    if (pid.includes(t)) {
+      score += 2;
+      matchedTokens.push(t);
     }
   }
 
-  return { score, matchedTokens };
-}
-
-// -----------------------------------------------------------------------------
-// DOWNLOAD → CLOUDINARY
-// -----------------------------------------------------------------------------
-async function downloadAndUploadToCloudinary(file) {
-  const destPath = path.join(TEMP_DIR, `${file.id}-${file.name}`);
-  const dest = fs.createWriteStream(destPath);
-
-  await drive.files
-    .get({ fileId: file.id, alt: "media" }, { responseType: "stream" })
-    .then((res) => {
-      return new Promise((resolve, reject) => {
-        res.data.on("end", resolve).on("error", reject).pipe(dest);
-      });
-    });
-
-  const uploaded = await cloudinary.uploader.upload(destPath, {
-    folder: process.env.CLOUDINARY_FOLDER
-      ? `${process.env.CLOUDINARY_FOLDER}/google`
-      : "news-images/google",
-    resource_type: "image"
-  });
-
-  try {
-    if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
-  } catch (err) {
-    console.warn("[imagePicker] cleanup warning:", err);
-  }
+  if (dedupe(matchedTags).length >= 2) score += 3;
 
   return {
-    publicId: uploaded.public_id,
-    url: uploaded.secure_url
+    score,
+    matchedTags: dedupe(matchedTags),
+    matchedContext: dedupe(matchedContext),
+    matchedTokens: dedupe(matchedTokens),
   };
 }
 
 // -----------------------------------------------------------------------------
-// PERSON ROTATION
-// -----------------------------------------------------------------------------
-async function pickRotatedPersonFile(personKey, candidates) {
-  if (!personKey || !Array.isArray(candidates) || !candidates.length) {
-    return null;
-  }
-
-  const regex = new RegExp(personKey, "i");
-
-  let usedCount = 0;
-  try {
-    const conn = Article.db;
-    const isReady = conn && conn.readyState === 1;
-
-    if (isReady) {
-      usedCount = await Article.countDocuments({
-        $or: [{ title: regex }, { summary: regex }]
-      });
-    } else {
-      usedCount = 0;
-    }
-  } catch (err) {
-    usedCount = 0;
-  }
-
-  const sorted = [...candidates].sort((a, b) =>
-    a.name.toLowerCase().localeCompare(b.name.toLowerCase())
-  );
-
-  const index = usedCount % sorted.length;
-  const chosen = sorted[index];
-
-  return {
-    file: chosen,
-    meta: {
-      mode: "drive-picked-rotated",
-      personKey,
-      usedCount,
-      poolSize: sorted.length,
-      pickedIndex: index
-    }
-  };
-}
-
-// -----------------------------------------------------------------------------
-// MAIN EXPORT
+// MAIN
 // -----------------------------------------------------------------------------
 exports.chooseHeroImage = async function (meta = {}) {
   try {
-    // If Drive is not configured, tell caller "no pick"
-    if (!DRIVE_FOLDER_ID) {
-      console.warn("[imagePicker] No DRIVE_FOLDER_ID configured");
+    // base normalized tags
+    const baseArticleTags = dedupe(normalizeArticleTags(meta.tags));
+
+    if (!baseArticleTags.length) {
+      console.log("[imagePicker] Article has no tags → skipping auto-pick");
       return null;
     }
 
-    if (!drive) {
-      console.warn("[imagePicker] No Drive client available; credSource =", credSource);
-      return null;
-    }
+    // expanded tokens used for matching
+    const articleExpanded = dedupe(baseArticleTags.flatMap(expandTag));
+    const articleExpandedSet = new Set(articleExpanded);
 
-    const { tokens, phrases } = buildTokens(meta);
-    const strongNames = strongNamesFrom(meta.title || "", meta.summary || "");
-    const strongBrands = strongBrandsFrom(meta);
-
-    let candidates = await searchDriveCandidates(tokens, phrases);
-
-    // Fallback list-all when query returns nothing
-    if (!candidates.length) {
-      const res = await drive.files.list({
-        q: `'${DRIVE_FOLDER_ID}' in parents and mimeType contains 'image/'`,
-        fields: "files(id, name, mimeType, modifiedTime)",
-        pageSize: 50
+    // "specific" means NOT generic, computed on expanded tokens
+    const specificTokens = articleExpanded.filter((t) => !isGenericTag(t));
+    if (!specificTokens.length) {
+      console.log("[imagePicker] Only generic tags → skipping auto-pick", {
+        articleTags: baseArticleTags,
+        expanded: articleExpanded,
       });
-      candidates = res.data.files || [];
-    }
-
-    if (!candidates.length) {
-      console.log("[imagePicker] No Drive files found in folder:", DRIVE_FOLDER_ID);
       return null;
     }
 
+    // Tokens used for scoring (tag-driven)
+    const tokens = dedupe(
+      articleExpanded
+        .map(stem)
+        .filter((t) => !STOPWORDS.has(t) && t.length >= 3)
+    );
+
+   const candidates = await loadCloudinaryCandidates(CLOUDINARY_FOLDER, MAX_CANDIDATES);
+
+if (!candidates.length) {
+  console.log("[imagePicker] No Cloudinary candidates loaded", {
+    folder: CLOUDINARY_FOLDER,
+    max: MAX_CANDIDATES,
+  });
+  return null;
+}
+
+// DEBUG: prove whether Cloudinary API is returning tags
+const withTags = candidates.filter(
+  (a) => Array.isArray(a?.tags) && a.tags.length > 0
+);
+
+console.log("[imagePicker] Candidate tag stats", {
+  folder: CLOUDINARY_FOLDER,
+  totalCandidates: candidates.length,
+  candidatesWithAnyTags: withTags.length,
+  sampleWithTags: withTags.slice(0, 5).map((a) => ({
+    public_id: a.public_id,
+    tags: a.tags,
+  })),
+  
+  sampleNoTags: candidates.slice(0, 5).map((a) => ({
+    public_id: a.public_id,
+    tags: a.tags,
+  })),
+
+});
+
+console.log("[imagePicker] Candidate context samples", {
+  sampleContext: candidates.slice(0, 5).map(a => ({
+    public_id: a.public_id,
+    context: a?.context?.custom || null
+  }))
+});
+
+
+
+    // We try stricter match first, then relax to 1 if none exist.
+    // requiredMatches is against expanded tokens count (not raw tags).
+    const preferredRequired = Math.min(MIN_TAG_MATCHES, Math.max(1, baseArticleTags.length));
+
+    function filterByRequired(requiredMatches) {
+      return candidates
+        .map((asset) => {
+          const assetTags = getAssetTags(asset);
+
+          // count how many expanded article tokens appear in asset tags
+          const matchedExpanded = assetTags.filter((t) => articleExpandedSet.has(t));
+          const matchedSpecific = assetTags.filter(
+            (t) => articleExpandedSet.has(t) && !isGenericTag(t)
+          );
+
+          return { asset, assetTags, matchedExpanded, matchedSpecific };
+        })
+        // must match at least 1 specific token to avoid "world-only" matches
+        .filter((x) => x.matchedExpanded.length >= requiredMatches && x.matchedSpecific.length >= 1);
+    }
+
+    let tagMatched = filterByRequired(preferredRequired);
+
+    // fall back to 1 if none matched
+    let usedRequiredMatches = preferredRequired;
+    if (!tagMatched.length && preferredRequired > 1) {
+      tagMatched = filterByRequired(1);
+      usedRequiredMatches = 1;
+    }
+
+         if (!tagMatched.length) {
+      console.log("[imagePicker] No Cloudinary images matched article tags → returning null (will use default)", {
+        folder: CLOUDINARY_FOLDER,
+        articleTags: baseArticleTags,
+        expanded: articleExpanded,
+        requiredMatches: preferredRequired,
+        usedRequiredMatches,
+        excludedPrefixes: EXCLUDE_PREFIXES,
+      });
+      return null;
+    }
+
+
+
+    // SCORE ONLY TAG-MATCHED
     let best = null;
-    let rotationMeta = null;
 
-    // Person rotation: if a strongName (e.g. modi/putin) exists,
-    // try to rotate across all matching files first,
-    // but avoid images that contain OTHER leaders not in this article.
-    const personKey = strongNames.length ? strongNames[0] : null;
-    if (personKey) {
-      const lower = personKey.toLowerCase();
+    for (const row of tagMatched) {
+      const scored = scoreAsset(row.asset, tokens);
 
-      const personCandidates = candidates.filter((f) => {
-        const fname = f.name.toLowerCase();
+      const mergedMatchedTags = dedupe([...(scored.matchedTags || []), ...(row.matchedExpanded || [])]);
 
-        // Must contain this personKey (e.g. "modi")
-        if (!fname.includes(lower)) return false;
+      const mergedScore =
+        scored.score +
+        row.matchedExpanded.length +         // tiny bump per match
+        row.matchedSpecific.length * 2;      // reward specificity
 
-        // If filename also contains some OTHER strong-name token
-        // that is not in article strongNames, skip it.
-        if (containsOtherStrongName(fname, strongNames)) {
-          return false;
-        }
+      const candidate = {
+        asset: row.asset,
+        score: mergedScore,
+        matchedTags: mergedMatchedTags,
+        matchedSpecificTags: dedupe(row.matchedSpecific || []),
+        matchedContext: scored.matchedContext,
+        matchedTokens: scored.matchedTokens,
+      };
 
-        return true;
+      if (!best || candidate.score > best.score) best = candidate;
+    }
+
+    if (!best || best.score < MIN_SCORE) {
+      console.log("[imagePicker] No strong tag-based image found", {
+        bestScore: best?.score,
+        minScore: MIN_SCORE,
       });
-
-      if (personCandidates.length > 0) {
-        const rotated = await pickRotatedPersonFile(personKey, personCandidates);
-        if (rotated && rotated.file) {
-          best = { file: rotated.file, score: null, matchedTokens: [] };
-          rotationMeta = rotated.meta;
-        }
-      }
-    }
-
-    // Standard scoring (if rotation didn't already choose)
-    if (!best) {
-      for (const f of candidates) {
-        const pack = scoreFile(f, tokens, phrases, strongNames, strongBrands);
-        const scored = {
-          file: f,
-          score: pack.score,
-          matchedTokens: pack.matchedTokens
-        };
-
-        if (!best || scored.score > best.score) {
-          best = scored;
-        }
-      }
-    }
-
-    // If somehow no usable candidate → no pick
-    if (!best || !best.file) {
-      console.log("[imagePicker] No best candidate after scoring");
       return null;
     }
-
-    // ─────────────────────────────────────────────────────────────
-    // CONFIDENCE GATE:
-    // Only trust Drive pick if score is high enough and we have
-    // at least some meaningful token signal. Otherwise return null
-    // and let the caller (imageStrategy) fall back to default hero.
-    // ─────────────────────────────────────────────────────────────
-    if (best.score != null && typeof best.score === "number") {
-      const filenameLower = best.file.name.toLowerCase();
-
-      const hasStrongNameHit = Array.isArray(strongNames)
-        ? strongNames.some((s) =>
-            filenameLower.includes(String(s).toLowerCase())
-          )
-        : false;
-
-      const hasBrandHit = Array.isArray(strongBrands)
-        ? strongBrands.some((b) =>
-            filenameLower.includes(String(b).toLowerCase())
-          )
-        : false;
-
-      const matchedTokenCount = Array.isArray(best.matchedTokens)
-        ? best.matchedTokens.length
-        : 0;
-
-      const articleHasStrongName = strongNames.length > 0;
-      const articleHasStrongBrand = strongBrands.length > 0;
-
-      // Base thresholds
-      const MIN_SCORE_WITH_KEY = 5; // filename hits a leader or brand
-      const MIN_SCORE_WITHOUT_KEY = 8;
-      const MIN_SCORE_GENERIC = 10;
-
-      let minScore;
-
-      if (!articleHasStrongName && !articleHasStrongBrand) {
-        // Completely generic article: be extra strict
-        minScore = MIN_SCORE_GENERIC;
-        if (best.score < minScore || matchedTokenCount < 2) {
-          console.log("[imagePicker] Rejecting generic low-confidence candidate", {
-            file: best.file.name,
-            score: best.score,
-            minScore,
-            matchedTokenCount,
-            strongNames,
-            strongBrands
-          });
-          return null;
-        }
-      } else {
-        // Article has either leader or brand context
-        if (hasStrongNameHit || hasBrandHit) {
-          minScore = MIN_SCORE_WITH_KEY;
-        } else {
-          minScore = MIN_SCORE_WITHOUT_KEY;
-        }
-
-        if (best.score < minScore || matchedTokenCount === 0) {
-          console.log("[imagePicker] Rejecting low-confidence candidate", {
-            file: best.file.name,
-            score: best.score,
-            minScore,
-            matchedTokenCount,
-            strongNames,
-            strongBrands
-          });
-          return null;
-        }
-      }
-    }
-
-    const uploaded = await downloadAndUploadToCloudinary(best.file);
 
     return {
-      publicId: uploaded.publicId,
-      url: uploaded.url,
+      publicId: best.asset.public_id,
+      url: best.asset.secure_url,
       why: {
-        mode: rotationMeta ? rotationMeta.mode : "drive-picked",
-        file: best.file.name,
-        score: best.score,
+        mode: "cloudinary-tag-first",
+        folder: CLOUDINARY_FOLDER,
+        articleTags: baseArticleTags,
+        expandedTokens: articleExpanded,
+        requiredMatchesUsed: usedRequiredMatches,
+        matchedTags: best.matchedTags,
+        matchedSpecificTags: best.matchedSpecificTags,
+        matchedContext: best.matchedContext,
         matchedTokens: best.matchedTokens,
-        rotation: rotationMeta || null,
-        credSource
-      }
+        score: best.score,
+        candidateCount: tagMatched.length,
+      },
     };
   } catch (err) {
     console.error("[imagePicker ERROR]", err);
-    // Tell caller "no pick"; caller can decide default image.
     return null;
   }
 };

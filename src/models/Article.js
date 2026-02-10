@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 
 /**
  * ---- Content quality thresholds (tweak via env if you like) ----
- * ARTICLE_MIN_BODY:    minimum words required in body (default 450)
+ * ARTICLE_MIN_BODY:    minimum words required in body (default 350)
  * ARTICLE_MIN_SUMMARY: minimum characters required in summary (default 60)
  */
 const MIN_BODY = parseInt(process.env.ARTICLE_MIN_BODY || '350', 10);
@@ -21,20 +21,21 @@ function calcReadingTime(body = '') {
 }
 
 const ArticleSchema = new mongoose.Schema({
-  title:       { type: String, required: true, trim: true },
-  slug:        { type: String, required: true, unique: true, index: true },
+  title: { type: String, required: true, trim: true },
+  slug:  { type: String, required: true, unique: true, index: true },
 
-  summary:     { type: String, default: '' },
-  author:      { type: String, default: '' },
+  summary: { type: String, default: '' },
+  author:  { type: String, default: '' },
 
   // Main content
-  body:        { type: String, default: '' },        // raw / markdown / html
-  bodyHtml:    { type: String, default: '' },        // if you keep both
+  body:     { type: String, default: '' }, // raw / markdown / html
+  bodyHtml: { type: String, default: '' }, // if you keep both
 
   // Taxonomy
-category:      { type: String, index: true },          // display name (e.g., "Business")
-categorySlug:  { type: String, index: true },          // canonical key (e.g., "business")
-tags:          { type: [String], default: [], index: true },
+  category:     { type: String, index: true },     // display name (e.g., "Business")
+  categorySlug: { type: String, index: true },     // canonical key (e.g., "business")
+  tags:         { type: [String], default: [], index: true },
+
   // Homepage placement (controls which homepage bucket this article belongs to)
   homepagePlacement: {
     type: String,
@@ -45,27 +46,26 @@ tags:          { type: [String], default: [], index: true },
     trim: true,
   },
 
-
-
-    // Timeline (used for History)
-  year:       { type: Number, min: 0, max: 4000 },   // 0–4000 (we treat as BC for now)
-  era:        { type: String, enum: ['BC', 'AD'], default: 'BC' },
-
+  // Timeline (used for History)
+  year: { type: Number, min: 0, max: 4000 }, // 0–4000 (we treat as BC for now)
+  era:  { type: String, enum: ['BC', 'AD'], default: 'BC' },
 
   // Images
-  imageUrl:      { type: String, default: '' },      // Cloudinary (or absolute) URL
+  imageUrl:      { type: String, default: '' }, // Cloudinary (or absolute) URL
   imagePublicId: { type: String, default: '' },
   imageAlt:      { type: String, default: '' },
-  ogImage:       { type: String, default: '' },      // social (1200x630)
-  thumbImage:    { type: String, default: '' },      // ✅ added (list/grid thumbnails)
-  // NEW: optional video URL (Google Drive, Cloudinary, etc.)
-videoUrl: { type: String, default: null },
-  // SEO
-  metaTitle:   { type: String, default: '' },
-  metaDesc:    { type: String, default: '' },
+  ogImage:       { type: String, default: '' }, // social (1200x630)
+  thumbImage:    { type: String, default: '' }, // list/grid thumbnails
 
-  // ✅ NEW: keep Cloudinary public_id + original source (Drive)
-  videoPublicId: { type: String, default: '' },
+  // NEW: optional video URL (Google Drive, Cloudinary, etc.)
+  videoUrl: { type: String, default: null },
+
+  // SEO
+  metaTitle: { type: String, default: '' },
+  metaDesc:  { type: String, default: '' },
+
+  // keep Cloudinary public_id + original source (Drive)
+  videoPublicId:  { type: String, default: '' },
   videoSourceUrl: { type: String, default: '' },
 
   // Other
@@ -84,13 +84,33 @@ videoUrl: { type: String, default: null },
   publishedAt: { type: Date, index: true }, // set when actually publishing
 
   // Provenance
-  source:      { type: String, default: 'automation' },
-  sourceUrl:   { type: String, default: '' },        // ✅ added (original link)
+  source:    { type: String, default: 'automation' },
+  sourceUrl: { type: String, default: '' },
   sourceUrlCanonical: { type: String, index: true },
 
   // Optional geo targeting
-  geoMode:   { type: String, enum: ['global','include','exclude'], default: 'global' },
-  geoAreas:  { type: [String], default: [] },
+  geoMode:  { type: String, enum: ['global', 'include', 'exclude'], default: 'global' },
+  geoAreas: { type: [String], default: [] },
+
+  /**
+   * ✅ AUTO IMAGE DEBUG
+   * Your controllers/services can write: payload.autoImageDebug = {...}
+   * Mongoose stores it as "_autoImageDebug"
+   *
+   * Improvement:
+   * - alias: autoImageDebug (existing)
+   * - we ALSO treat it as "autoImageWhy" (same data) for convenience
+   */
+  _autoImageDebug: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null,
+    alias: 'autoImageDebug',
+  },
+
+  // ✅ Optional helpers for Admin UI
+  autoImagePicked:   { type: Boolean, default: false },
+  autoImagePickedAt: { type: Date, default: null },
+
 }, { timestamps: true });
 
 /**
@@ -98,7 +118,6 @@ videoUrl: { type: String, default: null },
  * Enforce min summary/body only when publishing; derive readingTime, metaTitle/metaDesc; set publishedAt on publish.
  */
 ArticleSchema.pre('validate', function(next) {
-  // Only enforce thresholds when going live
   if (this.status === 'published') {
     const textForCount = this.body && this.body.trim().length ? this.body : this.bodyHtml;
     const sumLen = stripHtml(this.summary).trim().length;
@@ -135,16 +154,17 @@ ArticleSchema.pre('save', function(next) {
   if (this.isModified('status') && this.status === 'published' && !this.publishedAt) {
     this.publishedAt = new Date();
   }
+
   next();
 });
 
 // Helpful indexes
-ArticleSchema.index({ status: 1, publishedAt: -1 });   // ✅ fast listings by status
+ArticleSchema.index({ status: 1, publishedAt: -1 });
 ArticleSchema.index({ category: 1, publishedAt: -1 });
+ArticleSchema.index({ categorySlug: 1, publishedAt: -1 });
 ArticleSchema.index({ tags: 1, publishedAt: -1 });
 ArticleSchema.index({ publishedAt: -1 });
 ArticleSchema.index({ slug: 1 }, { unique: true });
 ArticleSchema.index({ category: 1, year: 1 });
-
 
 module.exports = mongoose.models.Article || mongoose.model('Article', ArticleSchema);

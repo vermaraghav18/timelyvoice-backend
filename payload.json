@@ -1,1 +1,13 @@
-{"generated":{"title":"Salman Rushdie honoured with Dayton Lifetime Achievement Award","summary":"Rushdie receives the Dayton Literary Peace Prize lifetime honour for his literary contributions and advocacy for peace, his first major recognition since recovering from the 2022 attack.","body":"Salman Rushdie has been honoured with the Dayton Literary Peace Prize’s Lifetime Achievement Award, recognizing ...\n[write ~250+ words here, plain text; no quotes needed]\n"}}
+{
+  "title": "Auto Image Debug PICKED FLAG Test",
+  "author": "Desk",
+  "summary": "This summary is written specifically to exceed the minimum word requirement enforced by the backend validator. It includes enough descriptive context and clear explanation to avoid rejection. The objective is validation compliance, not storytelling. The text is intentionally long and explicit so the server accepts it without returning missing fields or length errors during creation and saving as a draft article in the system. This sentence is added to safely cross the word threshold without risk.",
+  "body": "This body content is intentionally long to safely exceed the minimum three hundred and fifty word requirement enforced by the backend validation logic. The purpose of this text is to pass validation and allow testing of auto image debug persistence and the autoImagePicked flags. The article discusses a neutral current affairs topic and provides background context, recent developments, and possible implications.\n\nThe first section outlines why the topic matters and what readers should understand about the situation. It includes general context, mentions key stakeholders, and explains that details can evolve over time. This ensures the content is meaningful and not a placeholder or filler text that might be rejected by validation rules.\n\nThe second section expands on potential impacts, including political, economic, and public reaction angles. It also notes that official confirmations and verified sources are important when interpreting new information. This keeps the article tone balanced while adding the necessary word count required by the backend validator.\n\nThe final section summarizes the key points and emphasizes that ongoing monitoring is required. It explains that the goal is a technically valid article record that will trigger the image picker and persist debug metadata. This paragraph helps ensure the total body length comfortably exceeds the minimum threshold so the backend accepts the request without errors.",
+  "category": "Business",
+  "categorySlug": "business",
+  "tags": [],
+  "homepagePlacement": "none",
+  "status": "draft",
+  "geoMode": "global",
+  "geoAreas": []
+}

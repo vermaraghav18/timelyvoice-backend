@@ -25,31 +25,35 @@ const FEEDS = [
   // Times of India
   // ─────────────────────────────
   "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
-  "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms",
-  "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms",
-  "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms",
-  "https://timesofindia.indiatimes.com/rssfeeds/1081479906.cms",
-  "https://timesofindia.indiatimes.com/rssfeeds/4719148.cms",
 
   // ─────────────────────────────
-  // Indian Express
+  // Hindustan Times 
   // ─────────────────────────────
-  "https://publish.tribuneindia.com/city/jalandhar/feed/",
-  "https://indianexpress.com/section/business/feed/",
-  "https://indianexpress.com/section/sports/cricket/feed/",
-  "https://indianexpress.com/section/business/economy/feed/",
-  "https://indianexpress.com/section/entertainment/feed/",
-  "https://indianexpress.com/section/news-today/feed/",
-  "https://indianexpress.com/section/trending/feed/",
+  "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
+
+   // ─────────────────────────────
+  // NDTV
+  // ─────────────────────────────
+  "https://feeds.feedburner.com/ndtvnews-top-stories",
+  "https://feeds.feedburner.com/ndtvcooks-latest",
+
+   // ─────────────────────────────
+  // tribune
+  // ─────────────────────────────
+  "https://publish.tribuneindia.com/newscategory/india/feed/",
+  "https://publish.tribuneindia.com/newscategory/sports/feed/",
+
 
   // ─────────────────────────────
-  // External RSS (RSS.app XML)
+  // EuroAsiaNet
   // ─────────────────────────────
-  "https://rss.app/feeds/W4xqo13jWuO9K5aD.xml",
-  "https://rss.app/feeds/50EMHbHEY3feCeXR.xml",
-  "https://rss.app/feeds/WhJRNvpVEsR8XVkR.xml",
-  "https://rss.app/feeds/1rbNzHzp2RzTogY0.xml",
-  "https://rss.app/feeds/FVTLr4W1gUqbM3fk.xml",
+  "https://rss.app/feeds/HiK5vx8hyCAt4cBp.xml",
+
+
+  // Google News (World) via RSS.app
+  "https://rss.app/feeds/utwHGNw8064jpf6G.xml",
+
+
 ];
 
 // -----------------------------------------------------------------------------

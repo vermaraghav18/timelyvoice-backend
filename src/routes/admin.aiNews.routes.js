@@ -24,6 +24,29 @@ const LOG_MODEL =
   "openai/gpt-4o-mini";
 
 // ─────────────────────────────────────────────────────────────
+// CRON SECRET PROTECTION
+// This prevents random people on the internet from triggering AI generation.
+// Render Cron Job will call with header: x-cron-secret: <AI_NEWS_CRON_SECRET>
+// ─────────────────────────────────────────────────────────────
+function requireCronSecret(req, res, next) {
+  const secret = process.env.AI_NEWS_CRON_SECRET;
+
+  // If secret not configured, fail closed (safer)
+  if (!secret) {
+    return res
+      .status(500)
+      .json({ ok: false, error: "Missing AI_NEWS_CRON_SECRET" });
+  }
+
+  const got = req.header("x-cron-secret");
+  if (!got || got !== secret) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  return next();
+}
+
+// ─────────────────────────────────────────────────────────────
 // Simple health check
 // GET /api/admin/ai/ping
 // ─────────────────────────────────────────────────────────────
@@ -51,8 +74,9 @@ router.get("/cron-status", (_req, res) => {
 // ─────────────────────────────────────────────────────────────
 // MANUAL CRON RUN — trigger one AI automation cycle
 // POST /api/admin/ai/run-cron-once
+// Protected by x-cron-secret
 // ─────────────────────────────────────────────────────────────
-router.post("/run-cron-once", async (_req, res) => {
+router.post("/run-cron-once", requireCronSecret, async (_req, res) => {
   try {
     const result = await runOnceAutoNews({ reason: "manual-api" });
     return res.json({
@@ -71,8 +95,9 @@ router.post("/run-cron-once", async (_req, res) => {
 // ─────────────────────────────────────────────────────────────
 // RSS SEEDS PREVIEW — debug what cron sees
 // GET /api/admin/ai/rss-preview?limit=10
+// Protected by x-cron-secret (recommended)
 // ─────────────────────────────────────────────────────────────
-router.get("/rss-preview", async (req, res) => {
+router.get("/rss-preview", requireCronSecret, async (req, res) => {
   try {
     const limit = Math.max(
       1,
@@ -96,13 +121,11 @@ router.get("/rss-preview", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // LOG LIST — for admin dashboard
 // GET /api/admin/ai/logs?limit=50
+// (not protected; contains no secrets, OK to keep open if you want)
 // ─────────────────────────────────────────────────────────────
 router.get("/logs", async (req, res) => {
   try {
-    const limit = Math.min(
-      parseInt(req.query.limit || "50", 10),
-      200
-    );
+    const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
 
     const logs = await AiGenerationLog.find({})
       .sort({ runAt: -1 })
@@ -126,8 +149,9 @@ router.get("/logs", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // PREVIEW ONLY — NO DB WRITE
 // POST /api/admin/ai/preview-batch
+// Protected by x-cron-secret (prevents AI cost abuse)
 // ─────────────────────────────────────────────────────────────
-router.post("/preview-batch", async (req, res) => {
+router.post("/preview-batch", requireCronSecret, async (req, res) => {
   try {
     const { count, categories } = req.body || {};
 
@@ -155,6 +179,8 @@ router.post("/preview-batch", async (req, res) => {
 // SAVE TO DB — CREATES REAL Article DOCUMENTS + AUTO IMAGES
 // POST /api/admin/ai/generate-batch
 //
+// Protected by x-cron-secret (prevents AI cost abuse)
+//
 // Body:
 // {
 //   "count": 5,                          // optional, default 10 (max 20)
@@ -162,7 +188,7 @@ router.post("/preview-batch", async (req, res) => {
 //   "status": "draft" | "published"      // optional, default "draft"
 // }
 // ─────────────────────────────────────────────────────────────
-router.post("/generate-batch", async (req, res) => {
+router.post("/generate-batch", requireCronSecret, async (req, res) => {
   const startedAt = Date.now();
 
   const { count, categories, status } = req.body || {};
@@ -231,6 +257,7 @@ router.post("/generate-batch", async (req, res) => {
       };
 
       // 🔁 FINALIZE IMAGES (Drive → Cloudinary + OG + thumb)
+      // eslint-disable-next-line no-await-in-loop
       const fin = await finalizeArticleImages({
         title: payload.title,
         summary: payload.summary,
@@ -262,8 +289,7 @@ router.post("/generate-batch", async (req, res) => {
       payload.slug = finalSlug;
 
       // Final status + timestamps
-      payload.status =
-        desiredStatus === "published" ? "published" : "draft";
+      payload.status = desiredStatus === "published" ? "published" : "draft";
       if (payload.status === "published") {
         payload.publishedAt = new Date();
       }
@@ -302,10 +328,7 @@ router.post("/generate-batch", async (req, res) => {
       articles: createdSummaries,
     });
   } catch (err) {
-    console.error(
-      "[admin.aiNews] /generate-batch error:",
-      err?.message || err
-    );
+    console.error("[admin.aiNews] /generate-batch error:", err?.message || err);
 
     // Log error
     try {
@@ -324,10 +347,7 @@ router.post("/generate-batch", async (req, res) => {
         triggeredBy: "api-admin-ai-generate-batch",
       });
     } catch (logErr) {
-      console.error(
-        "[admin.aiNews] log-create failed:",
-        logErr?.message || logErr
-      );
+      console.error("[admin.aiNews] log-create failed:", logErr?.message || logErr);
     }
 
     return res.status(500).json({

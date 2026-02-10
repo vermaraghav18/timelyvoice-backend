@@ -1,27 +1,32 @@
 // backend/src/services/finalizeArticleImages.js
-// Google-Drive → Cloudinary hybrid image finalizer
+// Cloudinary-only image finalizer (FINAL, FIXED)
 //
 // PURPOSE:
-//  - If article already has imageUrl → keep it (manual override)
-//  - If article only has Google Drive imageUrl → upload to Cloudinary
-//  - If article has NOTHING → auto-pick from Drive (imagePicker, which already uploads to Cloudinary)
-//  - Always build OG, hero, thumb URLs from Cloudinary
+//  - Respect manual images
+//  - Upload Drive images if pasted manually
+//  - Auto-pick from Cloudinary ONLY when no real image exists
+//  - NEVER block picker because of default placeholder
 //
 
-const { uploadDriveImageToCloudinary, extractDriveFileId } = require("./googleDriveUploader");
-const { chooseHeroImage } = require("./imagePicker"); // now returns Cloudinary publicId + url
+const {
+  uploadDriveImageToCloudinary,
+  extractDriveFileId,
+} = require("./googleDriveUploader");
+const { chooseHeroImage } = require("./imagePicker");
 const cloudinary = require("cloudinary").v2;
 
 // OG variants
-const OG_W = 1200;
-const OG_H = 630;
+const OG_W = Number(process.env.CLOUDINARY_OG_WIDTH || 1200);
+const OG_H = Number(process.env.CLOUDINARY_OG_HEIGHT || 630);
 
-// Default Cloudinary image
+// Default Cloudinary placeholder
 const DEFAULT_PUBLIC_ID =
   process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
   "news-images/defaults/fallback-hero";
 
-// Build Cloudinary variants
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 function buildHeroUrl(publicId) {
   return cloudinary.url(publicId, {
     type: "upload",
@@ -55,7 +60,6 @@ function buildThumbUrl(publicId) {
   });
 }
 
-// Detect if URL is a Google Drive direct file link
 function looksLikeGoogleDrive(url = "") {
   return (
     typeof url === "string" &&
@@ -63,7 +67,6 @@ function looksLikeGoogleDrive(url = "") {
   );
 }
 
-// Normalize empty image fields on incoming article
 function normalize(a = {}) {
   const obj = { ...a };
   if (obj.imageUrl === "") obj.imageUrl = null;
@@ -73,65 +76,128 @@ function normalize(a = {}) {
   return obj;
 }
 
-/**
- * finalizeArticleImages(articleLike)
- * Ensures Cloudinary publicId + hero + og + thumb are always available.
- *
- * LOGIC:
- * 1) If manual imageUrl provided AND it's not Drive → we keep it.
- * 2) If imageUrl is a Drive URL → upload to Cloudinary then build variants.
- * 3) If no imageUrl and no publicId → auto-pick from Google Drive (imagePicker),
- *    which already uploads to Cloudinary and returns { publicId, url }.
- * 4) Always generate OG + thumb from Cloudinary.
- */
-exports.finalizeArticleImages = async function finalizeArticleImages(articleLike = {}) {
+// 🔥 CRITICAL: default placeholder ≠ real image
+function isDefaultPlaceholder(publicId, imageUrl) {
+  return (
+    (typeof publicId === "string" &&
+      (publicId.includes("/defaults/") ||
+        publicId.includes("news-images/default"))) ||
+    (typeof imageUrl === "string" && imageUrl.includes("news-images/default"))
+  );
+}
+
+// OPTIONAL but recommended: derive PID from a Cloudinary URL if PID missing
+function deriveCloudinaryPublicIdFromUrl(url = "") {
+  if (typeof url !== "string" || !url.includes("/image/upload/")) return null;
+  try {
+    // Example:
+    // https://res.cloudinary.com/<cloud>/image/upload/c_fill,w_800/v1723456/folder/name/file.jpg
+    const afterUpload = url.split("/image/upload/")[1];
+    if (!afterUpload) return null;
+
+    const clean = afterUpload.split(/[?#]/)[0]; // strip query/hash
+    const segs = clean.split("/");
+
+    let i = 0;
+    // skip transformation segments (contain commas or colon)
+    while (i < segs.length && (segs[i].includes(",") || segs[i].includes(":")))
+      i++;
+    // skip version like v12345
+    if (i < segs.length && /^v\d+$/i.test(segs[i])) i++;
+
+    const publicPath = segs.slice(i).join("/");
+    if (!publicPath) return null;
+
+    return publicPath.replace(/\.[a-z0-9]+$/i, "") || null; // drop extension
+  } catch {
+    return null;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// MAIN FINALIZER
+// -----------------------------------------------------------------------------
+exports.finalizeArticleImages = async function finalizeArticleImages(
+  articleLike = {}
+) {
   const norm = normalize(articleLike);
 
   let imagePublicId = norm.imagePublicId || null;
   let imageUrl = norm.imageUrl || null;
 
-  // ───────────────────────────────────────────────────────────
-  // CASE 1 — Manual CDN/HTTP image (NOT Drive) → keep as-is
-  // ───────────────────────────────────────────────────────────
+  let autoImageDebug = norm.autoImageDebug || null;
+  let autoPicked = false;
+
+  // ---------------------------------------------------------------------------
+  // 🔥 ALLOW AUTOPICK IF CURRENT IMAGE IS JUST DEFAULT PLACEHOLDER
+  // ---------------------------------------------------------------------------
+  if (isDefaultPlaceholder(imagePublicId, imageUrl)) {
+    imagePublicId = null;
+    imageUrl = null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // ✅ CONSISTENCY: If Cloudinary URL exists but PID missing, derive it.
+  // (Prevents treating Cloudinary as "external manual" by mistake.)
+  // ---------------------------------------------------------------------------
+  if (!imagePublicId && imageUrl && String(imageUrl).includes("/image/upload/")) {
+    const pid = deriveCloudinaryPublicIdFromUrl(String(imageUrl));
+    if (pid) imagePublicId = pid;
+  }
+
+  // ---------------------------------------------------------------------------
+  // CASE 1 — Manual external image (non-Drive)
+  // ---------------------------------------------------------------------------
   if (imageUrl && !imagePublicId && !looksLikeGoogleDrive(imageUrl)) {
-    // Build OG + thumb from DEFAULT_PUBLIC_ID for consistency
+    // Manual external URL = respect it fully (do NOT force default PID)
     return {
-      imagePublicId: DEFAULT_PUBLIC_ID,
+      imagePublicId: null,
       imageUrl,
-      ogImage: buildOgUrl(DEFAULT_PUBLIC_ID),
-      thumbImage: buildThumbUrl(DEFAULT_PUBLIC_ID),
+      ogImage: norm.ogImage || imageUrl,
+      thumbImage: norm.thumbImage || imageUrl,
       imageAlt: norm.imageAlt || norm.title || "News image",
+      autoImageDebug: {
+        mode: "manual-external-url",
+        picked: imageUrl,
+      },
+      autoImagePicked: false,
+      autoImagePickedAt: null,
     };
   }
 
-  // ───────────────────────────────────────────────────────────
-  // CASE 2 — Manual Google Drive URL → upload to Cloudinary (by fileId)
-  // ───────────────────────────────────────────────────────────
+  // ---------------------------------------------------------------------------
+  // CASE 2 — Manual Google Drive URL → upload
+  // ---------------------------------------------------------------------------
   if (imageUrl && looksLikeGoogleDrive(imageUrl) && !imagePublicId) {
     try {
       const fileId = extractDriveFileId(imageUrl);
-      if (fileId) {
-        const upload = await uploadDriveImageToCloudinary(fileId, {
-          folder: process.env.CLOUDINARY_FOLDER || "news-images",
-        });
-        imagePublicId = upload.public_id;
-        imageUrl = buildHeroUrl(upload.public_id);
-      } else {
-        console.error("[finalizeArticleImages] Could not extract Drive fileId from URL");
-        imagePublicId = DEFAULT_PUBLIC_ID;
-        imageUrl = buildHeroUrl(DEFAULT_PUBLIC_ID);
-      }
-    } catch (e) {
-      console.error("[finalizeArticleImages] Drive upload failed:", e);
-      imagePublicId = DEFAULT_PUBLIC_ID;
-      imageUrl = buildHeroUrl(DEFAULT_PUBLIC_ID);
+      if (!fileId) throw new Error("Invalid Drive URL");
+
+      const upload = await uploadDriveImageToCloudinary(fileId, {
+        folder: process.env.CLOUDINARY_FOLDER || "news-images",
+      });
+
+      imagePublicId = upload.public_id;
+      imageUrl = buildHeroUrl(upload.public_id);
+
+      autoImageDebug = {
+        mode: "manual-drive-upload",
+        picked: upload.public_id,
+      };
+    } catch (err) {
+      // Keep the reason for debugging, but allow fallback logic to continue
+      imagePublicId = null;
+      imageUrl = null;
+      autoImageDebug = {
+        mode: "manual-drive-upload-failed",
+        error: String(err?.message || err),
+      };
     }
   }
 
-  // ───────────────────────────────────────────────────────────
-  // CASE 3 — No image fields at all → auto-pick via imagePicker
-  // (imagePicker already does Drive → Cloudinary and returns { publicId, url })
-  // ───────────────────────────────────────────────────────────
+  // ---------------------------------------------------------------------------
+  // CASE 3 — NOTHING EXISTS → AUTO PICK FROM CLOUDINARY
+  // ---------------------------------------------------------------------------
   if (!imagePublicId && !imageUrl) {
     try {
       const pick = await chooseHeroImage({
@@ -145,26 +211,30 @@ exports.finalizeArticleImages = async function finalizeArticleImages(articleLike
       if (pick && pick.publicId) {
         imagePublicId = pick.publicId;
         imageUrl = pick.url || buildHeroUrl(pick.publicId);
-      } else {
-        console.warn("[finalizeArticleImages] chooseHeroImage returned no pick, using default");
-        imagePublicId = DEFAULT_PUBLIC_ID;
-        imageUrl = buildHeroUrl(DEFAULT_PUBLIC_ID);
+        autoImageDebug = pick.why;
+        autoPicked = true;
       }
     } catch (e) {
-      console.error("[auto-pick] chooseHeroImage failed:", e);
-      imagePublicId = DEFAULT_PUBLIC_ID;
-      imageUrl = buildHeroUrl(DEFAULT_PUBLIC_ID);
+      // swallow → fallback below
     }
   }
 
-  // ───────────────────────────────────────────────────────────
-  // FINAL SAFETY CHECK + ALWAYS BUILD VARIANTS
-  // ───────────────────────────────────────────────────────────
+  // ---------------------------------------------------------------------------
+  // FINAL FALLBACK — ONLY IF NOTHING WORKED
+  // ---------------------------------------------------------------------------
   if (!imagePublicId) imagePublicId = DEFAULT_PUBLIC_ID;
   if (!imageUrl) imageUrl = buildHeroUrl(imagePublicId);
 
   const ogImage = buildOgUrl(imagePublicId);
   const thumbImage = buildThumbUrl(imagePublicId);
+
+  if (!autoImageDebug) {
+    autoImageDebug = {
+      mode:
+        imagePublicId === DEFAULT_PUBLIC_ID ? "fallback-default" : "kept-existing",
+      picked: imagePublicId,
+    };
+  }
 
   return {
     imagePublicId,
@@ -172,5 +242,8 @@ exports.finalizeArticleImages = async function finalizeArticleImages(articleLike
     ogImage,
     thumbImage,
     imageAlt: norm.imageAlt || norm.title || "News image",
+    autoImageDebug,
+    autoImagePicked: autoPicked,
+    autoImagePickedAt: autoPicked ? new Date() : null,
   };
 };
