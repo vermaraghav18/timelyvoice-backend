@@ -85,8 +85,10 @@ cloudinary.config({
 
 
   // 6) Models registered early
-  const Article = require('./src/models/Article');
-  const Category = require('./src/models/Category');
+const Article = require('./src/models/Article');
+const Category = require('./src/models/Category');
+const ImageLibrary = require('./src/models/ImageLibrary'); // ✅ ADD THIS
+
 
   const XSource = require('./src/models/XSource');
   const XItem   = require('./src/models/XItem');
@@ -185,6 +187,54 @@ cloudinary.config({
     }
   }
 
+  // ✅ Default placeholder detector (shared for SSR + API)
+function isDefaultPlaceholder(publicId, imageUrl) {
+  return (
+    (typeof publicId === "string" &&
+      (publicId.includes("/default") || publicId.includes("news-images/default"))) ||
+    (typeof imageUrl === "string" && imageUrl.includes("news-images/default"))
+  );
+}
+
+// ✅ Normalize a single article before sending to frontend
+function normalizeArticleForClient(a = {}) {
+  // clone to avoid mutating mongoose lean doc references
+  const out = { ...a };
+
+  // keep id consistent for frontend
+  out.id = out._id;
+  out.publishedAt = out.publishedAt;
+
+  let safePublicId = out.imagePublicId || null;
+  let safeImageUrl = out.imageUrl || null;
+  let safeOgStored = out.ogImage || null;
+
+  // ❌ if it's the default placeholder, ignore it fully
+  if (isDefaultPlaceholder(safePublicId, safeImageUrl)) {
+    safePublicId = null;
+    safeImageUrl = null;
+    safeOgStored = null;
+  }
+
+  // ✅ Cloudinary OG from publicId is the best/most reliable
+  const ogFromPublicId = buildCloudinaryOgFromPublicId(safePublicId);
+
+  const finalOg =
+    (!isBadOg(ogFromPublicId) ? ogFromPublicId : "") ||
+    (!isBadOg(safeOgStored) ? safeOgStored : "") ||
+    (!isBadOg(safeImageUrl) ? safeImageUrl : "") ||
+    `${(process.env.FRONTEND_BASE_URL || "https://timelyvoice.com").replace(/\/+$/, "")}/logo-192.png`;
+
+  // ✅ force consistency so frontend never picks a wrong/blank OG
+  out.ogImage = finalOg;
+
+  // (optional but recommended) if imageUrl is bad, let frontend use ogImage
+  if (isBadOg(out.imageUrl)) out.imageUrl = finalOg;
+
+  return out;
+}
+
+
   // Build SSR HTML for an article slug
   async function renderArticleHtml({ slug }) {
     const now = new Date();
@@ -213,12 +263,34 @@ cloudinary.config({
       "Read the latest update.";
 
     // ✅ Cloudinary-first OG (never Drive view links)
-    const ogFromPublicId = buildCloudinaryOgFromPublicId(a.imagePublicId);
-    const ogImage =
-      (!isBadOg(ogFromPublicId) ? ogFromPublicId : "") ||
-      (!isBadOg(a.ogImage) ? a.ogImage : "") ||
-      (!isBadOg(a.imageUrl) ? a.imageUrl : "") ||
-      `${siteBase.replace(/\/+$/, "")}/logo-192.png`;
+    function isDefaultPlaceholder(publicId, imageUrl) {
+  return (
+    (typeof publicId === "string" &&
+      (publicId.includes("/default") || publicId.includes("news-images/default"))) ||
+    (typeof imageUrl === "string" &&
+      imageUrl.includes("news-images/default"))
+  );
+}
+
+let safePublicId = a.imagePublicId || null;
+let safeImageUrl = a.imageUrl || null;
+let safeOgStored = a.ogImage || null;
+
+// ❌ ignore default placeholder images
+if (isDefaultPlaceholder(safePublicId, safeImageUrl)) {
+  safePublicId = null;
+  safeImageUrl = null;
+  safeOgStored = null;
+}
+
+const ogFromPublicId = buildCloudinaryOgFromPublicId(safePublicId);
+
+const ogImage =
+  (!isBadOg(ogFromPublicId) ? ogFromPublicId : "") ||
+  (!isBadOg(safeOgStored) ? safeOgStored : "") ||
+  (!isBadOg(safeImageUrl) ? safeImageUrl : "") ||
+  `${siteBase.replace(/\/+$/, "")}/logo-192.png`;
+
 
     const imageAlt = a.imageAlt || a.title || "Timely Voice";
     const publishedTime = a.publishedAt || a.publishAt || a.createdAt || new Date();
@@ -722,11 +794,28 @@ cloudinary.config({
   });
 
   // Admin articles router
-  const adminArticlesRouter = require('./src/routes/admin.articles.routes');
-  app.use('/api/admin/articles', adminArticlesRouter);
+  // Admin articles router
+const adminArticlesRouter = require('./src/routes/admin.articles.routes');
+app.use('/api/admin/articles', adminArticlesRouter);
+
+// ✅ Admin Image Library router (protected)
+const adminImageLibraryRouter = require("./src/routes/admin.imageLibrary.routes");
+app.use("/api/admin/image-library", auth, adminImageLibraryRouter);
+
+
 
   // Admin AI News router (protected with admin auth)
-  app.use('/api/admin/ai', auth, adminAiNewsRouter);
+// ✅ Admin AI News router
+// - Most routes require admin JWT (auth)
+// - BUT /run-cron-once uses x-cron-secret (for Render cron)
+app.use('/api/admin/ai', (req, res, next) => {
+  // IMPORTANT: req.path is router-local, so "/run-cron-once" matches correctly
+  if (req.path === '/run-cron-once') {
+    return cronSecretAuth(req, res, next);
+  }
+  return auth(req, res, next);
+}, adminAiNewsRouter);
+
 
   // ⬇ Image Picker Debug Route
   app.use("/api/debug", require("./src/routes/debug.imagePicker.routes"));
@@ -746,6 +835,33 @@ cloudinary.config({
   app.use('/api/top-news',  cacheRoute(30_000), require("./src/routes/topnews"));
 
   app.use('/api/plan-image', planImageRoutes);
+
+  // ✅ Alias endpoint for Admin UI (expected path)
+app.post('/api/articles/plan-image', async (req, res) => {
+  try {
+    const { chooseHeroImage } = require('./src/services/imagePicker');
+
+    const {
+      title = '',
+      summary = '',
+      category = '',
+      tags = [],
+      slug = ''
+    } = req.body || {};
+
+    const pick = await chooseHeroImage({ title, summary, category, tags, slug });
+
+    return res.json({
+      publicId: pick?.publicId || null,
+      url: pick?.url || null,
+      why: pick?.why || null
+    });
+  } catch (err) {
+    console.error('POST /api/articles/plan-image failed:', err);
+    return res.status(500).json({ error: 'plan-image failed' });
+  }
+});
+
   // History Page (Public + Admin)
   app.use("/api/history-page", historyPageRoutes);
 
@@ -1124,6 +1240,22 @@ async function connectMongo() {
     next();
   }
 
+  // ✅ CRON secret auth (for Render cron / server-to-server calls)
+// Uses env CRON_SECRET (recommended). If not set, falls back to ADMIN_PASSWORD.
+function cronSecretAuth(req, res, next) {
+  const expected = String(process.env.CRON_SECRET || process.env.ADMIN_PASSWORD || '').trim();
+  const got = String(req.headers['x-cron-secret'] || '').trim();
+
+  if (!expected) {
+    return res.status(500).json({ error: 'CRON_SECRET not set' });
+  }
+  if (!got || got !== expected) {
+    return res.status(401).json({ error: 'Invalid or missing cron secret' });
+  }
+  return next();
+}
+
+
   /* -------------------- Comments & Newsletter -------------------- */
   const commentsRouterFactory = require('./routes/comments');
   app.use(commentsRouterFactory(
@@ -1336,317 +1468,172 @@ if (picked?.chosen) {
     return doc;
   }
 
-  /* -------------------- Auto image match (Cloudinary) -------------------- */
+  /* -------------------- Auto image match (DB-first ImageLibrary) -------------------- */
 
-  // Expand stopwords heavily to remove generic “news noise”
-  const STOP_WORDS = new Set([
-    'the','a','an','and','or','of','to','in','on','for','at','by','with','is','are','was','were','be',
-    'as','from','that','this','these','those','it','its','into','over','after','before','about','than',
-    'new','latest','today','yesterday','tomorrow','live','update','updates','report','reports','says','said',
-    'amid','among','near','nearly','major','big','huge','fresh','breaking','watch','video','photos','image',
-    'official','sources','source','government','minister','ministry','leaders','leader',
-    // common fillers
-    'could','would','should','may','might','can','will','now','just','also','still'
-  ]);
-
-  function normalizeText(s='') {
-    return String(s || '')
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
-  function splitWords(s='') {
-    return normalizeText(s)
-      .split(' ')
-      .filter(w => w && w.length >= 3 && !STOP_WORDS.has(w));
-  }
-
-  // Build phrases from title: "naval drills", "persian gulf", etc.
-  function buildPhrases(words, maxN=3) {
-    const out = [];
-    for (let n = 2; n <= maxN; n++) {
-      for (let i = 0; i <= words.length - n; i++) {
-        out.push(words.slice(i, i+n).join(' '));
-        out.push(words.slice(i, i+n).join('-')); // filename friendly
-      }
-    }
-    return out;
-  }
-
-  // Detect "strong" tokens: acronyms, proper entities, specific event words.
-  // (simple heuristic — works well for news)
-  const STRONG_EVENT_WORDS = new Set([
-    'strike','strikes','attack','attacks','war','missile','missiles','drill','drills','exercise','exercises',
-    'navy','naval','carrier','bomber','sanctions','summit','election','budget','tariff','ceasefire',
-    'explosion','explosions','blast','blasts','crash','launch','launches','deploy','deploys'
-  ]);
-
-  function classifyStrongTokens(words) {
-    const strong = [];
-    const weak = [];
-
-    for (const w of words) {
-      if (STRONG_EVENT_WORDS.has(w)) {
-        strong.push(w);
-        continue;
-      }
-      // acronyms like RBI, NATO appear as lowercase here after normalize — still okay:
-      // prefer short-uppercase in original is hard; instead treat 3–5 letter tokens as stronger sometimes
-      if (w.length <= 5 && /^[a-z]+$/.test(w)) {
-        // keep as weak unless it’s a known strong acronym-like token
-        // (you can add more later: rbi, isro, bcci, nato, un, etc.)
-        if (['rbi','isro','bcci','nato','un','us','uk','uae','iran','china','russia','india','pakistan','israel','gaza','ukraine'].includes(w)) {
-          strong.push(w);
-          continue;
-        }
-      }
-      weak.push(w);
-    }
-
-    return { strong, weak };
-  }
-
-  function buildArticleKeywords({ title = '', tags = [], category = '' }) {
-    const titleWords = splitWords(title);
-    const tagWords = splitWords((Array.isArray(tags) ? tags : []).join(' '));
-    const catWords = splitWords(category);
-
-    // phrases from title only (most reliable signal)
-    const phrases = buildPhrases(titleWords, 3);
-
-    // Merge but keep priority order: strong title words → title phrases → tags → category
-    const all = [
-      ...titleWords,
-      ...phrases,
-      ...tagWords,
-      ...catWords
-    ].map(normalizeText).filter(Boolean);
-
-    const seen = new Set();
-    const deduped = [];
-    for (const k of all) {
-      const kk = k.trim();
-      if (!kk || seen.has(kk)) continue;
-      seen.add(kk);
-      deduped.push(kk);
-    }
-
-    // hard cap to keep Cloudinary query reasonable
-    return deduped.slice(0, 30);
-  }
-async function searchCloudinaryByKeywords(keywords = []) {
-  if (!keywords.length) return [];
-
-  const folderRaw = process.env.CLOUDINARY_FOLDER || "news-images";
-  const prefix = String(folderRaw).replace(/\/+$/, "") + "/";
-
-  const scanMax = parseInt(process.env.CLOUDINARY_AUTOPICK_SCAN_MAX || "500", 10);
-  const maxPool = parseInt(process.env.CLOUDINARY_AUTOPICK_MAX || "60", 10);
-
-  // normalize keywords
-  const kw = keywords
-    .map(k => String(k || "").trim().toLowerCase())
+// Normalize tags to lowercase strings
+function normTags(tags = []) {
+  return (Array.isArray(tags) ? tags : [])
+    .map(t => String(t || '').trim().toLowerCase())
     .filter(Boolean);
+}
 
-  if (!kw.length) return [];
-
+/**
+ * Pick best image from ImageLibrary using:
+ * 1) highest number of matching tags
+ * 2) then highest priority
+ * 3) then newest
+ *
+ * Keeps the same return shape as your existing Cloudinary picker:
+ * { chosen: { imageUrl, imagePublicId, ogImage } | null, debug: {...} }
+ */
+async function pickBestImageForArticle({ title = '', tags = [], category = '' }) {
   try {
-    let all = [];
-    let next_cursor = undefined;
-
-    // ✅ Cloudinary Admin API listing (NO search DSL)
-    while (all.length < scanMax) {
-      const remaining = scanMax - all.length;
-      const pageSize = Math.min(100, remaining);
-
-      const res = await cloudinary.api.resources({
-        type: "upload",
-        resource_type: "image",
-        prefix,             // ✅ folder restriction
-        max_results: pageSize,
-        next_cursor,
-        tags: true          // ✅ we need tags for your scoring logic
-      });
-
-      const resources = Array.isArray(res?.resources) ? res.resources : [];
-      all.push(...resources);
-
-      next_cursor = res?.next_cursor;
-      if (!next_cursor || resources.length === 0) break;
+    // Keep your existing ON/OFF switch to avoid changing env usage
+    if (String(process.env.CLOUDINARY_AUTOPICK || 'on').toLowerCase() === 'off') {
+      return { chosen: null, debug: { mode: 'off' } };
     }
 
-    if (!all.length) return [];
+    const tagSet = new Set(normTags(tags));
+    if (tagSet.size === 0) {
+      return { chosen: null, debug: { mode: 'no-tags' } };
+    }
 
-    // ✅ filter locally: match tags/public_id/filename
-    const filtered = all.filter((r) => {
-      const id = String(r.public_id || "").toLowerCase();
-      const filename = id.split("/").pop() || "";
-      const tags = Array.isArray(r.tags) ? r.tags.map(t => String(t).toLowerCase()) : [];
+    const tagArr = Array.from(tagSet);
+    const cat = String(category || '').trim();
 
-      return kw.some(k => tags.includes(k) || id.includes(k) || filename.includes(k));
+    // Pull a candidate pool from MongoDB (must match at least 1 tag)
+    const candidates = await ImageLibrary.find({
+      tags: { $in: tagArr },
+    })
+      .sort({ priority: -1, createdAt: -1 })
+      .limit(80)
+      .lean();
+
+    if (!candidates.length) {
+      return {
+        chosen: null,
+        debug: {
+          mode: 'no-db-candidates',
+          usedTags: tagArr,
+          category: cat || null,
+        },
+      };
+    }
+
+    // Score candidates locally
+    const ranked = candidates.map(img => {
+      const imgTags = new Set(normTags(img.tags || []));
+      let matchCount = 0;
+      for (const t of tagSet) if (imgTags.has(t)) matchCount++;
+
+      const sameCategory =
+        cat &&
+        img.category &&
+        String(img.category).toLowerCase() === cat.toLowerCase();
+
+      // Score: tags dominate, then small category bonus, then priority tiebreak
+      const score =
+        (matchCount * 100) +
+        (sameCategory ? 20 : 0) +
+        Number(img.priority || 0);
+
+      return { img, matchCount, sameCategory, score };
     });
 
-    // newest first
-    filtered.sort((a, b) => {
-      const da = Date.parse(a.created_at || "") || 0;
-      const db = Date.parse(b.created_at || "") || 0;
-      return db - da;
-    });
+    ranked.sort((a, b) => b.score - a.score);
 
-    return filtered.slice(0, Math.max(10, maxPool));
+    const best = ranked[0];
+
+    // Minimum confidence: require at least N matching tags (default 2)
+    const requiredMatches = parseInt(process.env.IMAGE_LIBRARY_REQUIRED_MATCHES || '2', 10);
+
+    if (best.matchCount < requiredMatches) {
+      return {
+        chosen: null,
+        debug: {
+          mode: 'below-required-matches',
+          requiredMatches,
+          bestMatchCount: best.matchCount,
+          usedTags: tagArr,
+          top3: ranked.slice(0, 3).map(r => ({
+            publicId: r.img.publicId,
+            matchCount: r.matchCount,
+            priority: r.img.priority || 0,
+            category: r.img.category || null,
+          })),
+        },
+      };
+    }
+
+    const publicId = best.img.publicId || null;
+    const imageUrl = best.img.url || null;
+
+    // Build OG from publicId if possible (most reliable)
+    const ogImage = publicId
+      ? cloudinary.url(publicId, {
+          width: 1200,
+          height: 630,
+          crop: 'fill',
+          format: 'jpg',
+          secure: true,
+        })
+      : (best.img.ogImage || imageUrl || '');
+
+    return {
+      chosen: {
+        imageUrl: imageUrl || '',
+        imagePublicId: publicId || '',
+        ogImage: ogImage || '',
+      },
+      debug: {
+        mode: 'db-first',
+        requiredMatches,
+        bestMatchCount: best.matchCount,
+        bestCategoryMatch: !!best.sameCategory,
+        usedTags: tagArr,
+        picked: {
+          publicId,
+          url: imageUrl,
+          tags: best.img.tags || [],
+          category: best.img.category || null,
+          priority: best.img.priority || 0,
+        },
+        top3: ranked.slice(0, 3).map(r => ({
+          publicId: r.img.publicId,
+          matchCount: r.matchCount,
+          sameCategory: r.sameCategory,
+          priority: r.img.priority || 0,
+          category: r.img.category || null,
+        })),
+      },
+    };
   } catch (e) {
-    console.warn("[cloudinary.api.resources] failed:", e?.message || e);
-    return [];
+    console.warn('[image-library autopick] failed:', e?.message || e);
+    return { chosen: null, debug: { mode: 'error', error: e?.message || String(e) } };
   }
 }
 
-  function scoreImage(resource, { strongSet, weakSet, phraseSet }) {
-    const id = String(resource.public_id || '').toLowerCase();
-    const filename = id.split('/').pop() || '';
-    const tags = (resource.tags || []).map(t => String(t).toLowerCase());
+async function ensureArticleHasImage(payload = {}) {
+  // If anything already exists, do nothing
+  if (payload.imageUrl || payload.ogImage || payload.imagePublicId) return payload;
 
-    let score = 0;
-    let strongHits = 0;
-    let totalHits = 0;
-
-    function hit(points, isStrong=false) {
-      score += points;
-      totalHits++;
-      if (isStrong) strongHits++;
-    }
-
-    // Strong hits matter a lot more
-    for (const k of strongSet) {
-      if (tags.includes(k)) hit(12, true);
-      if (id.includes(k)) hit(8, true);
-      if (filename.includes(k)) hit(8, true);
-    }
-
-    // Phrase hits are extremely valuable (closest to “exact match”)
-    for (const p of phraseSet) {
-      if (tags.includes(p)) hit(14, true);
-      if (id.includes(p)) hit(10, true);
-      if (filename.includes(p)) hit(10, true);
-    }
-
-    // Weak hits give small support but shouldn’t dominate
-    for (const k of weakSet) {
-      if (tags.includes(k)) hit(3, false);
-      if (id.includes(k)) hit(2, false);
-      if (filename.includes(k)) hit(2, false);
-    }
-
-    // Quality bonus
-    if (resource.width >= 1200) score += 2;
-    if (resource.width >= 1600) score += 2;
-
-    return { score, strongHits, totalHits };
-  }
-
-  async function pickBestImageForArticle({ title, tags = [], category = '' }) {
-    try {
-      if (String(process.env.CLOUDINARY_AUTOPICK || 'on').toLowerCase() === 'off') return null;
-
-      const keywords = buildArticleKeywords({ title, tags, category });
-      if (!keywords.length) return null;
-
-      const titleWords = splitWords(title);
-      const { strong, weak } = classifyStrongTokens(titleWords);
-
-      // phrase set from title only (best signal)
-      const phraseSet = new Set(buildPhrases(titleWords, 3).map(normalizeText));
-      const strongSet = new Set(strong.map(normalizeText));
-      const weakSet = new Set(weak.map(normalizeText));
-
-      const resources = await searchCloudinaryByKeywords(keywords);
-      if (!resources.length) return null;
-
-      let best = null;
-  let bestMeta = null;
-
-  // NEW: keep ranked list so we can return top3 suggestions
-  const ranked = [];
-
-  for (const r of resources) {
-    const meta = scoreImage(r, { strongSet, weakSet, phraseSet });
-    ranked.push({ r, meta });
-
-    if (!best || meta.score > bestMeta.score) {
-      best = r;
-      bestMeta = meta;
-    }
-  }
-
-  // sort best-first
-  ranked.sort((a, b) => b.meta.score - a.meta.score);
-
-  // top3 suggestions for manual fallback
-  const top3 = ranked.slice(0, 3).map(x => ({
-    publicId: x.r.public_id,
-    url: x.r.secure_url,
-    score: x.meta.score,
-    strongHits: x.meta.strongHits,
-    totalHits: x.meta.totalHits
-  }));
-
-
-      if (!best) return null;
-
-      // ✅ CONFIDENCE GATE:
-      // Must have at least 1 strong hit AND at least 2 total hits,
-      // and must cross a minimum score.
-      const minScore = parseInt(process.env.CLOUDINARY_AUTOPICK_MIN_SCORE || '20', 10);
-
-  const debug = {
-    minScore,
-    bestScore: bestMeta.score,
-    strongHits: bestMeta.strongHits,
-    totalHits: bestMeta.totalHits,
-    top3
-  };
-
-  if (bestMeta.score < minScore || bestMeta.strongHits < 1 || bestMeta.totalHits < 2) {
-    return { chosen: null, debug };
-  }
-
-
-      const publicId = best.public_id;
-      const imageUrl = best.secure_url || cloudinary.url(publicId, { secure: true });
-      const ogImage  = cloudinary.url(publicId, { width: 1200, height: 630, crop: 'fill', format: 'jpg', secure: true });
-
-      return {
-    chosen: { imageUrl, imagePublicId: publicId, ogImage },
-    debug
-  };
-
-    } catch (e) {
-      console.warn('[autopick-image] failed:', e?.message || e);
-      return null;
-    }
-  }
-
-  async function ensureArticleHasImage(payload = {}) {
-    if (payload.imageUrl || payload.ogImage || payload.imagePublicId) return payload;
   const result = await pickBestImageForArticle({
     title: payload.title,
     tags: payload.tags,
-    category: payload.category
+    category: payload.category,
   });
 
   if (result?.chosen) {
-    payload.imageUrl = result.chosen.imageUrl;
-    payload.imagePublicId = result.chosen.imagePublicId;
+    payload.imageUrl = result.chosen.imageUrl || payload.imageUrl;
+    payload.imagePublicId = result.chosen.imagePublicId || payload.imagePublicId;
     payload.ogImage = result.chosen.ogImage || payload.ogImage;
   }
 
-  // optional: keep debug so admin can see why it failed
+  // keep debug so admin can see why it failed
   payload._autoImageDebug = result?.debug;
 
   return payload;
-
-  }
+}
 
 
   /* -------------------- Articles API (public + admin) -------------------- */
@@ -2820,7 +2807,8 @@ if (category !== undefined || categorySlug !== undefined || categoryName !== und
       const a = await Article.findOne(filter).lean();
       if (!a) return res.status(404).json({ error: 'Not found' });
 
-      return res.json({ ...a, id: a._id, publishedAt: a.publishedAt });
+      return res.json(normalizeArticleForClient(a));
+
     } catch (e) {
       console.error('GET /api/articles/slug/:slug failed:', e?.message || e);
       return res.status(500).json({ error: 'Server error' });
@@ -2843,7 +2831,8 @@ if (category !== undefined || categorySlug !== undefined || categoryName !== und
       if (isObjectId) {
         const a = await Article.findById(key).lean();
         if (!a) return res.status(404).json({ error: 'Not found' });
-        return res.json({ ...a, id: a._id, publishedAt: a.publishedAt });
+        return res.json(normalizeArticleForClient(a));
+
       }
 
       // Otherwise treat it as a slug -> redirect to canonical
