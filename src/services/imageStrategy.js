@@ -176,82 +176,104 @@ async function pickFromImageLibrary({ tags = [], category = "" } = {}) {
   const cleanTags = Array.isArray(tags) ? tags.filter(Boolean) : [];
   const cleanCategory = String(category || "").trim();
 
-  if (!cleanTags.length) return null;
+  // 1) Tag match (best)
+  if (cleanTags.length) {
+    const candidates = await ImageLibrary.find({
+      tags: { $in: cleanTags },
+    })
+      .sort({ priority: -1, createdAt: -1 })
+      .limit(50)
+      .lean();
 
-  // Find images that match ANY of the tags (we will score in JS)
-  const candidates = await ImageLibrary.find({
-    tags: { $in: cleanTags },
-  })
-    .sort({ priority: -1, createdAt: -1 })
-    .limit(50)
-    .lean();
+    if (candidates.length) {
+      let best = null;
 
-  if (!candidates.length) return null;
+      for (const img of candidates) {
+        const imgTags = Array.isArray(img.tags) ? img.tags : [];
+        const matchCount = imgTags.filter((t) => cleanTags.includes(t)).length;
+        const sameCategory =
+          cleanCategory && img.category && img.category === cleanCategory;
 
-  // score by matchCount + category boost + priority
-  let best = null;
+        const score =
+          matchCount * 10 + (sameCategory ? 5 : 0) + (Number(img.priority) || 0);
 
-  for (const img of candidates) {
-    const imgTags = Array.isArray(img.tags) ? img.tags : [];
-    const matchCount = imgTags.filter((t) => cleanTags.includes(t)).length;
-    const sameCategory =
-      cleanCategory && img.category && img.category === cleanCategory;
+        const row = {
+          publicId: img.publicId,
+          url: img.url,
+          category: img.category || "",
+          tags: imgTags,
+          priority: Number(img.priority) || 0,
+          matchCount,
+          sameCategory,
+          score,
+        };
 
-    const score =
-      matchCount * 10 + (sameCategory ? 5 : 0) + (Number(img.priority) || 0);
+        if (!best || row.score > best.score) best = row;
+      }
 
-    const row = {
-      publicId: img.publicId,
-      url: img.url,
-      category: img.category || "",
-      tags: imgTags,
-      priority: Number(img.priority) || 0,
-      matchCount,
-      sameCategory,
-      score,
-    };
-
-    if (!best || row.score > best.score) best = row;
+      if (best) {
+        return {
+          publicId: best.publicId,
+          url: best.url,
+          why: {
+            mode: "db-tag-match",
+            picked: best.publicId,
+            reason: "Matched ImageLibrary tags",
+            matchCount: best.matchCount,
+            sameCategory: best.sameCategory,
+            articleTags: cleanTags,
+            imageTags: best.tags,
+            category: cleanCategory || "",
+          },
+        };
+      }
+    }
   }
 
-  if (!best) return null;
+  // 2) Category fallback (still ONLY ImageLibrary)
+  if (cleanCategory) {
+    const catPick = await ImageLibrary.find({
+      category: cleanCategory,
+    })
+      .sort({ priority: -1, createdAt: -1 })
+      .limit(1)
+      .lean();
 
-  return {
-    publicId: best.publicId,
-    url: best.url,
-    why: {
-      mode: "db-first",
-      requiredMatches: Number(process.env.CLOUDINARY_AUTOPICK_MIN_TAG_MATCHES || 2),
-      bestMatchCount: best.matchCount,
-      bestCategoryMatch: best.sameCategory,
-      usedTags: cleanTags,
-      picked: {
-        publicId: best.publicId,
-        url: best.url,
-        tags: best.tags,
-        category: best.category,
-        priority: best.priority,
+    if (catPick && catPick[0] && catPick[0].publicId) {
+      return {
+        publicId: catPick[0].publicId,
+        url: catPick[0].url,
+        why: {
+          mode: "db-category-fallback",
+          picked: catPick[0].publicId,
+          reason: "No tag match; fell back to same category in ImageLibrary",
+          category: cleanCategory,
+        },
+      };
+    }
+  }
+
+  // 3) Final fallback: ANY ImageLibrary image (so we NEVER hit default if library has images)
+  const anyPick = await ImageLibrary.find({})
+    .sort({ priority: -1, createdAt: -1 })
+    .limit(1)
+    .lean();
+
+  if (anyPick && anyPick[0] && anyPick[0].publicId) {
+    return {
+      publicId: anyPick[0].publicId,
+      url: anyPick[0].url,
+      why: {
+        mode: "db-any-fallback",
+        picked: anyPick[0].publicId,
+        reason: "No tag/category match; fell back to any ImageLibrary image",
       },
-      top3: candidates
-        .map((img) => {
-          const imgTags = Array.isArray(img.tags) ? img.tags : [];
-          const matchCount = imgTags.filter((t) => cleanTags.includes(t)).length;
-          const sameCategory =
-            cleanCategory && img.category && img.category === cleanCategory;
+    };
+  }
 
-          return {
-            publicId: img.publicId,
-            matchCount,
-            sameCategory,
-            priority: Number(img.priority) || 0,
-            category: img.category || "",
-          };
-        })
-        .sort((a, b) => (b.matchCount - a.matchCount) || (b.priority - a.priority))
-        .slice(0, 3),
-    },
-  };
+  return null;
 }
+
 
 /**
  * Main orchestrator.

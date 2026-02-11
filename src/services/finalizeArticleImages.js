@@ -12,7 +12,8 @@ const {
   uploadDriveImageToCloudinary,
   extractDriveFileId,
 } = require("./googleDriveUploader");
-const { chooseHeroImage } = require("./imagePicker");
+const { decideAndAttach } = require("./imageStrategy");
+
 const cloudinary = require("cloudinary").v2;
 
 // OG variants
@@ -196,34 +197,32 @@ exports.finalizeArticleImages = async function finalizeArticleImages(
   }
 
   // ---------------------------------------------------------------------------
-// CASE 3 — NOTHING EXISTS → AUTO PICK (ImageLibrary / Cloudinary)
+// CASE 3 — NOTHING EXISTS → AUTO PICK (DB ImageLibrary FIRST, ALWAYS)
 // ---------------------------------------------------------------------------
 if (!imagePublicId && !imageUrl) {
   try {
-    const pick = await chooseHeroImage({
+    const tmp = {
       title: norm.title,
       summary: norm.summary,
+      slug: norm.slug,
       category: norm.category,
       tags: norm.tags,
-      slug: norm.slug,
-    });
+      imageAlt: norm.imageAlt,
 
-    if (pick && pick.publicId) {
-      imagePublicId = pick.publicId;
-      imageUrl = pick.url || buildHeroUrl(pick.publicId);
+      imagePublicId: null,
+      imageUrl: null,
 
-      // ✅ FIX: Always mark ImagePicker selection as AUTO (not manual)
-      autoPicked = true;
+      autoImageDebug: autoImageDebug || null,
+      autoImagePicked: false,
+      autoImagePickedAt: null,
+    };
 
-      // ✅ FIX: overwrite any "manual" mode coming from pick.why
-      autoImageDebug = {
-        ...(pick.why && typeof pick.why === "object" ? pick.why : {}),
-        mode: "auto-image-library",
-        picked: pick.publicId,
-        pickedFrom: "image-library",
-        updatedAt: new Date().toISOString(),
-      };
-    }
+    await decideAndAttach(tmp);
+
+    imagePublicId = tmp.imagePublicId || null;
+    imageUrl = tmp.imageUrl || null;
+    autoImageDebug = tmp.autoImageDebug || autoImageDebug;
+    autoPicked = !!tmp.autoImagePicked;
   } catch (e) {
     // swallow → fallback below
   }
