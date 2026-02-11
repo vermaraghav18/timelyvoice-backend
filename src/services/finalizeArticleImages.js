@@ -196,28 +196,39 @@ exports.finalizeArticleImages = async function finalizeArticleImages(
   }
 
   // ---------------------------------------------------------------------------
-  // CASE 3 — NOTHING EXISTS → AUTO PICK FROM CLOUDINARY
-  // ---------------------------------------------------------------------------
-  if (!imagePublicId && !imageUrl) {
-    try {
-      const pick = await chooseHeroImage({
-        title: norm.title,
-        summary: norm.summary,
-        category: norm.category,
-        tags: norm.tags,
-        slug: norm.slug,
-      });
+// CASE 3 — NOTHING EXISTS → AUTO PICK (ImageLibrary / Cloudinary)
+// ---------------------------------------------------------------------------
+if (!imagePublicId && !imageUrl) {
+  try {
+    const pick = await chooseHeroImage({
+      title: norm.title,
+      summary: norm.summary,
+      category: norm.category,
+      tags: norm.tags,
+      slug: norm.slug,
+    });
 
-      if (pick && pick.publicId) {
-        imagePublicId = pick.publicId;
-        imageUrl = pick.url || buildHeroUrl(pick.publicId);
-        autoImageDebug = pick.why;
-        autoPicked = true;
-      }
-    } catch (e) {
-      // swallow → fallback below
+    if (pick && pick.publicId) {
+      imagePublicId = pick.publicId;
+      imageUrl = pick.url || buildHeroUrl(pick.publicId);
+
+      // ✅ FIX: Always mark ImagePicker selection as AUTO (not manual)
+      autoPicked = true;
+
+      // ✅ FIX: overwrite any "manual" mode coming from pick.why
+      autoImageDebug = {
+        ...(pick.why && typeof pick.why === "object" ? pick.why : {}),
+        mode: "auto-image-library",
+        picked: pick.publicId,
+        pickedFrom: "image-library",
+        updatedAt: new Date().toISOString(),
+      };
     }
+  } catch (e) {
+    // swallow → fallback below
   }
+}
+
 
   // ---------------------------------------------------------------------------
   // FINAL FALLBACK — ONLY IF NOTHING WORKED
@@ -228,13 +239,18 @@ exports.finalizeArticleImages = async function finalizeArticleImages(
   const ogImage = buildOgUrl(imagePublicId);
   const thumbImage = buildThumbUrl(imagePublicId);
 
-  if (!autoImageDebug) {
-    autoImageDebug = {
-      mode:
-        imagePublicId === DEFAULT_PUBLIC_ID ? "fallback-default" : "kept-existing",
-      picked: imagePublicId,
-    };
-  }
+ if (!autoImageDebug) {
+  autoImageDebug = {
+    mode: autoPicked
+      ? "auto-image-library"
+      : imagePublicId === DEFAULT_PUBLIC_ID
+      ? "fallback-default"
+      : "kept-existing",
+    picked: imagePublicId,
+    pickedFrom: autoPicked ? "image-library" : undefined,
+    updatedAt: new Date().toISOString(),
+  };
+}
 
   return {
     imagePublicId,
