@@ -106,9 +106,9 @@ async function backfillMatchingArticlesFromLibraryImage(imageDoc, opts = {}) {
 
   // If this library image is tagged "default" -> backfill only default-image articles (already filtered above)
   // If not default -> match by tags and/or category
-  if (imgTagsNoDefault.length) {
-    baseQuery.tags = { $in: imgTagsNoDefault };
-  } else {
+ // IMPORTANT: Do NOT filter by tags in Mongo because tags are case-sensitive in DB.
+// We'll do the tag overlap match in JS using normalizeTag() so it works for "Ice" vs "ice".
+ else {
     // If it’s only a default tag, don’t require article tags match.
     // We still only update default-image articles.
   }
