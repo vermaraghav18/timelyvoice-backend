@@ -350,11 +350,21 @@ async function runOnceAutoNews({ reason = "interval", force = false } = {}) {
         imageAlt: payload.imageAlt,
       });
 
-      if (fin) {
-        payload.imageUrl = fin.imageUrl || payload.imageUrl;
-        payload.imagePublicId = fin.imagePublicId || payload.imagePublicId;
-        payload.imageAlt = payload.imageAlt || fin.imageAlt;
-      }
+     if (fin) {
+  payload.imageUrl = fin.imageUrl || payload.imageUrl;
+  payload.imagePublicId = fin.imagePublicId || payload.imagePublicId;
+  payload.imageAlt = payload.imageAlt || fin.imageAlt;
+
+  // variants
+  payload.ogImage = fin.ogImage || payload.ogImage;
+  payload.thumbImage = fin.thumbImage || payload.thumbImage;
+
+  // picker metadata (so admin can show WHY it picked / failed)
+  payload.autoImageDebug = fin.autoImageDebug || payload.autoImageDebug;
+  payload.autoImagePicked = !!fin.autoImagePicked;
+  payload.autoImagePickedAt = fin.autoImagePickedAt || null;
+}
+
 
       let finalSlug = payload.slug;
       let suffix = 2;

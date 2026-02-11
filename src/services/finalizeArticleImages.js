@@ -199,6 +199,7 @@ exports.finalizeArticleImages = async function finalizeArticleImages(
   // ---------------------------------------------------------------------------
 // CASE 3 — NOTHING EXISTS → AUTO PICK (DB ImageLibrary FIRST, ALWAYS)
 // ---------------------------------------------------------------------------
+// CASE 3 — NOTHING EXISTS → AUTO PICK (ONLY ImageLibrary via imageStrategy)
 if (!imagePublicId && !imageUrl) {
   try {
     const tmp = {

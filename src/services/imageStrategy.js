@@ -1,17 +1,18 @@
 // backend/src/services/imageStrategy.js
-// Cloudinary-only Image Strategy Orchestrator
+// Image Strategy Orchestrator (IMAGE-LIBRARY ONLY)
 //
-// Purpose:
-// - If article has a real image (manual or real Cloudinary), keep it
-// - If article has only default placeholder, treat as "no image" so picker can run
-// - If no real image, try DB-first ImageLibrary picker
-// - If still nothing, try strict tag-first Cloudinary picker (chooseHeroImage)
-// - If still nothing, fall back to ImageLibrary "default" image
-// - If still nothing, fall back to DEFAULT_PUBLIC_ID
+// PURPOSE (your requirement):
+// - Created-by-AI (and all autopick) must ONLY use /admin/image-library
+// - If tags match -> pick best match
+// - Else if category match -> pick category match
+// - Else -> pick ImageLibrary image tagged "default" (ONE canonical default)
+// - Only if ImageLibrary is empty -> use DEFAULT_PUBLIC_ID fallback (env)
+// - NEVER use Cloudinary tag-search picker (chooseHeroImage)
+
+"use strict";
 
 const cloudinary = require("cloudinary").v2;
 const assert = require("assert");
-const { chooseHeroImage } = require("./imagePicker");
 const ImageLibrary = require("../models/ImageLibrary");
 
 const DEFAULT_PUBLIC_ID =
@@ -32,8 +33,6 @@ function isPlaceholderUrl(url = "") {
       h.includes("cdn.example")
     );
   } catch (_) {
-    // If it isn't a valid URL, don't treat it as placeholder automatically
-    // (manual relative URLs etc. should not get nuked here)
     return false;
   }
 }
@@ -49,7 +48,7 @@ function isDefaultPlaceholder(publicId, imageUrl) {
 }
 
 // ------------------------------
-// Tag normalization (must match picker + AI uploader)
+// Tag normalization (keep same as before)
 // ------------------------------
 function stem(t) {
   if (!t) return "";
@@ -102,7 +101,7 @@ function normalizeArticleInput(a = {}) {
     title: a.title || "",
     summary: a.summary || "",
     slug: a.slug || "",
-    category: a.category || "",
+    category: String(a.category || "").trim(),
     tags: dedupe(normalizeTagsInput(a.tags)),
     imageAlt: a.imageAlt || "",
   };
@@ -110,8 +109,7 @@ function normalizeArticleInput(a = {}) {
 
 // ------------------------------
 // DEFAULT PICKER (ImageLibrary)
-// Used ONLY when no match exists.
-// Rule: Image must have tag "default"
+// RULE: Image must have tag "default"
 // Preference order:
 // 1) category-specific default (category = article category)
 // 2) global default (category = "global")
@@ -143,9 +141,7 @@ async function pickDefaultFromImageLibrary({ category = "" } = {}) {
 
   // 3) any default
   if (!doc) {
-    doc = await ImageLibrary.findOne({
-      tags: "default",
-    })
+    doc = await ImageLibrary.findOne({ tags: "default" })
       .sort({ priority: -1, createdAt: -1 })
       .lean();
   }
@@ -157,7 +153,7 @@ async function pickDefaultFromImageLibrary({ category = "" } = {}) {
     url: doc.url,
     why: {
       mode: "db-default",
-      reason: "No tag match found, used ImageLibrary default",
+      reason: 'No match found, used ImageLibrary tag "default"',
       picked: {
         publicId: doc.publicId,
         url: doc.url,
@@ -171,12 +167,15 @@ async function pickDefaultFromImageLibrary({ category = "" } = {}) {
 
 // ------------------------------
 // DB-FIRST PICKER (ImageLibrary)
+// IMPORTANT: DO NOT "pick any" here.
+// We must reserve default behavior for tag "default" only.
+// Priority: tag match → category match → (return null)
 // ------------------------------
 async function pickFromImageLibrary({ tags = [], category = "" } = {}) {
   const cleanTags = Array.isArray(tags) ? tags.filter(Boolean) : [];
   const cleanCategory = String(category || "").trim();
 
-  // 1) Tag match (best)
+  // 1) TAG MATCH (best)
   if (cleanTags.length) {
     const candidates = await ImageLibrary.find({
       tags: { $in: cleanTags },
@@ -211,81 +210,56 @@ async function pickFromImageLibrary({ tags = [], category = "" } = {}) {
         if (!best || row.score > best.score) best = row;
       }
 
-      if (best) {
-        return {
-          publicId: best.publicId,
-          url: best.url,
-          why: {
-            mode: "db-tag-match",
-            picked: best.publicId,
-            reason: "Matched ImageLibrary tags",
-            matchCount: best.matchCount,
-            sameCategory: best.sameCategory,
-            articleTags: cleanTags,
-            imageTags: best.tags,
-            category: cleanCategory || "",
-          },
-        };
-      }
-    }
-  }
-
-  // 2) Category fallback (still ONLY ImageLibrary)
-  if (cleanCategory) {
-    const catPick = await ImageLibrary.find({
-      category: cleanCategory,
-    })
-      .sort({ priority: -1, createdAt: -1 })
-      .limit(1)
-      .lean();
-
-    if (catPick && catPick[0] && catPick[0].publicId) {
       return {
-        publicId: catPick[0].publicId,
-        url: catPick[0].url,
+        publicId: best.publicId,
+        url: best.url,
         why: {
-          mode: "db-category-fallback",
-          picked: catPick[0].publicId,
-          reason: "No tag match; fell back to same category in ImageLibrary",
-          category: cleanCategory,
+          mode: "db-tag-match",
+          reason: "Matched ImageLibrary tags",
+          usedTags: cleanTags,
+          picked: best.publicId,
+          matchCount: best.matchCount,
+          sameCategory: best.sameCategory,
         },
       };
     }
   }
 
-  // 3) Final fallback: ANY ImageLibrary image (so we NEVER hit default if library has images)
-  const anyPick = await ImageLibrary.find({})
-    .sort({ priority: -1, createdAt: -1 })
-    .limit(1)
-    .lean();
+  // 2) CATEGORY FALLBACK (still only ImageLibrary)
+  if (cleanCategory) {
+    const cat = await ImageLibrary.findOne({ category: cleanCategory })
+      .sort({ priority: -1, createdAt: -1 })
+      .lean();
 
-  if (anyPick && anyPick[0] && anyPick[0].publicId) {
-    return {
-      publicId: anyPick[0].publicId,
-      url: anyPick[0].url,
-      why: {
-        mode: "db-any-fallback",
-        picked: anyPick[0].publicId,
-        reason: "No tag/category match; fell back to any ImageLibrary image",
-      },
-    };
+    // IMPORTANT: don't allow a category image that is actually the default card
+    // (if you want category images, keep separate assets; default is only tag:"default")
+    if (cat?.publicId) {
+      return {
+        publicId: cat.publicId,
+        url: cat.url,
+        why: {
+          mode: "db-category-fallback",
+          reason: "No tag match; fell back to category in ImageLibrary",
+          category: cleanCategory,
+          picked: cat.publicId,
+        },
+      };
+    }
   }
 
   return null;
 }
-
 
 /**
  * Main orchestrator.
  * Mutates `article` in-place:
  *  - keep existing real imagePublicId / imageUrl
  *  - if default placeholder → treat as missing so picker can run
- *  - try ImageLibrary (db-first)
- *  - try chooseHeroImage (strict tag-first)
- *  - fallback to ImageLibrary "default" only if nothing picked
- *  - fallback to DEFAULT_PUBLIC_ID only if nothing picked
+ *  - try ImageLibrary (tag match, then category)
+ *  - if no match -> ImageLibrary "default" (tag: default)
+ *  - if still nothing -> DEFAULT_PUBLIC_ID (env), used only if library empty
  */
-async function decideAndAttach(article = {}, opts = {}) {
+async function decideAndAttach(article = {}, _opts = {}) {
   assert(article, "article is required");
   const meta = normalizeArticleInput(article);
 
@@ -319,7 +293,7 @@ async function decideAndAttach(article = {}, opts = {}) {
     return "kept-existing-url";
   }
 
-  // 3) Try DB-first (ImageLibrary)
+  // 3) Try DB-first (ImageLibrary: tag -> category)
   let picked = null;
 
   try {
@@ -332,10 +306,10 @@ async function decideAndAttach(article = {}, opts = {}) {
     picked = null;
   }
 
-  if (picked && picked.publicId) {
+  if (picked?.publicId) {
     article.imagePublicId = picked.publicId;
-
-    const safeUrl = typeof picked.url === "string" ? picked.url.replace(/\s+/g, "") : "";
+    const safeUrl =
+      typeof picked.url === "string" ? picked.url.replace(/\s+/g, "") : "";
     article.imageUrl = safeUrl || cloudinary.url(picked.publicId, { secure: true });
 
     article.autoImageDebug = picked.why || {
@@ -354,47 +328,7 @@ async function decideAndAttach(article = {}, opts = {}) {
     return "attached-db-image";
   }
 
-  // 4) Try Cloudinary picker (STRICT TAG-FIRST)
-  try {
-    picked = await chooseHeroImage({
-      title: meta.title,
-      summary: meta.summary,
-      slug: meta.slug,
-      category: meta.category,
-      tags: meta.tags,
-    });
-  } catch (err) {
-    console.error("[imageStrategy] chooseHeroImage error:", err);
-    picked = null;
-  }
-
-  if (picked && picked.publicId) {
-    article.imagePublicId = picked.publicId;
-    article.imageUrl =
-      picked.url || cloudinary.url(picked.publicId, { secure: true });
-
-    // ✅ store why (same debug object used everywhere)
-    article.autoImageDebug = picked.why || {
-      mode: "cloudinary-tag-first",
-      picked: picked.publicId,
-      reason: "Auto-picked from Cloudinary",
-    };
-
-    // ✅ flags (ONLY when actually picked)
-    article.autoImagePicked = true;
-    article.autoImagePickedAt = new Date();
-
-    if (!article.imageAlt) {
-      article.imageAlt = meta.imageAlt || meta.title || "News image";
-    }
-    return "attached-cloudinary-image";
-  }
-
-  // 5) Fallback to ImageLibrary DEFAULT (ONLY if nothing else exists)
-  // To use:
-  // - Upload ONE ImageLibrary image with tag "default"
-  // - Recommended global default: category="global", tags=["default"], priority=0
-  // - Optional category default: category="world", tags=["default"]
+  // 4) No match -> ALWAYS use ImageLibrary tag:"default"
   let dbDefault = null;
 
   try {
@@ -404,9 +338,8 @@ async function decideAndAttach(article = {}, opts = {}) {
     dbDefault = null;
   }
 
-  if (dbDefault && dbDefault.publicId) {
+  if (dbDefault?.publicId) {
     article.imagePublicId = dbDefault.publicId;
-
     const safeUrl =
       typeof dbDefault.url === "string" ? dbDefault.url.replace(/\s+/g, "") : "";
     article.imageUrl =
@@ -415,20 +348,20 @@ async function decideAndAttach(article = {}, opts = {}) {
     article.autoImageDebug = dbDefault.why || {
       mode: "db-default",
       picked: dbDefault.publicId,
-      reason: "No match found, used ImageLibrary default",
+      reason: 'No match found, used ImageLibrary tag "default"',
     };
 
-    // ✅ It's still a system pick (eligible for repick if cleared later)
     article.autoImagePicked = true;
     article.autoImagePickedAt = new Date();
 
     if (!article.imageAlt) {
       article.imageAlt = meta.imageAlt || meta.title || "News image";
     }
+
     return "attached-db-default-image";
   }
 
-  // 6) Final fallback default image (ONLY if DB default not present)
+  // 5) Final hard fallback (only if ImageLibrary is empty or broken)
   if (!article.imagePublicId && DEFAULT_PUBLIC_ID) {
     article.imagePublicId = DEFAULT_PUBLIC_ID;
     article.imageUrl = cloudinary.url(DEFAULT_PUBLIC_ID, { secure: true });
@@ -436,10 +369,10 @@ async function decideAndAttach(article = {}, opts = {}) {
     article.autoImageDebug = {
       mode: "fallback-default",
       picked: DEFAULT_PUBLIC_ID,
-      reason: "No suitable Cloudinary/DB image found, used hard default",
+      reason: "ImageLibrary empty/unavailable; used hard default",
     };
 
-    // ✅ IMPORTANT: hard default fallback is NOT a "picked" image
+    // note: hard fallback is not a real "pick"
     article.autoImagePicked = false;
     article.autoImagePickedAt = null;
 
