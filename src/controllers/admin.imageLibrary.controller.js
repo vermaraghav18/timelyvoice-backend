@@ -68,16 +68,31 @@ exports.createImage = async (req, res) => {
       finalUrl = finalLegacyUrl;
     }
 
-    const doc = await ImageLibrary.create({
-      publicId: finalPublicId,
-      url: finalUrl,
-      tags: normalizeTags(tags),
-      category: String(category || "").trim(),
-      source,
-      priority: Number(priority) || 0,
-    });
+   const doc = await ImageLibrary.create({
+  publicId: finalPublicId,
+  url: finalUrl,
+  tags: normalizeTags(tags),
+  category: String(category || "").trim(),
+  source,
+  priority: Number(priority) || 0,
+});
 
-    return res.json({ ok: true, image: doc });
+// ✅ NEW: Retroactively update older AI drafts that still have default image
+let backfill = null;
+try {
+  const { backfillMatchingArticlesFromLibraryImage } = require("../services/imageBackfill");
+  backfill = await backfillMatchingArticlesFromLibraryImage(doc, {
+    limit: 300,
+    lookbackHours: 168, // last 7 days
+    onlyAi: true,
+  });
+} catch (e) {
+  console.error("[ImageLibrary:createImage] backfill error:", e?.message || e);
+  backfill = { ok: false, error: String(e?.message || e) };
+}
+
+return res.json({ ok: true, image: doc, backfill });
+
   } catch (err) {
     // handle duplicate publicId
     if (err && err.code === 11000) {
