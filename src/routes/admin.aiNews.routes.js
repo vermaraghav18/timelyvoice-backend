@@ -92,6 +92,28 @@ router.post("/run-cron-once", requireCronSecret, async (_req, res) => {
   }
 });
 
+// ✅ Force-clear stuck cron lock (in_flight)
+router.post("/clear-in-flight", async (req, res) => {
+  try {
+    // If you store cron state in DB, clear it here.
+    // If you store it in-memory, clear that flag here.
+    // We handle both patterns below.
+
+    // Pattern A: module-level flag
+    if (global.__AI_CRON_IN_FLIGHT) {
+      global.__AI_CRON_IN_FLIGHT = false;
+    }
+
+    // Pattern B: cron state stored somewhere (if exists)
+    // Example: await CronState.updateOne({ key: "ai_news" }, { $set: { inFlight: false } }, { upsert: true });
+
+    return res.json({ ok: true, cleared: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 // ─────────────────────────────────────────────────────────────
 // RSS SEEDS PREVIEW — debug what cron sees
 // GET /api/admin/ai/rss-preview?limit=10
@@ -242,8 +264,10 @@ router.post("/generate-batch", requireCronSecret, async (req, res) => {
         category: g.category || "General",
         status: "draft", // override later
         publishAt: g.publishAt || new Date(),
-        imageUrl: g.imageUrl || null,
-        imagePublicId: g.imagePublicId || null,
+       // ✅ CRITICAL: Never trust AI-provided image fields here either
+imageUrl: null,
+imagePublicId: null,
+
         imageAlt: g.imageAlt || g.title || "",
         metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
         metaDesc: (g.metaDesc || g.summary || "").slice(0, 200),
@@ -254,22 +278,31 @@ router.post("/generate-batch", requireCronSecret, async (req, res) => {
         body: g.body || "",
         source: "ai-batch",
         sourceUrl: g.sourceUrl || "",
+
+        // ✅ NEW: publisher/original image for Admin side-by-side compare
+        sourceImageUrl: g.sourceImageUrl || "",
+        sourceImageFrom: g.sourceImageFrom || "",
+
       };
 
       // 🔁 FINALIZE IMAGES (Drive → Cloudinary + OG + thumb)
       // eslint-disable-next-line no-await-in-loop
-      const fin = await finalizeArticleImages({
-        title: payload.title,
-        summary: payload.summary,
-        category: payload.category,
-        tags: payload.tags,
-        slug: payload.slug,
-        imageUrl: payload.imageUrl,
-        imagePublicId: payload.imagePublicId,
-        imageAlt: payload.imageAlt,
-        ogImage: payload.ogImage,
-        thumbImage: null,
-      });
+     const fin = await finalizeArticleImages({
+  title: payload.title,
+  summary: payload.summary,
+  category: payload.category,
+  tags: payload.tags,
+  slug: payload.slug,
+
+  // ✅ force picker path
+  imageUrl: null,
+  imagePublicId: null,
+
+  imageAlt: payload.imageAlt,
+  ogImage: payload.ogImage,
+  thumbImage: null,
+});
+
 
       if (fin) {
         payload.imagePublicId = fin.imagePublicId;

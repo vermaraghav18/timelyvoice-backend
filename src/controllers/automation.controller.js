@@ -17,6 +17,8 @@ const XSource = require("../models/XSource"); // <-- NEW
 
 const { chooseHeroImage } = require("../services/imagePicker");
 const { finalizeArticleImages } = require("../services/finalizeArticleImages");
+const { extractSourceImage } = require("../services/sourceImageExtractor");
+
 
 const { rewriteWithGuard } = require("../services/rewrite.service");
 const { cleanseHtml } = require("../services/sanitize.service");
@@ -754,26 +756,33 @@ exports.createDraft = async (req, res) => {
     `article-${Date.now()}`;
 
   // Build payload for Article and FINALIZE IMAGES here (single source of truth)
-  const payload = {
-    title: g.title,
-    slug: baseSlug,
-    summary: g.summary || "",
-    author: g.author || "Desk",
-    category: g.category || "General",
-    status: "draft",
-    publishAt: toValidDate(g.publishAt || Date.now()),
-    imageUrl: g.imageUrl || null,
-    imagePublicId: g.imagePublicId || null,
-    imageAlt: g.imageAlt || g.title || "",
-    metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
-    metaDesc: (g.metaDesc || g.summary || "").slice(0, 200),
-    ogImage: g.ogImage || null,
-    geoMode: g.geoMode || "global",
-    geoAreas: Array.isArray(g.geoAreas) ? g.geoAreas : [],
-    tags: Array.isArray(g.tags) ? g.tags : [],
-    body: g.body || "",
-    sourceUrl: item.link,
-  };
+  const { url: sourceImageUrl, from: sourceImageFrom } =
+  await extractSourceImage(item);
+
+const payload = {
+  title: g.title,
+  slug: baseSlug,
+  summary: g.summary || "",
+  author: g.author || "Desk",
+  category: g.category || "General",
+  status: "draft",
+  publishAt: toValidDate(g.publishAt || Date.now()),
+  imageUrl: g.imageUrl || null,
+  imagePublicId: g.imagePublicId || null,
+  imageAlt: g.imageAlt || g.title || "",
+  metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
+  metaDesc: (g.metaDesc || g.summary || "").slice(0, 200),
+  ogImage: g.ogImage || null,
+  geoMode: g.geoMode || "global",
+  geoAreas: Array.isArray(g.geoAreas) ? g.geoAreas : [],
+  tags: Array.isArray(g.tags) ? g.tags : [],
+  body: g.body || "",
+  sourceUrl: item.link,
+
+  // ✅ NEW
+  sourceImageUrl,
+  sourceImageFrom,
+};
 
   const fin = await finalizeArticleImages({
     title: payload.title,

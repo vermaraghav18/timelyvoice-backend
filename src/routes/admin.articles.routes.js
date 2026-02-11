@@ -545,7 +545,7 @@ router.get("/drafts", async (req, res) => {
 
     const rawDrafts = await Article.find(q)
       .select(
-        "_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl autoImageDebug _autoImageDebug autoImagePicked autoImagePickedAt"
+        "_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl sourceImageUrl sourceImageFrom videoUrl autoImageDebug _autoImageDebug autoImagePicked autoImagePickedAt"
       )
       .sort({ createdAt: -1 })
       .limit(200)
@@ -666,7 +666,7 @@ router.get("/", async (req, res) => {
     const [allItems, total] = await Promise.all([
       Article.find(query)
         .select(
-          "_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl videoUrl autoImageDebug _autoImageDebug autoImagePicked autoImagePickedAt"
+          "_id title slug status category summary homepagePlacement body publishedAt updatedAt createdAt imageUrl imagePublicId ogImage thumbImage imageAlt tags source sourceUrl sourceImageUrl sourceImageFrom videoUrl autoImageDebug _autoImageDebug autoImagePicked autoImagePickedAt"
         )
         .sort({ updatedAt: -1, createdAt: -1 })
         .limit(MAX_LIST)
@@ -774,28 +774,34 @@ router.get("/:id", async (req, res) => {
 router.patch("/:id", async (req, res) => {
   try {
     const allowed = [
-      "title",
-      "slug",
-      "category",
-      "categorySlug",
-      "summary",
-      "homepagePlacement",
-      "imageUrl",
-      "imagePublicId",
-      "imageAlt",
-      "ogImage",
-      "thumbImage",
-      "status",
-      "tags",
-      "body",
-      "bodyHtml",
-      "author",
-      "year",
-      "era",
-      "videoUrl",
-      "videoPublicId",
-      "videoSourceUrl",
-    ];
+  "title",
+  "slug",
+  "category",
+  "categorySlug",
+  "summary",
+  "homepagePlacement",
+  "imageUrl",
+  "imagePublicId",
+  "imageAlt",
+  "ogImage",
+  "thumbImage",
+
+  // ✅ NEW: publisher/source image fields
+  "sourceImageUrl",
+  "sourceImageFrom",
+  "sourceUrl",
+
+  "status",
+  "tags",
+  "body",
+  "bodyHtml",
+  "author",
+  "year",
+  "era",
+  "videoUrl",
+  "videoPublicId",
+  "videoSourceUrl",
+];
 
     const patch = {};
     for (const k of allowed) {
@@ -1054,33 +1060,43 @@ if (
     if (!merged.ogImage && merged.imageUrl) merged.ogImage = merged.imageUrl;
 
     const toSaveKeys = [
-      "title",
-      "slug",
-      "category",
-      "categorySlug",
-      "summary",
-      "homepagePlacement",
-      "imageUrl",
-      "imagePublicId",
-      "imageAlt",
-      "status",
-      "tags",
-      "body",
-      "bodyHtml",
-      "author",
-      "publishedAt",
-      "ogImage",
-      "thumbImage",
-      "year",
-      "era",
-      "videoUrl",
-      "videoPublicId",
-      "videoSourceUrl",
-      "autoImageDebug",
-      "_autoImageDebug",
-      "autoImagePicked",
-      "autoImagePickedAt",
-    ];
+  "title",
+  "slug",
+  "category",
+  "categorySlug",
+  "summary",
+  "homepagePlacement",
+
+  // images (internal)
+  "imageUrl",
+  "imagePublicId",
+  "imageAlt",
+  "ogImage",
+  "thumbImage",
+
+  // ✅ publisher/source image fields (THIS WAS MISSING)
+  "sourceImageUrl",
+  "sourceImageFrom",
+  "sourceUrl",
+
+  "status",
+  "tags",
+  "body",
+  "bodyHtml",
+  "author",
+  "publishedAt",
+  "year",
+  "era",
+  "videoUrl",
+  "videoPublicId",
+  "videoSourceUrl",
+
+  "autoImageDebug",
+  "_autoImageDebug",
+  "autoImagePicked",
+  "autoImagePickedAt",
+];
+
 
     const toSave = {};
     for (const k of toSaveKeys) {

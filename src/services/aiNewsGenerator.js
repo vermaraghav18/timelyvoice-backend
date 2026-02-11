@@ -108,8 +108,16 @@ function makeSlugFromTitle(title, index) {
 function normalizeOne(
   raw,
   index,
-  { defaultPublishAt, seedTitle, seedLink, seedSource } = {}
+  {
+    defaultPublishAt,
+    seedTitle,
+    seedLink,
+    seedSource,
+    seedSourceImageUrl,
+    seedSourceImageFrom,
+  } = {}
 ) {
+
   if (!raw || typeof raw !== "object") return null;
 
   let title = String(raw.title || "").trim();
@@ -200,26 +208,33 @@ function normalizeOne(
       ? canonicalizeSourceUrl(sourceUrlRaw)
       : sourceUrlRaw;
 
-  const sourceName = raw.sourceName || seedSource || "";
+ const sourceName = raw.sourceName || seedSource || "";
 
-  return {
-    title,
-    slug,
-    summary,
-    author: raw.author || "Desk",
-    category,
-    body,
+return {
+  title,
+  slug,
+  summary,
+  author: raw.author || "Desk",
+  category,
+  body,
 
-    status: "draft",
-    publishAt: Number.isNaN(publishAt.getTime()) ? new Date() : publishAt,
+  status: "draft",
+  publishAt: Number.isNaN(publishAt.getTime()) ? new Date() : publishAt,
 
-    imageUrl: raw.imageUrl || "",
-    imagePublicId: raw.imagePublicId || "",
+  // 🚫 IMPORTANT: AI output image fields are NOT trusted.
+  // We will force ImageLibrary picking in the cron/route layer.
+  imageUrl: raw.imageUrl || "",
+  imagePublicId: raw.imagePublicId || "",
 
-    // NEW: store original RSS article link + optional source label + canonical URL
-    sourceUrl: sourceUrlRaw,
-    sourceUrlCanonical,
-    sourceName,
+  // ✅ store original RSS article link + optional source label + canonical URL
+  sourceUrl: sourceUrlRaw,
+  sourceUrlCanonical,
+  sourceName,
+
+  // ✅ NEW: publisher/original image (for Admin side-by-side compare)
+  sourceImageUrl: seedSourceImageUrl || "",
+  sourceImageFrom: seedSourceImageFrom || "",
+
 
     seo: {
       imageAlt,
@@ -306,8 +321,11 @@ async function generateNewsBatch({
   let seedNote = "";
   let seedDates = [];
   let seedTitles = [];
-  let seedLinks = [];
-  let seedSources = [];
+ let seedLinks = [];
+let seedSources = [];
+let seedSourceImageUrls = [];
+let seedSourceImageFroms = [];
+
 
   if (Array.isArray(seeds) && seeds.length) {
     const limitedSeeds = seeds.slice(0, n);
@@ -319,10 +337,15 @@ async function generateNewsBatch({
     seedTitles = limitedSeeds.map((s) => s.title || "");
 
     // NEW: carry through RSS link + source label
-    seedLinks = limitedSeeds.map((s) => s.link || "");
-    seedSources = limitedSeeds.map(
-      (s) => s.sourceName || s.feedTitle || s.feedUrl || ""
-    );
+   seedLinks = limitedSeeds.map((s) => s.link || "");
+seedSources = limitedSeeds.map(
+  (s) => s.sourceName || s.feedTitle || s.feedUrl || ""
+);
+
+// ✅ NEW: carry original/publisher image through normalization
+seedSourceImageUrls = limitedSeeds.map((s) => s.sourceImageUrl || "");
+seedSourceImageFroms = limitedSeeds.map((s) => s.sourceImageFrom || "");
+
 
     seedBlock = limitedSeeds
       .map((s, idx) => {
@@ -454,12 +477,15 @@ Each BODY must be between ${minWords} and ${maxWords} words.
   // Normalize with title-protection + RSS origin + canonical URL
   const normalized = rawArticles
     .map((raw, idx) =>
-      normalizeOne(raw, idx, {
-        defaultPublishAt: seedDates[idx],
-        seedTitle: seedTitles[idx],
-        seedLink: seedLinks[idx],
-        seedSource: seedSources[idx],
-      })
+     normalizeOne(raw, idx, {
+  defaultPublishAt: seedDates[idx],
+  seedTitle: seedTitles[idx],
+  seedLink: seedLinks[idx],
+  seedSource: seedSources[idx],
+  seedSourceImageUrl: seedSourceImageUrls[idx],
+  seedSourceImageFrom: seedSourceImageFroms[idx],
+})
+
     )
     .filter(Boolean);
 

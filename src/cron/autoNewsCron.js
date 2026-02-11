@@ -339,41 +339,54 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       const sourceUrl = g.sourceUrl || "";
       const sourceUrlCanonical = canonicalizeSourceUrl(sourceUrl);
 
-      const payload = {
-        title: g.title,
-        slug: baseSlug,
-        summary: g.summary || "",
-        author: g.author || "Desk",
-        category: g.category || "General",
-        status: "draft", // override later
-        publishAt: g.publishAt || new Date(),
-        imageUrl: g.imageUrl || null,
-        imagePublicId: g.imagePublicId || null,
-        imageAlt: g.imageAlt || g.title || "",
-        metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
-        metaDesc: (g.metaDesc || g.summary || "").slice(0, 200),
-        ogImage: g.ogImage || null,
-        geoMode: g.geoMode || "global",
-        geoAreas: Array.isArray(g.geoAreas) ? g.geoAreas : [],
-        tags: Array.isArray(g.tags) ? g.tags : [],
-        body: g.body || "",
-        source: "ai-batch",
-        sourceUrl,
-        sourceUrlCanonical, // 👈 NEW: normalized URL for hard dedupe
-      };
+     const payload = {
+  title: g.title,
+  slug: baseSlug,
+  summary: g.summary || "",
+  author: g.author || "Desk",
+  category: g.category || "General",
+  status: "draft", // override later
+  publishAt: g.publishAt || new Date(),
+
+  // ✅ CRITICAL: Never trust AI-provided image fields.
+  // Force the system to pick from /admin/image-library (your intended source).
+  imageUrl: null,
+  imagePublicId: null,
+
+  imageAlt: g.imageAlt || g.title || "",
+  metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
+  metaDesc: (g.metaDesc || g.summary || "").slice(0, 200),
+  ogImage: g.ogImage || null,
+  geoMode: g.geoMode || "global",
+  geoAreas: Array.isArray(g.geoAreas) ? g.geoAreas : [],
+  tags: Array.isArray(g.tags) ? g.tags : [],
+  body: g.body || "",
+  source: "ai-batch",
+  sourceUrl,
+  sourceUrlCanonical,
+
+  // ✅ NEW: persist publisher/original image for Admin comparison
+  sourceImageUrl: g.sourceImageUrl || "",
+  sourceImageFrom: g.sourceImageFrom || "",
+};
+
 
       // --- 3) Finalize images (unchanged) ---
       // eslint-disable-next-line no-await-in-loop
       const fin = await finalizeArticleImages({
-        title: payload.title,
-        summary: payload.summary,
-        category: payload.category,
-        tags: payload.tags,
-        slug: payload.slug,
-        imageUrl: payload.imageUrl,
-        imagePublicId: payload.imagePublicId,
-        imageAlt: payload.imageAlt,
-      });
+  title: payload.title,
+  summary: payload.summary,
+  category: payload.category,
+  tags: payload.tags,
+  slug: payload.slug,
+
+  // ✅ force picker path
+  imageUrl: null,
+  imagePublicId: null,
+
+  imageAlt: payload.imageAlt,
+});
+
 
       if (fin) {
         payload.imageUrl = fin.imageUrl || payload.imageUrl;

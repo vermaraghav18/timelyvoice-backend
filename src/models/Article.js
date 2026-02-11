@@ -53,6 +53,9 @@ const ArticleSchema = new mongoose.Schema({
   // Images
   imageUrl:      { type: String, default: '' }, // Cloudinary (or absolute) URL
   imagePublicId: { type: String, default: '' },
+  sourceImageUrl: { type: String, default: "" },
+sourceImageFrom: { type: String, default: "" },
+
   imageAlt:      { type: String, default: '' },
   ogImage:       { type: String, default: '' }, // social (1200x630)
   thumbImage:    { type: String, default: '' }, // list/grid thumbnails

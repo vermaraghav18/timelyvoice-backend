@@ -17,6 +17,10 @@
 const Parser = require("rss-parser");
 const rssParser = new Parser({ timeout: 8000 });
 
+// ✅ NEW: extract publisher/RSS image (media/enclosure/og:image)
+const { extractSourceImage } = require("./sourceImageExtractor");
+
+
 // -----------------------------------------------------------------------------
 // FEEDS
 // -----------------------------------------------------------------------------
@@ -181,32 +185,46 @@ async function fetchFeed(url) {
     const feed = await rssParser.parseURL(url);
     const feedTitle = clean(feed.title || "");
 
-    return (feed.items || []).map((item) => {
-      const title = clean(item.title || "");
+    // ✅ We need async extraction (RSS media/enclosure + OG fallback), so Promise.all
+    const mapped = await Promise.all(
+      (feed.items || []).map(async (item) => {
+        const title = clean(item.title || "");
 
-      const rawSummary =
-        item.contentSnippet || item.summary || item.description || "";
-      const summaryClean = clean(rawSummary);
-      const summary = summaryClean || title; // ✅ fallback to title if empty
+        const rawSummary =
+          item.contentSnippet || item.summary || item.description || "";
+        const summaryClean = clean(rawSummary);
+        const summary = summaryClean || title;
 
-      const publishedAt = parseDate(item);
+        const publishedAt = parseDate(item);
 
-      return {
-        title,
-        summary,
-        link: item.link || "",
-        category: guessCategory(url, title),
-        feedUrl: url,
-        feedTitle, // helpful for aiNewsGenerator (sourceName / feedTitle)
-        sourceName: feedTitle || url, // explicit source name
-        publishedAt,
-      };
-    });
+        // ✅ Extract original/publisher image
+        const { url: sourceImageUrl, from: sourceImageFrom } =
+          await extractSourceImage(item);
+
+        return {
+          title,
+          summary,
+          link: item.link || "",
+          category: guessCategory(url, title),
+          feedUrl: url,
+          feedTitle,
+          sourceName: feedTitle || url,
+          publishedAt,
+
+          // ✅ NEW fields used by Admin UI side-by-side compare
+          sourceImageUrl: sourceImageUrl || "",
+          sourceImageFrom: sourceImageFrom || "",
+        };
+      })
+    );
+
+    return mapped;
   } catch (err) {
     console.error("[liveNewsIngestor] FEED ERROR:", url, err.message);
     return [];
   }
 }
+
 
 // -----------------------------------------------------------------------------
 // FILTER STORIES — ONLY TODAY'S DATE
