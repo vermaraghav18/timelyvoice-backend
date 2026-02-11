@@ -19,6 +19,11 @@ const DEFAULT_PUBLIC_ID =
   process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
   "news-images/defaults/fallback-hero";
 
+const IMAGE_LIBRARY_CANDIDATE_LIMIT = parseInt(
+  process.env.IMAGE_LIBRARY_CANDIDATE_LIMIT || '300',
+  10
+);
+
 // Placeholder hosts for junk URLs pasted in drafts
 const PLACEHOLDER_HOSTS = ["example.com", "cdn.example", "your-cdn.example"];
 
@@ -181,7 +186,7 @@ async function pickFromImageLibrary({ tags = [], category = "" } = {}) {
       tags: { $in: cleanTags },
     })
       .sort({ priority: -1, createdAt: -1 })
-      .limit(50)
+      .limit(IMAGE_LIBRARY_CANDIDATE_LIMIT)
       .lean();
 
     if (candidates.length) {

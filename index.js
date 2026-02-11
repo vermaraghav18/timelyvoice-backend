@@ -429,7 +429,7 @@ const ogImage =
 })
 
       .sort({ createdAt: -1, _id: -1 })
-      .limit(80)
+      .limit(parseInt(process.env.IMAGE_LIBRARY_CANDIDATE_LIMIT || '300', 10))
       .select("title slug summary publishedAt publishAt createdAt status")
       .lean();
 
@@ -532,7 +532,7 @@ const ogImage =
     ],
   })
     .sort({ publishedAt: -1, createdAt: -1, _id: -1 })
-    .limit(80)
+    .limit(parseInt(process.env.IMAGE_LIBRARY_CANDIDATE_LIMIT || '300', 10))
     .select("title slug summary publishedAt publishAt createdAt")
     .lean();
 
@@ -1506,7 +1506,7 @@ async function pickBestImageForArticle({ title = '', tags = [], category = '' })
       tags: { $in: tagArr },
     })
       .sort({ priority: -1, createdAt: -1 })
-      .limit(80)
+      .limit(parseInt(process.env.IMAGE_LIBRARY_CANDIDATE_LIMIT || '300', 10))
       .lean();
 
     if (!candidates.length) {
