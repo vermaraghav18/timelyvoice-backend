@@ -14,7 +14,10 @@ const AiGenerationLog = require("../models/AiGenerationLog");
 const {
   getCronStatusSnapshot,
   runOnceAutoNews,
+  // ✅ If you add this export in autoNewsCron.js, it will be used automatically:
+  // clearInFlight,
 } = require("../cron/autoNewsCron");
+
 const { fetchLiveSeeds } = require("../services/liveNewsIngestor");
 
 // Use env-configured model for logging instead of hardcoding
@@ -75,14 +78,14 @@ router.get("/cron-status", (_req, res) => {
 // MANUAL CRON RUN — trigger one AI automation cycle
 // POST /api/admin/ai/run-cron-once
 // Protected by x-cron-secret
+//
+// Supports: ?force=1  (force run even if lock is stuck)
 // ─────────────────────────────────────────────────────────────
-router.post("/run-cron-once", requireCronSecret, async (_req, res) => {
+router.post("/run-cron-once", requireCronSecret, async (req, res) => {
   try {
-    const result = await runOnceAutoNews({ reason: "manual-api" });
-    return res.json({
-      ok: true,
-      result,
-    });
+    const force = String(req.query.force || "") === "1";
+    const result = await runOnceAutoNews({ reason: "manual-api", force });
+    return res.json({ ok: true, result });
   } catch (err) {
     console.error("[admin.aiNews] /run-cron-once error:", err?.message || err);
     return res.status(500).json({
@@ -92,23 +95,18 @@ router.post("/run-cron-once", requireCronSecret, async (_req, res) => {
   }
 });
 
-// ✅ Force-clear stuck cron lock (in_flight)
-router.post("/clear-in-flight", async (req, res) => {
+// ─────────────────────────────────────────────────────────────
+// ✅ Force-clear stuck cron lock
+// POST /api/admin/ai/clear-in-flight
+// Protected by x-cron-secret (same as run-cron-once)
+// ─────────────────────────────────────────────────────────────
+router.post("/clear-in-flight", requireCronSecret, async (_req, res) => {
   try {
-    // If you store cron state in DB, clear it here.
-    // If you store it in-memory, clear that flag here.
-    // We handle both patterns below.
-
-    // Pattern A: module-level flag
-    if (global.__AI_CRON_IN_FLIGHT) {
-      global.__AI_CRON_IN_FLIGHT = false;
-    }
-
-    // Pattern B: cron state stored somewhere (if exists)
-    // Example: await CronState.updateOne({ key: "ai_news" }, { $set: { inFlight: false } }, { upsert: true });
-
-    return res.json({ ok: true, cleared: true });
+    // ✅ this clears the REAL lock in autoNewsCron.js
+    const result = require("../cron/autoNewsCron").clearInFlight();
+    return res.json({ ok: true, result });
   } catch (e) {
+    console.error("[admin.aiNews] /clear-in-flight error:", e?.message || e);
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -117,7 +115,7 @@ router.post("/clear-in-flight", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // RSS SEEDS PREVIEW — debug what cron sees
 // GET /api/admin/ai/rss-preview?limit=10
-// Protected by x-cron-secret (recommended)
+// Protected by x-cron-secret
 // ─────────────────────────────────────────────────────────────
 router.get("/rss-preview", requireCronSecret, async (req, res) => {
   try {
@@ -143,7 +141,6 @@ router.get("/rss-preview", requireCronSecret, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // LOG LIST — for admin dashboard
 // GET /api/admin/ai/logs?limit=50
-// (not protected; contains no secrets, OK to keep open if you want)
 // ─────────────────────────────────────────────────────────────
 router.get("/logs", async (req, res) => {
   try {
@@ -171,7 +168,7 @@ router.get("/logs", async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // PREVIEW ONLY — NO DB WRITE
 // POST /api/admin/ai/preview-batch
-// Protected by x-cron-secret (prevents AI cost abuse)
+// Protected by x-cron-secret
 // ─────────────────────────────────────────────────────────────
 router.post("/preview-batch", requireCronSecret, async (req, res) => {
   try {
@@ -200,15 +197,7 @@ router.post("/preview-batch", requireCronSecret, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // SAVE TO DB — CREATES REAL Article DOCUMENTS + AUTO IMAGES
 // POST /api/admin/ai/generate-batch
-//
-// Protected by x-cron-secret (prevents AI cost abuse)
-//
-// Body:
-// {
-//   "count": 5,                          // optional, default 10 (max 20)
-//   "categories": ["World","Business"],  // optional
-//   "status": "draft" | "published"      // optional, default "draft"
-// }
+// Protected by x-cron-secret
 // ─────────────────────────────────────────────────────────────
 router.post("/generate-batch", requireCronSecret, async (req, res) => {
   const startedAt = Date.now();
@@ -227,7 +216,6 @@ router.post("/generate-batch", requireCronSecret, async (req, res) => {
     normalized = result.normalized || [];
 
     if (!normalized.length) {
-      // Log: nothing generated
       await AiGenerationLog.create({
         runAt: new Date(startedAt),
         model: LOG_MODEL,
@@ -250,7 +238,6 @@ router.post("/generate-batch", requireCronSecret, async (req, res) => {
 
     // Actually create Article docs one by one
     for (const g of normalized) {
-      // Base slug from AI output, or from title
       let baseSlug =
         g.slug ||
         slugify(g.title || "article", { lower: true, strict: true }) ||
@@ -262,11 +249,12 @@ router.post("/generate-batch", requireCronSecret, async (req, res) => {
         summary: g.summary || "",
         author: g.author || "Desk",
         category: g.category || "General",
-        status: "draft", // override later
+        status: "draft",
         publishAt: g.publishAt || new Date(),
-       // ✅ CRITICAL: Never trust AI-provided image fields here either
-imageUrl: null,
-imagePublicId: null,
+
+        // ✅ Force ImageLibrary picker for this route too
+        imageUrl: null,
+        imagePublicId: null,
 
         imageAlt: g.imageAlt || g.title || "",
         metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
@@ -279,30 +267,27 @@ imagePublicId: null,
         source: "ai-batch",
         sourceUrl: g.sourceUrl || "",
 
-        // ✅ NEW: publisher/original image for Admin side-by-side compare
+        // ✅ Original publisher image for side-by-side compare
         sourceImageUrl: g.sourceImageUrl || "",
         sourceImageFrom: g.sourceImageFrom || "",
-
       };
 
-      // 🔁 FINALIZE IMAGES (Drive → Cloudinary + OG + thumb)
       // eslint-disable-next-line no-await-in-loop
-     const fin = await finalizeArticleImages({
-  title: payload.title,
-  summary: payload.summary,
-  category: payload.category,
-  tags: payload.tags,
-  slug: payload.slug,
+      const fin = await finalizeArticleImages({
+        title: payload.title,
+        summary: payload.summary,
+        category: payload.category,
+        tags: payload.tags,
+        slug: payload.slug,
 
-  // ✅ force picker path
-  imageUrl: null,
-  imagePublicId: null,
+        // ✅ force picker path
+        imageUrl: null,
+        imagePublicId: null,
 
-  imageAlt: payload.imageAlt,
-  ogImage: payload.ogImage,
-  thumbImage: null,
-});
-
+        imageAlt: payload.imageAlt,
+        ogImage: payload.ogImage,
+        thumbImage: null,
+      });
 
       if (fin) {
         payload.imagePublicId = fin.imagePublicId;
@@ -321,7 +306,6 @@ imagePublicId: null,
       }
       payload.slug = finalSlug;
 
-      // Final status + timestamps
       payload.status = desiredStatus === "published" ? "published" : "draft";
       if (payload.status === "published") {
         payload.publishedAt = new Date();
@@ -339,7 +323,6 @@ imagePublicId: null,
       });
     }
 
-    // Log success
     await AiGenerationLog.create({
       runAt: new Date(startedAt),
       model: LOG_MODEL,
@@ -363,7 +346,6 @@ imagePublicId: null,
   } catch (err) {
     console.error("[admin.aiNews] /generate-batch error:", err?.message || err);
 
-    // Log error
     try {
       await AiGenerationLog.create({
         runAt: new Date(startedAt),

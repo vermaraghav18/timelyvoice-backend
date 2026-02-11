@@ -21,49 +21,30 @@ const {
   canonicalizeSourceUrl,
 } = require("../services/aiArticleGuard");
 
-
 const AUTOMATION_MODEL = "openai/gpt-4o-mini";
 
 const DEFAULT_INTERVAL_SEC = parseInt(
   process.env.AI_NEWS_CRON_INTERVAL_SECONDS || "300",
   10
 );
-const MAX_PER_RUN = parseInt(
-  process.env.AI_NEWS_CRON_MAX_PER_RUN || "1",
-  10
-);
-const MAX_PER_HOUR = parseInt(
-  process.env.AI_NEWS_CRON_MAX_PER_HOUR || "12",
-  10
-);
-const MAX_PER_DAY = parseInt(
-  process.env.AI_NEWS_CRON_MAX_PER_DAY || "250",
-  10
-);
+const MAX_PER_RUN = parseInt(process.env.AI_NEWS_CRON_MAX_PER_RUN || "1", 10);
+const MAX_PER_HOUR = parseInt(process.env.AI_NEWS_CRON_MAX_PER_HOUR || "12", 10);
+const MAX_PER_DAY = parseInt(process.env.AI_NEWS_CRON_MAX_PER_DAY || "250", 10);
 
-const DEFAULT_STATUS = String(
-  process.env.AI_NEWS_CRON_STATUS || "draft"
-).toLowerCase();
+const DEFAULT_STATUS = String(process.env.AI_NEWS_CRON_STATUS || "draft").toLowerCase();
 
-const FORCED_CATEGORIES = String(
-  process.env.AI_NEWS_CRON_CATEGORIES || ""
-)
+const FORCED_CATEGORIES = String(process.env.AI_NEWS_CRON_CATEGORIES || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const WINDOW_START_HOUR = parseInt(
-  process.env.AI_NEWS_CRON_WINDOW_START_HOUR || "0",
-  10
-);
-const WINDOW_END_HOUR = parseInt(
-  process.env.AI_NEWS_CRON_WINDOW_END_HOUR || "24",
-  10
-);
+const WINDOW_START_HOUR = parseInt(process.env.AI_NEWS_CRON_WINDOW_START_HOUR || "0", 10);
+const WINDOW_END_HOUR = parseInt(process.env.AI_NEWS_CRON_WINDOW_END_HOUR || "24", 10);
 
 // in-memory guard + status snapshot
 let timer = null;
 let inFlight = false;
+let inFlightSince = null;
 
 let lastRunAt = null;
 let lastStatus = null;
@@ -104,12 +85,7 @@ async function computeAllowedCount() {
           runAt: { $gte: oneHourAgo },
         },
       },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: "$countSaved" },
-        },
-      },
+      { $group: { _id: null, total: { $sum: "$countSaved" } } },
     ]),
     AiGenerationLog.aggregate([
       {
@@ -118,12 +94,7 @@ async function computeAllowedCount() {
           runAt: { $gte: dayStart },
         },
       },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: "$countSaved" },
-        },
-      },
+      { $group: { _id: null, total: { $sum: "$countSaved" } } },
     ]),
   ]);
 
@@ -136,10 +107,20 @@ async function computeAllowedCount() {
   const base = Math.min(MAX_PER_RUN, leftHour, leftDay);
 
   const allowed = clampCount(base);
+  return { allowed, usedHour, usedDay };
+}
+
+/**
+ * ✅ NEW: allow admin route to reset a stuck lock.
+ * This fixes your permanent: reason="in_flight"
+ */
+function clearInFlight() {
+  inFlight = false;
+  inFlightSince = null;
   return {
-    allowed,
-    usedHour,
-    usedDay,
+    ok: true,
+    cleared: true,
+    inFlight: false,
   };
 }
 
@@ -147,15 +128,18 @@ async function computeAllowedCount() {
  * MAIN EXECUTION — single cron run
  * Now always returns a structured result object so admin routes
  * can respond quickly instead of dealing with undefined.
+ *
+ * ✅ NEW: supports { force: true } to override stuck inFlight
  */
-async function runOnceAutoNews({ reason = "interval" } = {}) {
-  if (inFlight) {
+async function runOnceAutoNews({ reason = "interval", force = false } = {}) {
+  if (inFlight && !force) {
     console.log("[autoNewsCron] skip — previous run still in flight");
-    return {
-      ok: false,
-      skipped: true,
-      reason: "in_flight",
-    };
+    return { ok: false, skipped: true, reason: "in_flight", inFlightSince };
+  }
+
+  if (inFlight && force) {
+    console.warn("[autoNewsCron] force run requested; clearing inFlight lock");
+    clearInFlight();
   }
 
   const now = new Date();
@@ -178,6 +162,7 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
 
   const startedAt = Date.now();
   inFlight = true;
+  inFlightSince = new Date();
 
   const key = currentDateKey(now);
   if (todayDateKey !== key) {
@@ -185,7 +170,6 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
     todayCountSaved = 0;
   }
 
-  // we declare these upfront so we can safely refer to them in the return object
   let seeds = [];
   let normalized = [];
   let createdSummaries = [];
@@ -214,13 +198,10 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       };
     }
 
-    const desiredStatus =
-      DEFAULT_STATUS === "published" ? "published" : "draft";
+    const desiredStatus = DEFAULT_STATUS === "published" ? "published" : "draft";
 
     const categories =
-      FORCED_CATEGORIES && FORCED_CATEGORIES.length
-        ? FORCED_CATEGORIES
-        : undefined;
+      FORCED_CATEGORIES && FORCED_CATEGORIES.length ? FORCED_CATEGORIES : undefined;
 
     console.log(
       "[autoNewsCron] running (%s) allowed=%s status=%s categories=%s",
@@ -232,14 +213,11 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
 
     const pickedCategory =
       FORCED_CATEGORIES.length > 0
-        ? FORCED_CATEGORIES[
-            Math.floor(Math.random() * FORCED_CATEGORIES.length)
-          ]
+        ? FORCED_CATEGORIES[Math.floor(Math.random() * FORCED_CATEGORIES.length)]
         : undefined;
 
     // 1) Pull fresh live seeds from RSS
-    //    This uses your FEEDS array and drops anything older than 24h or wrong year
-    const seedLimit = Math.max(allowed * 3, 10); // pool a few extra, it’s cheap
+    const seedLimit = Math.max(allowed * 3, 10);
     try {
       seeds = await fetchLiveSeeds(seedLimit);
     } catch (e) {
@@ -258,7 +236,7 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       categories: pickedCategory ? [pickedCategory] : categories,
       trendingBias: true,
       mode: "standard",
-      seeds, // <-- title uniqueness + rewrite handled inside aiNewsGenerator
+      seeds,
     });
 
     normalized = result?.normalized || [];
@@ -295,10 +273,8 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       };
     }
 
-    // Create Article docs one by one
     createdSummaries = [];
     for (const g of normalized) {
-      // --- 1) Run central AI guard on the would-be article topic ---
       const seedForGuard = {
         title: g.title,
         summary: g.summary,
@@ -310,83 +286,69 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       const guard = await shouldGenerateFromSeed(seedForGuard);
 
       if (!guard.ok) {
-        // reason: 'dupe_source' | 'dupe_similar' | 'dupe_topic'
-        if (guard.reason === "dupe_topic") {
-          skippedTopicDuplicates += 1;
-        } else {
-          skippedDuplicates += 1;
-        }
+        if (guard.reason === "dupe_topic") skippedTopicDuplicates += 1;
+        else skippedDuplicates += 1;
 
         console.log(
           "[autoNewsCron] skipping by guard reason=%s title=%s",
           guard.reason,
           g.title
         );
-
-        // Skip to next generated article
         continue;
       }
 
-      // --- 2) Build base slug and payload as before ---
       let baseSlug =
         g.slug ||
-        slugify(g.title || "article", {
-          lower: true,
-          strict: true,
-        }) ||
+        slugify(g.title || "article", { lower: true, strict: true }) ||
         `article-${Date.now()}`;
 
       const sourceUrl = g.sourceUrl || "";
       const sourceUrlCanonical = canonicalizeSourceUrl(sourceUrl);
 
-     const payload = {
-  title: g.title,
-  slug: baseSlug,
-  summary: g.summary || "",
-  author: g.author || "Desk",
-  category: g.category || "General",
-  status: "draft", // override later
-  publishAt: g.publishAt || new Date(),
+      const payload = {
+        title: g.title,
+        slug: baseSlug,
+        summary: g.summary || "",
+        author: g.author || "Desk",
+        category: g.category || "General",
+        status: "draft",
+        publishAt: g.publishAt || new Date(),
 
-  // ✅ CRITICAL: Never trust AI-provided image fields.
-  // Force the system to pick from /admin/image-library (your intended source).
-  imageUrl: null,
-  imagePublicId: null,
+        // ✅ force ImageLibrary picking
+        imageUrl: null,
+        imagePublicId: null,
 
-  imageAlt: g.imageAlt || g.title || "",
-  metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
-  metaDesc: (g.metaDesc || g.summary || "").slice(0, 200),
-  ogImage: g.ogImage || null,
-  geoMode: g.geoMode || "global",
-  geoAreas: Array.isArray(g.geoAreas) ? g.geoAreas : [],
-  tags: Array.isArray(g.tags) ? g.tags : [],
-  body: g.body || "",
-  source: "ai-batch",
-  sourceUrl,
-  sourceUrlCanonical,
+        imageAlt: g.imageAlt || g.title || "",
+        metaTitle: (g.metaTitle || g.title || "").slice(0, 80),
+        metaDesc: (g.metaDesc || g.summary || "").slice(0, 200),
+        ogImage: g.ogImage || null,
+        geoMode: g.geoMode || "global",
+        geoAreas: Array.isArray(g.geoAreas) ? g.geoAreas : [],
+        tags: Array.isArray(g.tags) ? g.tags : [],
+        body: g.body || "",
+        source: "ai-batch",
+        sourceUrl,
+        sourceUrlCanonical,
 
-  // ✅ NEW: persist publisher/original image for Admin comparison
-  sourceImageUrl: g.sourceImageUrl || "",
-  sourceImageFrom: g.sourceImageFrom || "",
-};
+        // ✅ publisher/original image for Admin compare
+        sourceImageUrl: g.sourceImageUrl || "",
+        sourceImageFrom: g.sourceImageFrom || "",
+      };
 
-
-      // --- 3) Finalize images (unchanged) ---
       // eslint-disable-next-line no-await-in-loop
       const fin = await finalizeArticleImages({
-  title: payload.title,
-  summary: payload.summary,
-  category: payload.category,
-  tags: payload.tags,
-  slug: payload.slug,
+        title: payload.title,
+        summary: payload.summary,
+        category: payload.category,
+        tags: payload.tags,
+        slug: payload.slug,
 
-  // ✅ force picker path
-  imageUrl: null,
-  imagePublicId: null,
+        // ✅ force picker path
+        imageUrl: null,
+        imagePublicId: null,
 
-  imageAlt: payload.imageAlt,
-});
-
+        imageAlt: payload.imageAlt,
+      });
 
       if (fin) {
         payload.imageUrl = fin.imageUrl || payload.imageUrl;
@@ -394,7 +356,6 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
         payload.imageAlt = payload.imageAlt || fin.imageAlt;
       }
 
-      // --- 4) Ensure slug is unique (unchanged) ---
       let finalSlug = payload.slug;
       let suffix = 2;
       // eslint-disable-next-line no-await-in-loop
@@ -403,9 +364,7 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       }
       payload.slug = finalSlug;
 
-      // --- 5) Final status + timestamps (unchanged) ---
-      payload.status =
-        desiredStatus === "published" ? "published" : "draft";
+      payload.status = desiredStatus === "published" ? "published" : "draft";
       if (payload.status === "published") {
         payload.publishedAt = new Date();
       }
@@ -414,7 +373,6 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
       payload.createdAt = nowStamp;
       payload.updatedAt = nowStamp;
 
-      // --- 6) Save article + update topic fingerprint ---
       // eslint-disable-next-line no-await-in-loop
       const doc = await Article.create(payload);
 
@@ -490,10 +448,7 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
         triggeredBy: "cron-auto-newsroom",
       });
     } catch (logErr) {
-      console.error(
-        "[autoNewsCron] log-create failed:",
-        logErr?.message || logErr
-      );
+      console.error("[autoNewsCron] log-create failed:", logErr?.message || logErr);
     }
 
     lastRunAt = new Date();
@@ -511,6 +466,7 @@ async function runOnceAutoNews({ reason = "interval" } = {}) {
     };
   } finally {
     inFlight = false;
+    inFlightSince = null;
   }
 }
 
@@ -546,6 +502,10 @@ function getCronStatusSnapshot() {
     todayCountSaved,
     lastRunAt,
     lastStatus,
+
+    // ✅ helpful for debugging lock
+    inFlight,
+    inFlightSince,
   };
 }
 
@@ -553,4 +513,5 @@ module.exports = {
   startAutoNewsCron,
   runOnceAutoNews,
   getCronStatusSnapshot,
+  clearInFlight,
 };
