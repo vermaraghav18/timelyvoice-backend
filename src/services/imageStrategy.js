@@ -284,7 +284,8 @@ function scoreCandidate({
     penalty;
 
   // ✅ strongMatchCount ignores generic keywords (like "canada")
-  const strongMatchCount = strongTagMatches.length + strongKeywordMatches.length;
+const strongMatchCount = new Set([...strongTagMatches, ...strongKeywordMatches]).size;
+
 
   return {
     score,
