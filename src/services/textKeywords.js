@@ -8,15 +8,20 @@ const STOP = new Set([
   "today","latest","news","report","reports","says","say"
 ]);
 
-// Normalize tags into your ImageLibrary style (no spaces, lowercase, alnum)
-function normTag(s) {
+// Normalize tokens/tags into your ImageLibrary style (no spaces, lowercase, alnum/_/-)
+function normalizeToken(s) {
   const t = String(s || "").trim().toLowerCase();
   if (!t) return "";
-  // turn "Sri Lanka" -> "srilanka", "#T20 World Cup" -> "t20worldcup"
   return t
     .replace(/^#+/g, "")
-    .replace(/[^a-z0-9]+/g, "")
+    .replace(/[^a-z0-9_-]+/g, "")
     .trim();
+}
+
+// Backward compatible alias (your older code used normTag)
+function normTag(s) {
+  // turn "Sri Lanka" -> "srilanka", "#T20 World Cup" -> "t20worldcup"
+  return normalizeToken(String(s || "").replace(/[^a-z0-9]+/gi, ""));
 }
 
 // Detect some sports + formats
@@ -65,8 +70,8 @@ function detectCountries(text) {
   return Array.from(out);
 }
 
-// Extract top keywords from title/summary (fallback)
-function extractKeywords(text, limit = 12) {
+// Internal helper: extract keywords from one string
+function extractKeywordsFromText(text, limit = 12) {
   const s = String(text || "")
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, " ")
@@ -82,9 +87,7 @@ function extractKeywords(text, limit = 12) {
   for (const w of words) {
     if (w.length < 3) continue;
     if (STOP.has(w)) continue;
-    // avoid pure numbers
     if (/^\d+$/.test(w)) continue;
-
     freq.set(w, (freq.get(w) || 0) + 1);
   }
 
@@ -92,6 +95,16 @@ function extractKeywords(text, limit = 12) {
     .sort((a, b) => b[1] - a[1])
     .map((x) => x[0])
     .slice(0, limit);
+}
+
+/**
+ * ✅ IMPORTANT: imageStrategy.js calls:
+ *   extractKeywords(title, summary, max)
+ * So we provide this exact signature.
+ */
+function extractKeywords(title = "", summary = "", max = 12) {
+  const text = `${title || ""} ${summary || ""}`.trim();
+  return extractKeywordsFromText(text, max);
 }
 
 // MAIN: build final tag list (min 6, max 8)
@@ -115,7 +128,7 @@ function buildArticleTags({ rawTags, title, summary, body, seedTitle, min = 6, m
   for (const t of detectCountries(allText)) out.push(normTag(t));
 
   // 4) keyword fallback
-  const kw = extractKeywords(`${title || ""} ${summary || ""}`, 20);
+  const kw = extractKeywords(title || "", summary || "", 20);
   for (const k of kw) out.push(normTag(k));
 
   // de-dupe
@@ -126,20 +139,21 @@ function buildArticleTags({ rawTags, title, summary, body, seedTitle, min = 6, m
 
   // enforce min/max
   const final = filtered.slice(0, max);
-  while (final.length < min && filtered.length > final.length) {
-    final.push(filtered[final.length]);
-  }
 
   // absolute fallback if still too short
-  while (final.length < min) {
-    final.push("news");
-    break;
+  if (final.length < min) {
+    // add a safe filler that won't harm matching too much
+    if (!final.includes("news")) final.push("news");
   }
 
   return final.slice(0, max);
 }
-module.exports = {
-  buildArticleTags,
-  extractKeywords
-};
 
+module.exports = {
+  // used by aiNewsGenerator
+  buildArticleTags,
+
+  // used by imageStrategy
+  extractKeywords,
+  normalizeToken,
+};
