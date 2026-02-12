@@ -39,7 +39,6 @@ const IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES = parseInt(
 );
 
 // ✅ Confidence threshold: below this, do NOT pick by tags/keywords; go category/default.
-// Tune if needed.
 const IMAGE_LIBRARY_MIN_CONFIDENCE = parseInt(
   process.env.IMAGE_LIBRARY_MIN_CONFIDENCE || "110",
   10
@@ -74,25 +73,22 @@ function isDefaultPlaceholder(publicId, imageUrl) {
 }
 
 // ------------------------------
-// Tag normalization (keep same as before)
+// Tag normalization
+// IMPORTANT: tags are IDENTIFIERS, not English words.
+// Do NOT stem/plural-fix (westindies must stay westindies)
 // ------------------------------
-function stem(t) {
-  if (!t) return "";
-  if (t.endsWith("ies")) return t.slice(0, -3) + "y";
-  if (t.endsWith("s") && t.length > 3) return t.slice(0, -1);
-  return t;
-}
-
 function normalizeTag(raw = "") {
   const s = String(raw || "").trim().toLowerCase();
   if (!s) return "";
   const noHash = s.replace(/^#+/g, "");
+  // remove spaces/symbols but keep underscore/dash
   const clean = noHash.replace(/[^a-z0-9_-]/g, "");
   return clean;
 }
 
+// ✅ legacy name used across the file — now just normalizeTag
 function normStemTag(raw = "") {
-  return stem(normalizeTag(raw));
+  return normalizeTag(raw);
 }
 
 function dedupe(arr) {
@@ -123,7 +119,8 @@ function normalizeTagsInput(tags) {
 }
 
 function normalizeCategory(raw = "") {
-  return normStemTag(raw);
+  // ✅ category should also be normalized same way
+  return normalizeTag(raw);
 }
 
 function normalizeArticleInput(a = {}) {
@@ -158,23 +155,22 @@ function inferCategoryBucket(meta) {
   for (const [bucket, words] of Object.entries(CATEGORY_KEYWORDS)) {
     for (const w of words) {
       if (text.includes(w)) {
-        // treat space as its own bucket only for penalties, otherwise it’s fine
-        if (bucket === "space") return "world"; // don’t force category; only used for penalties
+        if (bucket === "space") return "world";
         return bucket;
       }
     }
   }
 
-  return ""; // unknown
+  return "";
 }
 
 // ------------------------------
 // DEFAULT PICKER (ImageLibrary)
 // RULE: Image must have tag "default"
 // Preference order:
-// 1) category-specific default (category = article category)
-// 2) global default (category = "global")
-// 3) any default (tag-only)
+// 1) category-specific default
+// 2) global default
+// 3) any default
 // ------------------------------
 async function pickDefaultFromImageLibrary({ category = "" } = {}) {
   const cleanCategoryRaw = String(category || "").trim();
@@ -249,19 +245,15 @@ function scoreCandidate({
   articleCategoryNorm,
   bucket,
 }) {
-  // matches from article tags
   const matchedTags = imgTagsNorm.filter((t) => cleanTags.includes(t));
   const strongTagMatches = matchedTags.filter((t) => !isGenericTag(t));
   const genericTagMatches = matchedTags.filter((t) => isGenericTag(t));
 
-  // matches from title/summary keywords (only strong, by definition)
   const matchedKeywords = imgTagsNorm.filter((t) => keywordTags.includes(t));
 
-  // same category?
   const sameCategory =
     !!articleCategoryNorm && !!imgCategoryNorm && imgCategoryNorm === articleCategoryNorm;
 
-  // negative penalties based on inferred bucket
   const negativeList = bucket ? NEGATIVE_TAGS_BY_CATEGORY[bucket] || [] : [];
   let penalty = 0;
   let penaltyHits = [];
@@ -271,18 +263,12 @@ function scoreCandidate({
       const badNorm = normalizeToken(bad);
       if (!badNorm) continue;
       if (imgTagsNorm.includes(badNorm)) {
-        penalty += 60; // strong penalty
+        penalty += 60;
         penaltyHits.push(badNorm);
       }
     }
   }
 
-  // Score weights:
-  // - strong tag matches are king
-  // - keyword matches from title are also strong
-  // - generic tags are tiny (never drive a pick)
-  // - category small bonus
-  // - priority tie-break
   const score =
     strongTagMatches.length * 120 +
     matchedKeywords.length * 90 +
@@ -291,7 +277,7 @@ function scoreCandidate({
     (Number(imgPriority) || 0) -
     penalty;
 
-  const strongMatchCount = strongTagMatches.length + matchedKeywords.length; // count both as strong
+  const strongMatchCount = strongTagMatches.length + matchedKeywords.length;
 
   return {
     score,
@@ -315,18 +301,13 @@ async function pickFromImageLibrary({ meta } = {}) {
   const categoryRaw = String(meta?.category || "").trim();
   const categoryNorm = normalizeCategory(categoryRaw);
 
-  // Keywords from title/summary (normalize like tags so we can compare)
   const keywords = extractKeywords(meta?.title || "", meta?.summary || "", 40)
     .map(normStemTag)
     .filter(Boolean);
 
-  // Use both tags and keywords to widen candidate discovery,
-  // but scoring is what decides.
   const discoverTokens = dedupe([...cleanTags, ...keywords]);
-
   const bucket = inferCategoryBucket(meta);
 
-  // 1) TAG/KEYWORD MATCH (best)
   if (discoverTokens.length) {
     const candidates = await ImageLibrary.find({
       tags: { $in: discoverTokens },
@@ -365,9 +346,7 @@ async function pickFromImageLibrary({ meta } = {}) {
         if (!best || row.score > best.score) best = row;
       }
 
-      // ✅ HARD RULE 1: Require minimum strong matches (non-generic tags + title keywords)
       if (best && best.strongMatchCount >= IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES) {
-        // ✅ HARD RULE 2: Confidence threshold
         if (best.score >= IMAGE_LIBRARY_MIN_CONFIDENCE) {
           return {
             publicId: best.publicId,
@@ -391,7 +370,6 @@ async function pickFromImageLibrary({ meta } = {}) {
           };
         }
 
-        // Not confident -> fall back to category/default
         return {
           publicId: null,
           why: {
@@ -412,13 +390,11 @@ async function pickFromImageLibrary({ meta } = {}) {
         };
       }
 
-      // Not enough strong matches -> fall back to category/default
       return {
         publicId: null,
         why: {
           mode: "db-advanced-insufficient-strong",
-          reason:
-            "Only generic/no strong matches (e.g., india/world). Using category/default.",
+          reason: "Only generic/no strong matches. Using category/default.",
           requiredStrong: IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES,
           usedTags: cleanTags,
           usedKeywords: keywords,
@@ -459,24 +435,16 @@ async function pickFromImageLibrary({ meta } = {}) {
 
 /**
  * Main orchestrator.
- * Mutates `article` in-place:
- *  - keep existing real imagePublicId / imageUrl
- *  - if default placeholder → treat as missing so picker can run
- *  - try ImageLibrary (advanced match, then category)
- *  - if no match -> ImageLibrary "default" (tag: default)
- *  - if still nothing -> DEFAULT_PUBLIC_ID (env), used only if library empty
  */
 async function decideAndAttach(article = {}, _opts = {}) {
   assert(article, "article is required");
   const meta = normalizeArticleInput(article);
 
-  // ✅ If current image is just the default placeholder, clear it so picker is allowed
   if (isDefaultPlaceholder(article.imagePublicId, article.imageUrl)) {
     article.imagePublicId = null;
     article.imageUrl = null;
   }
 
-  // 1) Respect existing REAL Cloudinary public id (not default)
   if (article.imagePublicId && article.imagePublicId !== DEFAULT_PUBLIC_ID) {
     if (!article.autoImageDebug) {
       article.autoImageDebug = {
@@ -488,7 +456,6 @@ async function decideAndAttach(article = {}, _opts = {}) {
     return "kept-existing-public-id";
   }
 
-  // 2) Respect existing REAL imageUrl (manual URL)
   if (article.imageUrl && !isPlaceholderUrl(article.imageUrl)) {
     if (!article.autoImageDebug) {
       article.autoImageDebug = {
@@ -500,7 +467,6 @@ async function decideAndAttach(article = {}, _opts = {}) {
     return "kept-existing-url";
   }
 
-  // 3) Try ImageLibrary advanced match (tags+keywords+penalty), then category fallback
   let picked = null;
 
   try {
@@ -510,7 +476,6 @@ async function decideAndAttach(article = {}, _opts = {}) {
     picked = null;
   }
 
-  // If pickFromImageLibrary returned debug-only (no publicId), preserve debug
   if (picked && !picked.publicId && picked.why) {
     article.autoImageDebug = picked.why;
   }
@@ -538,7 +503,6 @@ async function decideAndAttach(article = {}, _opts = {}) {
     return "attached-db-image";
   }
 
-  // 4) No confident match -> ALWAYS use ImageLibrary tag:"default"
   let dbDefault = null;
 
   try {
@@ -555,7 +519,6 @@ async function decideAndAttach(article = {}, _opts = {}) {
     article.imageUrl =
       safeUrl || cloudinary.url(dbDefault.publicId, { secure: true });
 
-    // Keep earlier debug (low-confidence) if present, but attach default info too
     const prev = article.autoImageDebug;
     article.autoImageDebug = {
       ...(prev ? { prev } : {}),
@@ -572,7 +535,6 @@ async function decideAndAttach(article = {}, _opts = {}) {
     return "attached-db-default-image";
   }
 
-  // 5) Final hard fallback (only if ImageLibrary is empty or broken)
   if (!article.imagePublicId && DEFAULT_PUBLIC_ID) {
     article.imagePublicId = DEFAULT_PUBLIC_ID;
     article.imageUrl = cloudinary.url(DEFAULT_PUBLIC_ID, { secure: true });
@@ -583,7 +545,6 @@ async function decideAndAttach(article = {}, _opts = {}) {
       reason: "ImageLibrary empty/unavailable; used hard default",
     };
 
-    // note: hard fallback is not a real "pick"
     article.autoImagePicked = false;
     article.autoImagePickedAt = null;
 
