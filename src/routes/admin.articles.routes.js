@@ -365,15 +365,20 @@ router.post("/:id/repick-image", async (req, res) => {
     finalizeImageFields(article);
 
     const toSave = {
-      imagePublicId: article.imagePublicId || null,
-      imageUrl: article.imageUrl || null,
-      ogImage: article.ogImage || null,
-      thumbImage: article.thumbImage || null,
-      imageAlt: article.imageAlt || null,
-      autoImageDebug: article.autoImageDebug || article._autoImageDebug || null,
-      autoImagePicked: !!article.autoImagePicked,
-      autoImagePickedAt: article.autoImagePickedAt || new Date(),
-    };
+  imagePublicId: article.imagePublicId || null,
+  imageUrl: article.imageUrl || null,
+  ogImage: article.ogImage || null,
+  thumbImage: article.thumbImage || null,
+  imageAlt: article.imageAlt || null,
+
+  // ✅ IMPORTANT: update ops must write to the real DB field (aliases don't apply here)
+  _autoImageDebug: article.autoImageDebug || article._autoImageDebug || null,
+  autoImageDebug: null, // keep clean (optional, but avoids confusion)
+
+  autoImagePicked: !!article.autoImagePicked,
+  autoImagePickedAt: article.autoImagePickedAt || new Date(),
+};
+
 
     const updated = await Article.findByIdAndUpdate(
       id,
