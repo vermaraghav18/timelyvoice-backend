@@ -138,5 +138,8 @@ function buildArticleTags({ rawTags, title, summary, body, seedTitle, min = 6, m
 
   return final.slice(0, max);
 }
+module.exports = {
+  buildArticleTags,
+  extractKeywords
+};
 
-module.exports = { buildArticleTags };
