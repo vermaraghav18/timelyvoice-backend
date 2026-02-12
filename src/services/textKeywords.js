@@ -1,64 +1,142 @@
 "use strict";
 
-const { STOPWORDS } = require("./imagePickerRules");
+// Simple stopword list (keep it small and safe)
+const STOP = new Set([
+  "the","a","an","and","or","of","to","in","on","for","with","as","at","by","from",
+  "is","are","was","were","be","been","being","it","this","that","these","those",
+  "after","before","into","over","under","against","between","during","about",
+  "today","latest","news","report","reports","says","say"
+]);
 
-// Your existing normalize style: remove hash/punct, keep a-z0-9_-
-// We’ll keep it consistent so tag matching works reliably.
-function normalizeToken(raw = "") {
-  const s = String(raw || "").trim().toLowerCase();
-  if (!s) return "";
-  const noHash = s.replace(/^#+/g, "");
-  const clean = noHash.replace(/[^a-z0-9_-]/g, "");
-  return clean;
+// Normalize tags into your ImageLibrary style (no spaces, lowercase, alnum)
+function normTag(s) {
+  const t = String(s || "").trim().toLowerCase();
+  if (!t) return "";
+  // turn "Sri Lanka" -> "srilanka", "#T20 World Cup" -> "t20worldcup"
+  return t
+    .replace(/^#+/g, "")
+    .replace(/[^a-z0-9]+/g, "")
+    .trim();
 }
 
-function splitWords(text = "") {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/[\u2019']/g, "") // remove apostrophes
-    .replace(/[^a-z0-9\s-]/g, " ") // punctuation -> space
-    .split(/\s+/g)
-    .map((x) => x.trim())
-    .filter(Boolean);
+// Detect some sports + formats
+function detectSportsTokens(text) {
+  const s = String(text || "").toLowerCase();
+  const out = new Set();
+
+  if (/\bcricket\b/.test(s)) out.add("cricket");
+  if (/\bt20\b/.test(s) || /\bt20i\b/.test(s)) out.add("t20");
+  if (/\bodi\b/.test(s)) out.add("odi");
+  if (/\btest\b/.test(s) || /\btestmatch\b/.test(s)) out.add("test");
+
+  if (/\bworld\s*cup\b/.test(s)) out.add("worldcup");
+  if (/\bt20\s*world\s*cup\b/.test(s)) out.add("t20worldcup");
+
+  return Array.from(out);
 }
 
-// Build phrases like "raghavchadha", "righttorecall"
-function makeBigrams(tokens = []) {
-  const out = [];
-  for (let i = 0; i < tokens.length - 1; i++) {
-    const a = tokens[i];
-    const b = tokens[i + 1];
-    if (!a || !b) continue;
-    out.push(`${a}${b}`);
-    out.push(`${a}-${b}`);
+// Country quick-map (add more anytime)
+const COUNTRY_ALIASES = [
+  ["sri lanka","srilanka"],
+  ["south africa","southafrica"],
+  ["new zealand","newzealand"],
+  ["united states","usa"],
+  ["united kingdom","uk"],
+  ["uae","uae"],
+];
+
+function detectCountries(text) {
+  const s = String(text || "").toLowerCase();
+  const out = new Set();
+
+  for (const [needle, tag] of COUNTRY_ALIASES) {
+    if (s.includes(needle)) out.add(tag);
   }
-  return out;
+
+  // single-word countries (simple)
+  const singles = [
+    "india","oman","australia","ireland","pakistan","iran","afghanistan",
+    "england","bangladesh","nepal","china","russia","ukraine","israel","gaza"
+  ];
+  for (const c of singles) {
+    if (new RegExp(`\\b${c}\\b`, "i").test(s)) out.add(c);
+  }
+
+  return Array.from(out);
 }
 
-/**
- * Extract keywords from title+summary:
- * - removes stopwords
- * - keeps tokens length >= 4 (reduces noise)
- * - includes bigrams to catch names/phrases
- */
-function extractKeywords(title = "", summary = "", max = 40) {
-  const text = `${title || ""} ${summary || ""}`.trim();
-  const rawTokens = splitWords(text);
+// Extract top keywords from title/summary (fallback)
+function extractKeywords(text, limit = 12) {
+  const s = String(text || "")
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  const filtered = rawTokens
-    .map(normalizeToken)
-    .filter(Boolean)
-    .filter((t) => t.length >= 4)
-    .filter((t) => !STOPWORDS.has(t));
+  if (!s) return [];
 
-  const bigrams = makeBigrams(filtered).map(normalizeToken).filter(Boolean);
+  const words = s.split(" ").filter(Boolean);
+  const freq = new Map();
 
-  // Keep unique, limit size
-  const uniq = Array.from(new Set([...filtered, ...bigrams]));
-  return uniq.slice(0, max);
+  for (const w of words) {
+    if (w.length < 3) continue;
+    if (STOP.has(w)) continue;
+    // avoid pure numbers
+    if (/^\d+$/.test(w)) continue;
+
+    freq.set(w, (freq.get(w) || 0) + 1);
+  }
+
+  return Array.from(freq.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map((x) => x[0])
+    .slice(0, limit);
 }
 
-module.exports = {
-  normalizeToken,
-  extractKeywords,
-};
+// MAIN: build final tag list (min 6, max 8)
+function buildArticleTags({ rawTags, title, summary, body, seedTitle, min = 6, max = 8 }) {
+  const out = [];
+
+  // 1) model tags (if any)
+  if (Array.isArray(rawTags)) {
+    for (const t of rawTags) {
+      const nt = normTag(t);
+      if (nt) out.push(nt);
+    }
+  }
+
+  const allText = `${title || ""} ${summary || ""} ${seedTitle || ""} ${body || ""}`;
+
+  // 2) add sports + cup tokens
+  for (const t of detectSportsTokens(allText)) out.push(normTag(t));
+
+  // 3) add countries
+  for (const t of detectCountries(allText)) out.push(normTag(t));
+
+  // 4) keyword fallback
+  const kw = extractKeywords(`${title || ""} ${summary || ""}`, 20);
+  for (const k of kw) out.push(normTag(k));
+
+  // de-dupe
+  const uniq = Array.from(new Set(out)).filter(Boolean);
+
+  // remove ultra-generic junk if it’s crowding
+  const filtered = uniq.filter((t) => !["general","world","breaking"].includes(t));
+
+  // enforce min/max
+  const final = filtered.slice(0, max);
+  while (final.length < min && filtered.length > final.length) {
+    final.push(filtered[final.length]);
+  }
+
+  // absolute fallback if still too short
+  while (final.length < min) {
+    final.push("news");
+    break;
+  }
+
+  return final.slice(0, max);
+}
+
+module.exports = { buildArticleTags };

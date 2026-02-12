@@ -157,13 +157,21 @@ function normalizeOne(
       ? new Date(raw.publishAt)
       : publishAtBase;
 
-  const tags = Array.isArray(raw.tags)
-    ? Array.from(
-        new Set(
-          raw.tags.map((t) => String(t || "").trim()).filter(Boolean)
-        )
-      ).slice(0, 6)
-    : [];
+ // ✅ TAGS: enforce strong, specific tags (min 6) to support ImageLibrary match score rules
+const { buildArticleTags } = require("./textKeywords");
+
+const tags = buildArticleTags({
+  rawTags: raw.tags,
+  title,
+  summary,
+  body,
+  seedTitle: seedTitle || "",
+  seedSource: seedSource || "",
+  min: 6,
+  max: 8,
+  category,
+});
+
 
   const seo = raw.seo && typeof raw.seo === "object" ? raw.seo : {};
   const imageAlt = seo.imageAlt || raw.imageAlt || title || "News article image";
