@@ -296,18 +296,29 @@ function scoreCandidate({
 // DB-FIRST PICKER (ImageLibrary)
 // Priority: strong tags/keywords → category → null
 // ------------------------------
+// ------------------------------
+// DB-FIRST PICKER (ImageLibrary)
+// Priority: strong tags/keywords → null
+// NOTE: We DO NOT do category fallback here anymore.
+// If no confident match, caller will use DEFAULT image.
+// ------------------------------
 async function pickFromImageLibrary({ meta } = {}) {
   const cleanTags = Array.isArray(meta?.tags) ? meta.tags.filter(Boolean) : [];
   const categoryRaw = String(meta?.category || "").trim();
   const categoryNorm = normalizeCategory(categoryRaw);
 
+  // Keywords from title/summary (normalize like tags so we can compare)
   const keywords = extractKeywords(meta?.title || "", meta?.summary || "", 40)
     .map(normStemTag)
     .filter(Boolean);
 
+  // Use both tags and keywords to widen candidate discovery,
+  // but scoring is what decides.
   const discoverTokens = dedupe([...cleanTags, ...keywords]);
+
   const bucket = inferCategoryBucket(meta);
 
+  // 1) TAG/KEYWORD MATCH (best)
   if (discoverTokens.length) {
     const candidates = await ImageLibrary.find({
       tags: { $in: discoverTokens },
@@ -346,7 +357,9 @@ async function pickFromImageLibrary({ meta } = {}) {
         if (!best || row.score > best.score) best = row;
       }
 
+      // ✅ HARD RULE 1: Require minimum strong matches
       if (best && best.strongMatchCount >= IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES) {
+        // ✅ HARD RULE 2: Confidence threshold
         if (best.score >= IMAGE_LIBRARY_MIN_CONFIDENCE) {
           return {
             publicId: best.publicId,
@@ -370,11 +383,12 @@ async function pickFromImageLibrary({ meta } = {}) {
           };
         }
 
+        // Not confident -> return no-pick, caller will default
         return {
           publicId: null,
           why: {
             mode: "db-advanced-low-confidence",
-            reason: "Had some matches but confidence too low; using category/default",
+            reason: "Had some matches but confidence too low; using default image",
             bestCandidate: {
               publicId: best.publicId,
               score: best.score,
@@ -390,11 +404,12 @@ async function pickFromImageLibrary({ meta } = {}) {
         };
       }
 
+      // Not enough strong matches -> return no-pick, caller will default
       return {
         publicId: null,
         why: {
           mode: "db-advanced-insufficient-strong",
-          reason: "Only generic/no strong matches. Using category/default.",
+          reason: "Not enough strong matches; using default image",
           requiredStrong: IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES,
           usedTags: cleanTags,
           usedKeywords: keywords,
@@ -404,32 +419,7 @@ async function pickFromImageLibrary({ meta } = {}) {
     }
   }
 
-  // 2) CATEGORY FALLBACK
-  if (categoryRaw) {
-    let cat = await ImageLibrary.findOne({ category: categoryRaw })
-      .sort({ priority: -1, createdAt: -1 })
-      .lean();
-
-    if (!cat && categoryNorm) {
-      cat = await ImageLibrary.findOne({ category: categoryNorm })
-        .sort({ priority: -1, createdAt: -1 })
-        .lean();
-    }
-
-    if (cat?.publicId && !isDefaultPlaceholder(cat.publicId, cat.url)) {
-      return {
-        publicId: cat.publicId,
-        url: cat.url,
-        why: {
-          mode: "db-category-fallback",
-          reason: "No confident strong match; fell back to category in ImageLibrary",
-          category: categoryRaw,
-          picked: cat.publicId,
-        },
-      };
-    }
-  }
-
+  // No candidates -> caller will default
   return null;
 }
 
