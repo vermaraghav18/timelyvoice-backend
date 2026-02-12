@@ -4,7 +4,6 @@
 // PURPOSE (your requirement):
 // - Created-by-AI (and all autopick) must ONLY use /admin/image-library
 // - If tags match -> pick best match
-// - Else if category match -> pick category match
 // - Else -> pick ImageLibrary image tagged "default" (ONE canonical default)
 // - Only if ImageLibrary is empty -> use DEFAULT_PUBLIC_ID fallback (env)
 // - NEVER use Cloudinary tag-search picker (chooseHeroImage)
@@ -38,7 +37,7 @@ const IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES = parseInt(
   10
 );
 
-// ✅ Confidence threshold: below this, do NOT pick by tags/keywords; go category/default.
+// ✅ Confidence threshold: below this, do NOT pick by tags/keywords; go default.
 const IMAGE_LIBRARY_MIN_CONFIDENCE = parseInt(
   process.env.IMAGE_LIBRARY_MIN_CONFIDENCE || "110",
   10
@@ -58,6 +57,7 @@ function isPlaceholderUrl(url = "") {
       h.includes("cdn.example")
     );
   } catch (_) {
+    // if it is malformed, treat as NOT placeholder (leave it alone)
     return false;
   }
 }
@@ -236,6 +236,9 @@ async function pickDefaultFromImageLibrary({ category = "" } = {}) {
 // ------------------------------
 // Advanced scoring for candidates
 // ------------------------------
+// ✅ FIX INCLUDED HERE:
+// Keyword matches are NOT automatically “strong” anymore.
+// Generic keyword matches (like "canada") do NOT count towards strongMatchCount.
 function scoreCandidate({
   imgTagsNorm,
   imgCategoryNorm,
@@ -250,6 +253,8 @@ function scoreCandidate({
   const genericTagMatches = matchedTags.filter((t) => isGenericTag(t));
 
   const matchedKeywords = imgTagsNorm.filter((t) => keywordTags.includes(t));
+  const strongKeywordMatches = matchedKeywords.filter((t) => !isGenericTag(t));
+  const genericKeywordMatches = matchedKeywords.filter((t) => isGenericTag(t));
 
   const sameCategory =
     !!articleCategoryNorm && !!imgCategoryNorm && imgCategoryNorm === articleCategoryNorm;
@@ -271,13 +276,15 @@ function scoreCandidate({
 
   const score =
     strongTagMatches.length * 120 +
-    matchedKeywords.length * 90 +
+    strongKeywordMatches.length * 90 +      // ✅ only strong keywords matter
     genericTagMatches.length * 5 +
+    genericKeywordMatches.length * 2 +      // ✅ tiny bump only (optional)
     (sameCategory ? 20 : 0) +
     (Number(imgPriority) || 0) -
     penalty;
 
-  const strongMatchCount = strongTagMatches.length + matchedKeywords.length;
+  // ✅ strongMatchCount ignores generic keywords (like "canada")
+  const strongMatchCount = strongTagMatches.length + strongKeywordMatches.length;
 
   return {
     score,
@@ -288,14 +295,12 @@ function scoreCandidate({
     strongTagMatches,
     genericTagMatches,
     matchedKeywords,
+    strongKeywordMatches,
+    genericKeywordMatches,
     strongMatchCount,
   };
 }
 
-// ------------------------------
-// DB-FIRST PICKER (ImageLibrary)
-// Priority: strong tags/keywords → category → null
-// ------------------------------
 // ------------------------------
 // DB-FIRST PICKER (ImageLibrary)
 // Priority: strong tags/keywords → null
@@ -379,6 +384,8 @@ async function pickFromImageLibrary({ meta } = {}) {
               strongTagMatches: best.strongTagMatches,
               genericTagMatches: best.genericTagMatches,
               keywordMatches: best.matchedKeywords,
+              strongKeywordMatches: best.strongKeywordMatches,
+              genericKeywordMatches: best.genericKeywordMatches,
             },
           };
         }
@@ -396,8 +403,10 @@ async function pickFromImageLibrary({ meta } = {}) {
               penalty: best.penalty,
               penaltyHits: best.penaltyHits,
               strongTagMatches: best.strongTagMatches,
+              strongKeywordMatches: best.strongKeywordMatches,
               keywordMatches: best.matchedKeywords,
               genericTagMatches: best.genericTagMatches,
+              genericKeywordMatches: best.genericKeywordMatches,
             },
             minConfidence: IMAGE_LIBRARY_MIN_CONFIDENCE,
           },
@@ -414,6 +423,20 @@ async function pickFromImageLibrary({ meta } = {}) {
           usedTags: cleanTags,
           usedKeywords: keywords,
           inferredBucket: bucket || "",
+          bestCandidate: best
+            ? {
+                publicId: best.publicId,
+                score: best.score,
+                strongMatchCount: best.strongMatchCount,
+                strongTagMatches: best.strongTagMatches,
+                strongKeywordMatches: best.strongKeywordMatches,
+                keywordMatches: best.matchedKeywords,
+                genericTagMatches: best.genericTagMatches,
+                genericKeywordMatches: best.genericKeywordMatches,
+                penalty: best.penalty,
+                penaltyHits: best.penaltyHits,
+              }
+            : null,
         },
       };
     }
@@ -435,6 +458,7 @@ async function decideAndAttach(article = {}, _opts = {}) {
     article.imageUrl = null;
   }
 
+  // Keep existing image if already set (non-default)
   if (article.imagePublicId && article.imagePublicId !== DEFAULT_PUBLIC_ID) {
     if (!article.autoImageDebug) {
       article.autoImageDebug = {
@@ -446,6 +470,7 @@ async function decideAndAttach(article = {}, _opts = {}) {
     return "kept-existing-public-id";
   }
 
+  // Keep existing URL if not placeholder
   if (article.imageUrl && !isPlaceholderUrl(article.imageUrl)) {
     if (!article.autoImageDebug) {
       article.autoImageDebug = {
@@ -466,16 +491,17 @@ async function decideAndAttach(article = {}, _opts = {}) {
     picked = null;
   }
 
+  // If picker returned "no-pick but has why", store why
   if (picked && !picked.publicId && picked.why) {
     article.autoImageDebug = picked.why;
   }
 
+  // Attach picked image
   if (picked?.publicId) {
     article.imagePublicId = picked.publicId;
     const safeUrl =
       typeof picked.url === "string" ? picked.url.replace(/\s+/g, "") : "";
-    article.imageUrl =
-      safeUrl || cloudinary.url(picked.publicId, { secure: true });
+    article.imageUrl = safeUrl || cloudinary.url(picked.publicId, { secure: true });
 
     article.autoImageDebug = picked.why || {
       mode: "db-advanced-match",
@@ -493,6 +519,7 @@ async function decideAndAttach(article = {}, _opts = {}) {
     return "attached-db-image";
   }
 
+  // Default from ImageLibrary ("default" tag)
   let dbDefault = null;
 
   try {
@@ -506,8 +533,7 @@ async function decideAndAttach(article = {}, _opts = {}) {
     article.imagePublicId = dbDefault.publicId;
     const safeUrl =
       typeof dbDefault.url === "string" ? dbDefault.url.replace(/\s+/g, "") : "";
-    article.imageUrl =
-      safeUrl || cloudinary.url(dbDefault.publicId, { secure: true });
+    article.imageUrl = safeUrl || cloudinary.url(dbDefault.publicId, { secure: true });
 
     const prev = article.autoImageDebug;
     article.autoImageDebug = {
@@ -525,6 +551,7 @@ async function decideAndAttach(article = {}, _opts = {}) {
     return "attached-db-default-image";
   }
 
+  // Hard fallback (only if ImageLibrary empty/unavailable)
   if (!article.imagePublicId && DEFAULT_PUBLIC_ID) {
     article.imagePublicId = DEFAULT_PUBLIC_ID;
     article.imageUrl = cloudinary.url(DEFAULT_PUBLIC_ID, { secure: true });

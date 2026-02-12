@@ -51,7 +51,33 @@ const STOPWORDS = new Set([
 // "generic" tags that are too broad to decide an image
 const GENERIC_TAGS = new Set([
   "world","india","news","politics","business","sports","technology","tech",
-  "entertainment","breaking","latest","update","general"
+  "entertainment","breaking","latest","update","general",// ✅ Countries / locations (too broad to be “strong” matches)
+  "canada",
+  "usa",
+  "us",
+  "unitedstates",
+  "uk",
+  "uae",
+  "newzealand",
+  "australia",
+  "china",
+  "russia",
+  "iran",
+  "israel",
+  "pakistan",
+  "afghanistan",
+  "srilanka",
+  "sri-lanka",
+  "japan",
+  "france",
+  "germany",
+  "italy",
+  "spain",
+  "qatar",
+  "saudi",
+  "saudiarabia",
+  "turkey",
+  "ukraine",
 ]);
 
 function dedupe(arr) {
