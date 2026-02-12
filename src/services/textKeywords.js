@@ -8,6 +8,42 @@ const STOP = new Set([
   "today","latest","news","report","reports","says","say"
 ]);
 
+// ------------------------------
+// ✅ NEW: Canonical tag variants
+// Goal: AI should not output both "politics" and "political" etc.
+// We standardize to ONE preferred tag.
+// Keep this list small and extend only when needed.
+// ------------------------------
+const CANONICAL_TAG_MAP = new Map([
+  // politics
+  ["political", "politics"],
+  ["politician", "politics"],
+  ["politicians", "politics"],
+
+  // economy/finance
+  ["economic", "economy"],
+  ["economical", "economy"],
+
+  // law/legal
+  ["laws", "law"],
+  ["legal", "law"],
+  ["legally", "law"],
+
+  // parliament/legislation
+  ["legislative", "parliament"],
+  ["legislation", "parliament"],
+  ["legislature", "parliament"],
+
+  // security/defence spelling variants (optional)
+  ["defense", "defence"],
+]);
+
+function canonicalizeTag(t) {
+  const x = String(t || "").trim().toLowerCase();
+  if (!x) return "";
+  return CANONICAL_TAG_MAP.get(x) || x;
+}
+
 // Normalize tokens/tags into your ImageLibrary style (no spaces, lowercase, alnum/_/-)
 function normalizeToken(s) {
   const t = String(s || "").trim().toLowerCase();
@@ -19,9 +55,16 @@ function normalizeToken(s) {
 }
 
 // Backward compatible alias (your older code used normTag)
+// NOTE: This intentionally removes spaces & symbols to match ImageLibrary tag style.
 function normTag(s) {
   // turn "Sri Lanka" -> "srilanka", "#T20 World Cup" -> "t20worldcup"
-  return normalizeToken(String(s || "").replace(/[^a-z0-9]+/gi, ""));
+  const raw = String(s || "").replace(/[^a-z0-9]+/gi, "");
+  const norm = normalizeToken(raw);
+  if (!norm) return "";
+
+  // ✅ Apply canonicalization AFTER normalization
+  // Example: "political" -> "politics"
+  return canonicalizeTag(norm);
 }
 
 // Detect some sports + formats
@@ -122,16 +165,25 @@ function buildArticleTags({ rawTags, title, summary, body, seedTitle, min = 6, m
   const allText = `${title || ""} ${summary || ""} ${seedTitle || ""} ${body || ""}`;
 
   // 2) add sports + cup tokens
-  for (const t of detectSportsTokens(allText)) out.push(normTag(t));
+  for (const t of detectSportsTokens(allText)) {
+    const nt = normTag(t);
+    if (nt) out.push(nt);
+  }
 
   // 3) add countries
-  for (const t of detectCountries(allText)) out.push(normTag(t));
+  for (const t of detectCountries(allText)) {
+    const nt = normTag(t);
+    if (nt) out.push(nt);
+  }
 
   // 4) keyword fallback
   const kw = extractKeywords(title || "", summary || "", 20);
-  for (const k of kw) out.push(normTag(k));
+  for (const k of kw) {
+    const nt = normTag(k);
+    if (nt) out.push(nt);
+  }
 
-  // de-dupe
+  // de-dupe (AFTER canonicalization)
   const uniq = Array.from(new Set(out)).filter(Boolean);
 
   // remove ultra-generic junk if it’s crowding
