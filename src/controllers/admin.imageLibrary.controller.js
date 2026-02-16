@@ -23,6 +23,10 @@ function normalizeTags(input) {
   return Array.from(new Set(clean)); // dedupe
 }
 
+function escapeRegex(value = "") {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 exports.createImage = async (req, res) => {
   try {
     // ✅ multipart/form-data fields come in req.body
@@ -113,7 +117,21 @@ exports.listImages = async (req, res) => {
     if (source) filter.source = String(source).trim();
 
     if (tag) {
-      filter.tags = normalizeTag(tag);
+      const terms = String(tag)
+        .split(/[\s,|]+/g)
+        .map(normalizeTag)
+        .filter(Boolean);
+
+      if (terms.length === 1) {
+        filter.tags = { $elemMatch: { $regex: escapeRegex(terms[0]), $options: "i" } };
+      } else if (terms.length > 1) {
+        filter.$or = [
+          ...(filter.$or || []),
+          ...terms.map((term) => ({
+            tags: { $elemMatch: { $regex: escapeRegex(term), $options: "i" } },
+          })),
+        ];
+      }
     }
 
     // optional search by publicId or url
