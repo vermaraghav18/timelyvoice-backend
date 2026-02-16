@@ -6,10 +6,12 @@ const router = express.Router();
 
 const {
   createImage,
+  resolvePublicId,
   listImages,
   updateImage,
   deleteImage,
 } = require("../controllers/admin.imageLibrary.controller");
+
 
 // ✅ Multer memory storage (no disk writes)
 const upload = multer({
@@ -30,8 +32,12 @@ const upload = multer({
 // POST: upload image file + save metadata (Cloudinary + MongoDB)
 router.post("/", upload.single("file"), createImage);
 
+// GET: resolve publicId -> url (must be BEFORE "/:id")
+router.get("/resolve", resolvePublicId);
+
 // GET: list/search images
 router.get("/", listImages);
+
 
 // PATCH: edit tags/category/priority
 router.patch("/:id", updateImage);

@@ -107,9 +107,29 @@ return res.json({ ok: true, image: doc, backfill });
   }
 };
 
+exports.resolvePublicId = async (req, res) => {
+  try {
+    const publicId = String(req.query?.publicId || "").trim();
+    if (!publicId) {
+      return res.status(400).json({ ok: false, error: "publicId is required" });
+    }
+
+    const doc = await ImageLibrary.findOne({ publicId }).lean();
+    if (!doc) {
+      return res.status(404).json({ ok: false, error: "Image not found for this publicId" });
+    }
+
+    return res.json({ ok: true, publicId: doc.publicId, url: doc.url });
+  } catch (err) {
+    console.error("[ImageLibrary:resolvePublicId]", err);
+    return res.status(500).json({ ok: false, error: "Failed to resolve publicId" });
+  }
+};
+
 exports.listImages = async (req, res) => {
   try {
     const { tag, category, source, q, limit = 50, page = 1 } = req.query || {};
+
 
     const filter = {};
 
