@@ -1,6 +1,9 @@
 // backend/src/controllers/admin.imageLibrary.controller.js
 const ImageLibrary = require("../models/ImageLibrary");
-const { uploadImageBuffer, deleteCloudinaryAsset } = require("../services/cloudinary.service");
+const {
+  uploadImageBuffer,
+  deleteCloudinaryAsset,
+} = require("../services/cloudinary.service");
 
 // simple tag normalizer (matches your existing style)
 function normalizeTag(raw = "") {
@@ -27,78 +30,168 @@ function escapeRegex(value = "") {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * ✅ MULTI + SINGLE + LEGACY create
+ *
+ * Your route uses:
+ * upload.fields([{name:"file"},{name:"files"}])
+ * so the controller reads from req.files.file[] and req.files.files[].
+ *
+ * Also keeps legacy JSON mode (publicId/url) when no file(s) provided.
+ */
 exports.createImage = async (req, res) => {
   try {
     // ✅ multipart/form-data fields come in req.body
     const { tags, category = "", source = "manual", priority = 0 } = req.body || {};
 
-    // ✅ file comes from multer: upload.single("file")
-    const file = req.file;
-
-    // Backward compatible: allow creating record by publicId/url (old behavior)
+    // ✅ legacy fields (old behavior)
     const { publicId, url } = req.body || {};
 
-    let finalPublicId = "";
-    let finalUrl = "";
+    // ✅ Collect all uploaded files (memoryStorage => buffers)
+    const multi = Array.isArray(req?.files?.files) ? req.files.files : [];
+    const single = Array.isArray(req?.files?.file) ? req.files.file : [];
+    const allFiles = [...single, ...multi].filter(Boolean);
 
-    if (file && file.buffer) {
-      // Upload the file buffer to Cloudinary
-      const up = await uploadImageBuffer(file.buffer, {
-        folder: process.env.CLOUDINARY_LIBRARY_FOLDER || "news-images/library",
-      });
-      finalPublicId = up.public_id;
-      finalUrl = up.url;
-    } else {
-      // Old JSON mode
-      if (!publicId) {
-        return res.status(400).json({ error: "file is required (or provide publicId for legacy mode)" });
-      }
+    // =========================
+    // CASE 1: FILE(S) PROVIDED
+    // =========================
+    if (allFiles.length > 0) {
+      const created = [];
+      const failed = [];
 
-      const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-      const cleanPublicId = String(publicId).trim();
+      for (const f of allFiles) {
+        try {
+          if (!f?.buffer) {
+            failed.push({
+              name: f?.originalname || "unknown",
+              error: "file buffer missing",
+            });
+            continue;
+          }
 
-      let finalLegacyUrl = url ? String(url).trim() : "";
-      finalLegacyUrl = finalLegacyUrl.replace(/\s+/g, "");
+          // Upload file buffer to Cloudinary
+          const up = await uploadImageBuffer(f.buffer, {
+            folder: process.env.CLOUDINARY_LIBRARY_FOLDER || "news-images/library",
+          });
 
-      // If url is missing OR has placeholder, build from env
-      if (!finalLegacyUrl || finalLegacyUrl.includes("YOUR_CLOUD_NAME")) {
-        if (!cloudName) {
-          return res.status(500).json({ error: "CLOUDINARY_CLOUD_NAME is missing in env" });
+          const doc = await ImageLibrary.create({
+            publicId: up.public_id,
+            url: up.url,
+            tags: normalizeTags(tags),
+            category: String(category || "").trim(),
+            source,
+            priority: Number(priority) || 0,
+          });
+
+          created.push(doc);
+        } catch (err) {
+          // duplicate publicId
+          if (err && err.code === 11000) {
+            failed.push({
+              name: f?.originalname || "unknown",
+              error: "duplicate_publicId",
+            });
+            continue;
+          }
+
+          console.error("[ImageLibrary:createImage] per-file error:", err);
+          failed.push({
+            name: f?.originalname || "unknown",
+            error: err?.message || "upload_failed",
+          });
         }
-        finalLegacyUrl = `https://res.cloudinary.com/${cloudName}/image/upload/v1/${cleanPublicId}.jpg`;
       }
 
-      finalPublicId = cleanPublicId;
-      finalUrl = finalLegacyUrl;
+      if (created.length === 0) {
+        const dupOnly =
+          failed.length > 0 && failed.every((x) => x.error === "duplicate_publicId");
+        return res.status(dupOnly ? 409 : 500).json({
+          ok: false,
+          error: dupOnly
+            ? "All selected images already exist in Image Library (duplicate publicId)."
+            : "Failed to upload images.",
+          failed,
+        });
+      }
+
+      // ✅ Backfill: safe behavior
+      // - single upload => run your backfill
+      // - batch upload => skip (avoid heavy scans N times)
+      let backfill = null;
+      if (created.length === 1) {
+        try {
+          const { backfillMatchingArticlesFromLibraryImage } = require("../services/imageBackfill");
+          backfill = await backfillMatchingArticlesFromLibraryImage(created[0], {
+            limit: 300,
+            lookbackHours: 168, // last 7 days
+            onlyAi: true,
+          });
+        } catch (e) {
+          console.error("[ImageLibrary:createImage] backfill error:", e?.message || e);
+          backfill = { ok: false, error: String(e?.message || e) };
+        }
+      } else {
+        backfill = { ok: true, skipped: true, reason: "batch_upload" };
+      }
+
+      return res.json({
+        ok: true,
+        count: created.length,
+        images: created, // ✅ array for multi
+        image: created.length === 1 ? created[0] : undefined, // backward-friendly
+        failed,
+        backfill,
+      });
     }
 
-   const doc = await ImageLibrary.create({
-  publicId: finalPublicId,
-  url: finalUrl,
-  tags: normalizeTags(tags),
-  category: String(category || "").trim(),
-  source,
-  priority: Number(priority) || 0,
-});
+    // =========================
+    // CASE 2: LEGACY JSON MODE
+    // =========================
+    if (!publicId) {
+      return res.status(400).json({
+        error: "file(s) is required (or provide publicId for legacy mode)",
+      });
+    }
 
-// ✅ NEW: Retroactively update older AI drafts that still have default image
-let backfill = null;
-try {
-  const { backfillMatchingArticlesFromLibraryImage } = require("../services/imageBackfill");
-  backfill = await backfillMatchingArticlesFromLibraryImage(doc, {
-    limit: 300,
-    lookbackHours: 168, // last 7 days
-    onlyAi: true,
-  });
-} catch (e) {
-  console.error("[ImageLibrary:createImage] backfill error:", e?.message || e);
-  backfill = { ok: false, error: String(e?.message || e) };
-}
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+    const cleanPublicId = String(publicId).trim();
 
-return res.json({ ok: true, image: doc, backfill });
+    let finalLegacyUrl = url ? String(url).trim() : "";
+    finalLegacyUrl = finalLegacyUrl.replace(/\s+/g, "");
 
+    // If url is missing OR has placeholder, build from env
+    if (!finalLegacyUrl || finalLegacyUrl.includes("YOUR_CLOUD_NAME")) {
+      if (!cloudName) {
+        return res.status(500).json({ error: "CLOUDINARY_CLOUD_NAME is missing in env" });
+      }
+      finalLegacyUrl = `https://res.cloudinary.com/${cloudName}/image/upload/v1/${cleanPublicId}.jpg`;
+    }
+
+    const doc = await ImageLibrary.create({
+      publicId: cleanPublicId,
+      url: finalLegacyUrl,
+      tags: normalizeTags(tags),
+      category: String(category || "").trim(),
+      source,
+      priority: Number(priority) || 0,
+    });
+
+    // ✅ Backfill (legacy treated as single)
+    let backfill = null;
+    try {
+      const { backfillMatchingArticlesFromLibraryImage } = require("../services/imageBackfill");
+      backfill = await backfillMatchingArticlesFromLibraryImage(doc, {
+        limit: 300,
+        lookbackHours: 168,
+        onlyAi: true,
+      });
+    } catch (e) {
+      console.error("[ImageLibrary:createImage] backfill error:", e?.message || e);
+      backfill = { ok: false, error: String(e?.message || e) };
+    }
+
+    return res.json({ ok: true, image: doc, backfill });
   } catch (err) {
-    // handle duplicate publicId
     if (err && err.code === 11000) {
       return res.status(409).json({ error: "This publicId already exists in Image Library" });
     }
@@ -129,7 +222,6 @@ exports.resolvePublicId = async (req, res) => {
 exports.listImages = async (req, res) => {
   try {
     const { tag, category, source, q, limit = 50, page = 1 } = req.query || {};
-
 
     const filter = {};
 
@@ -213,12 +305,12 @@ exports.updateImage = async (req, res) => {
 exports.deleteImage = async (req, res) => {
   try {
     const { id } = req.params;
-    const deleteFromCloudinary = String(req.query.deleteFromCloudinary || "").toLowerCase() === "true";
+    const deleteFromCloudinary =
+      String(req.query.deleteFromCloudinary || "").toLowerCase() === "true";
 
     const doc = await ImageLibrary.findById(id);
     if (!doc) return res.status(404).json({ error: "Image not found" });
 
-    // delete DB first (so UI feels instant). Cloudinary delete is optional.
     await ImageLibrary.deleteOne({ _id: id });
 
     let cloudinaryResult = null;

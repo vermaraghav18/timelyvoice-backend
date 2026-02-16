@@ -30,7 +30,15 @@ const upload = multer({
 });
 
 // POST: upload image file + save metadata (Cloudinary + MongoDB)
-router.post("/", upload.single("file"), createImage);
+router.post(
+  "/",
+  upload.fields([
+    { name: "file", maxCount: 1 },   // backward compatible
+    { name: "files", maxCount: 50 }, // ✅ multi
+  ]),
+  createImage
+);
+
 
 // GET: resolve publicId -> url (must be BEFORE "/:id")
 router.get("/resolve", resolvePublicId);
