@@ -1216,18 +1216,32 @@ async function connectMongo() {
   // Auth helpers
   function signToken() { return jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '6h' }); }
   function auth(req, res, next) {
-    const header = req.headers.authorization || '';
-    let token = header.startsWith('Bearer ') ? header.slice(7) : null;
-    if (!token && req.cookies) token = req.cookies.token || null;
-    try {
-      const decoded = jwt.verify(token || '', JWT_SECRET);
-      if (decoded.role !== 'admin') throw new Error('not admin');
-      req.user = { role: 'admin' };
-      next();
-    } catch {
-      res.status(401).json({ error: 'Invalid or missing token' });
-    }
+  // ✅ Admin auth disabled (no compulsory login anywhere)
+  // If you ever want to re-enable login later:
+  // set ADMIN_AUTH_ENABLED=true in env
+  const enabled =
+    String(process.env.ADMIN_AUTH_ENABLED || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  // Default: OFF (no auth required)
+  if (!enabled) return next();
+
+  // If enabled, enforce token
+  const hdr = req.headers.authorization || "";
+  const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : "";
+
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const decoded = jwt.verify(token, process.env.ADMIN_JWT_SECRET);
+    req.admin = decoded;
+    return next();
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
   }
+}
+
   function optionalAuth(req, _res, next) {
     const header = req.headers.authorization || '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : (req.cookies?.token || null);
