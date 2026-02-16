@@ -319,6 +319,16 @@ function deriveCloudinaryPublicIdFromUrl(url = "") {
   }
 }
 
+function looksLikeCloudinaryPublicId(value = "") {
+  const s = String(value || "").trim();
+  if (!s) return false;
+  if (/^https?:\/\//i.test(s)) return false;
+  if (/\s/.test(s)) return false;
+  // "folder/name" (or deeper) is the common public_id shape from image library.
+  if (!s.includes("/")) return false;
+  return /^[a-z0-9_\-./]+$/i.test(s);
+}
+
 function normalizeRemoteImageUrl(raw = "") {
   const s = String(raw || "").trim();
   if (!s) return null;
@@ -881,8 +891,16 @@ router.patch("/:id", async (req, res) => {
      */
     if (hasPatch("imageUrl")) {
       const cleaned = sanitizeImageUrl(patch.imageUrl);
-      if (!cleaned || isPlaceholderUrl(cleaned)) patch.imageUrl = null;
-      else patch.imageUrl = cleaned;
+     if (!cleaned || isPlaceholderUrl(cleaned)) {
+        patch.imageUrl = null;
+      } else if (looksLikeCloudinaryPublicId(cleaned)) {
+        // Admin pasted a Cloudinary public_id into Image URL (quick field).
+        // Normalize to imagePublicId so Cloudinary URLs/variants are built correctly.
+        patch.imagePublicId = cleaned.replace(/\.[a-z0-9]+$/i, "");
+        patch.imageUrl = null;
+      } else {
+        patch.imageUrl = cleaned;
+      }
     }
 
     /**
