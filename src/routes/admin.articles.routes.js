@@ -1060,9 +1060,28 @@ if (
     // Only finalize URLs if we have something (and never force defaults into DB)
     finalizeImageFields(merged);
 
-    // Keep og/thumb in sync if imageUrl exists and og/thumb missing
-    if (!merged.thumbImage && merged.imageUrl) merged.thumbImage = merged.imageUrl;
-    if (!merged.ogImage && merged.imageUrl) merged.ogImage = merged.imageUrl;
+   // Keep og/thumb in sync with quick image URL edits from admin list page.
+    // If imageUrl is explicitly changed and og/thumb are not explicitly patched,
+    // force them to match the new image URL so admins don't need to edit 3 fields.
+    if (
+      hasPatch("imageUrl") &&
+      nonEmptyStr(merged.imageUrl) &&
+      !hasPatch("ogImage")
+    ) {
+      merged.ogImage = merged.imageUrl;
+    } else if (!merged.ogImage && merged.imageUrl) {
+      merged.ogImage = merged.imageUrl;
+    }
+
+    if (
+      hasPatch("imageUrl") &&
+      nonEmptyStr(merged.imageUrl) &&
+      !hasPatch("thumbImage")
+    ) {
+      merged.thumbImage = merged.imageUrl;
+    } else if (!merged.thumbImage && merged.imageUrl) {
+      merged.thumbImage = merged.imageUrl;
+    }
 
     const toSaveKeys = [
   "title",
