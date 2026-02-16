@@ -1,4 +1,4 @@
-﻿// backend/src/routes/admin.articles.routes.js
+﻿﻿// backend/src/routes/admin.articles.routes.js
 // Admin routes for listing, previewing, editing and publishing Article drafts
 
 const express = require("express");
@@ -946,14 +946,19 @@ router.patch("/:id", async (req, res) => {
       }
     }
 
-    // if manual URL provided and is Cloudinary URL -> derive publicId
+    // if manual URL is provided without imagePublicId, prefer that URL over any old publicId.
+    // this fixes quick-edit flow where old imagePublicId could overwrite the new URL.
     const manualUrlProvided =
       hasPatch("imageUrl") &&
       typeof patch.imageUrl === "string" &&
       patch.imageUrl.trim() !== "" &&
       !hasPatch("imagePublicId");
 
-    if (manualUrlProvided && !merged.imagePublicId) {
+    if (manualUrlProvided) {
+      // remove stale pid so external URLs are respected
+      merged.imagePublicId = null;
+
+      // if the URL is Cloudinary, recover pid so variants still work
       const maybePid = deriveCloudinaryPublicIdFromUrl(merged.imageUrl);
       if (maybePid) merged.imagePublicId = maybePid;
     }
@@ -1007,15 +1012,17 @@ router.patch("/:id", async (req, res) => {
 
 
     // ✅ If admin manually sets imagePublicId, force URLs to match it
-if (
-  manualOverrideInPatch &&
-  typeof merged.imagePublicId === "string" &&
-  merged.imagePublicId.trim()
-) {
-  merged.imageUrl = null;
-  merged.ogImage = null;
-  merged.thumbImage = null;
-}
+    // (do not apply this when only imageUrl was patched)
+    if (
+      hasPatch("imagePublicId") &&
+      nonEmptyStr(patch.imagePublicId) &&
+      typeof merged.imagePublicId === "string" &&
+      merged.imagePublicId.trim()
+    ) {
+      merged.imageUrl = null;
+      merged.ogImage = null;
+      merged.thumbImage = null;
+    }
 
     // If admin is clearing image fields => ensure they are truly cleared and NOT manual
     if (clearingImageInPatch) {
@@ -1060,7 +1067,7 @@ if (
     // Only finalize URLs if we have something (and never force defaults into DB)
     finalizeImageFields(merged);
 
-   // Keep og/thumb in sync with quick image URL edits from admin list page.
+    // Keep og/thumb in sync with quick image URL edits from admin list page.
     // If imageUrl is explicitly changed and og/thumb are not explicitly patched,
     // force them to match the new image URL so admins don't need to edit 3 fields.
     if (
