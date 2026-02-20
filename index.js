@@ -798,9 +798,15 @@ const ogImage =
 const adminArticlesRouter = require('./src/routes/admin.articles.routes');
 app.use('/api/admin/articles', adminArticlesRouter);
 
+
 // ✅ Admin Image Library router (protected)
 const adminImageLibraryRouter = require("./src/routes/admin.imageLibrary.routes");
 app.use("/api/admin/image-library", auth, adminImageLibraryRouter);
+
+// ✅ Admin Prompt router (protected)
+const adminPromptRouter = require("./src/routes/admin.prompt.routes");
+app.use("/api/admin/prompt", auth, adminPromptRouter);
+
 
 
 
