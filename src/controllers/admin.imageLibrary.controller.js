@@ -5,7 +5,20 @@ const {
   deleteCloudinaryAsset,
 } = require("../services/cloudinary.service");
 
-// simple tag normalizer (matches your existing style)
+// ✅ Google Drive helpers (ONLY ONCE)
+const {
+  listFilesInFolder,
+  downloadFileBuffer,
+} = require("../services/googleDrive");
+
+// ✅ auto tag service
+const {
+  generateImageTagsFromUrl,
+} = require("../services/imageAutoTags.service");
+
+// -----------------------------
+// Tag helpers
+// -----------------------------
 function normalizeTag(raw = "") {
   return String(raw || "")
     .trim()
@@ -14,50 +27,57 @@ function normalizeTag(raw = "") {
     .replace(/[^a-z0-9_-]/g, "");
 }
 
+/**
+ * ✅ Upgraded normalizer:
+ * - Accepts: "donald trump, usa" OR ["donald trump","usa"]
+ * - Expands multi-word tags:
+ *   "donald trump" -> ["donald trump","donald","trump","donaldtrump"]
+ * - Then cleans to your existing format (lowercase, no spaces/special chars)
+ */
 function normalizeTags(input) {
-  // accepts: "iran, missile" OR ["iran","missile"]
   let arr = [];
   if (typeof input === "string") {
     arr = input.split(/[,|]/g);
   } else if (Array.isArray(input)) {
     arr = input;
   }
-  const clean = arr.map(normalizeTag).filter(Boolean);
-  return Array.from(new Set(clean)); // dedupe
+
+  const expanded = [];
+  for (const raw of arr) {
+    const s = String(raw || "").trim();
+    if (!s) continue;
+
+    expanded.push(s);
+
+    const words = s.split(/\s+/g).filter(Boolean);
+    if (words.length > 1) {
+      for (const w of words) expanded.push(w);
+      expanded.push(words.join(""));
+    }
+  }
+
+  const clean = expanded.map(normalizeTag).filter(Boolean);
+  return Array.from(new Set(clean));
 }
 
 function escapeRegex(value = "") {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/**
- * ✅ MULTI + SINGLE + LEGACY create
- *
- * Your route uses:
- * upload.fields([{name:"file"},{name:"files"}])
- * so the controller reads from req.files.file[] and req.files.files[].
- *
- * Also keeps legacy JSON mode (publicId/url) when no file(s) provided.
- */
 exports.createImage = async (req, res) => {
   try {
-    // ✅ multipart/form-data fields come in req.body
     const { tags, category = "", source = "manual", priority = 0 } = req.body || {};
-
-    // ✅ legacy fields (old behavior)
     const { publicId, url } = req.body || {};
 
-    // ✅ Collect all uploaded files (memoryStorage => buffers)
     const multi = Array.isArray(req?.files?.files) ? req.files.files : [];
     const single = Array.isArray(req?.files?.file) ? req.files.file : [];
     const allFiles = [...single, ...multi].filter(Boolean);
 
-    // =========================
-    // CASE 1: FILE(S) PROVIDED
-    // =========================
     if (allFiles.length > 0) {
       const created = [];
       const failed = [];
+
+      const requestTagsNormalized = normalizeTags(tags);
 
       for (const f of allFiles) {
         try {
@@ -69,15 +89,20 @@ exports.createImage = async (req, res) => {
             continue;
           }
 
-          // Upload file buffer to Cloudinary
           const up = await uploadImageBuffer(f.buffer, {
             folder: process.env.CLOUDINARY_LIBRARY_FOLDER || "news-images/library",
           });
 
+          let finalTags = requestTagsNormalized;
+          if (!finalTags || finalTags.length === 0) {
+            const auto = await generateImageTagsFromUrl(up.url, { max: 10 });
+            finalTags = normalizeTags(auto?.tags || []);
+          }
+
           const doc = await ImageLibrary.create({
             publicId: up.public_id,
             url: up.url,
-            tags: normalizeTags(tags),
+            tags: finalTags,
             category: String(category || "").trim(),
             source,
             priority: Number(priority) || 0,
@@ -85,7 +110,6 @@ exports.createImage = async (req, res) => {
 
           created.push(doc);
         } catch (err) {
-          // duplicate publicId
           if (err && err.code === 11000) {
             failed.push({
               name: f?.originalname || "unknown",
@@ -105,25 +129,24 @@ exports.createImage = async (req, res) => {
       if (created.length === 0) {
         const dupOnly =
           failed.length > 0 && failed.every((x) => x.error === "duplicate_publicId");
+        const firstFail = failed?.[0]?.error ? ` First error: ${failed[0].error}` : "";
+
         return res.status(dupOnly ? 409 : 500).json({
           ok: false,
           error: dupOnly
             ? "All selected images already exist in Image Library (duplicate publicId)."
-            : "Failed to upload images.",
+            : `Failed to upload image(s).${firstFail}`,
           failed,
         });
       }
 
-      // ✅ Backfill: safe behavior
-      // - single upload => run your backfill
-      // - batch upload => skip (avoid heavy scans N times)
       let backfill = null;
       if (created.length === 1) {
         try {
           const { backfillMatchingArticlesFromLibraryImage } = require("../services/imageBackfill");
           backfill = await backfillMatchingArticlesFromLibraryImage(created[0], {
             limit: 300,
-            lookbackHours: 168, // last 7 days
+            lookbackHours: 168,
             onlyAi: true,
           });
         } catch (e) {
@@ -137,16 +160,13 @@ exports.createImage = async (req, res) => {
       return res.json({
         ok: true,
         count: created.length,
-        images: created, // ✅ array for multi
-        image: created.length === 1 ? created[0] : undefined, // backward-friendly
+        images: created,
+        image: created.length === 1 ? created[0] : undefined,
         failed,
         backfill,
       });
     }
 
-    // =========================
-    // CASE 2: LEGACY JSON MODE
-    // =========================
     if (!publicId) {
       return res.status(400).json({
         error: "file(s) is required (or provide publicId for legacy mode)",
@@ -159,7 +179,6 @@ exports.createImage = async (req, res) => {
     let finalLegacyUrl = url ? String(url).trim() : "";
     finalLegacyUrl = finalLegacyUrl.replace(/\s+/g, "");
 
-    // If url is missing OR has placeholder, build from env
     if (!finalLegacyUrl || finalLegacyUrl.includes("YOUR_CLOUD_NAME")) {
       if (!cloudName) {
         return res.status(500).json({ error: "CLOUDINARY_CLOUD_NAME is missing in env" });
@@ -167,16 +186,21 @@ exports.createImage = async (req, res) => {
       finalLegacyUrl = `https://res.cloudinary.com/${cloudName}/image/upload/v1/${cleanPublicId}.jpg`;
     }
 
+    let finalTags = normalizeTags(tags);
+    if (!finalTags || finalTags.length === 0) {
+      const auto = await generateImageTagsFromUrl(finalLegacyUrl, { max: 10 });
+      finalTags = normalizeTags(auto?.tags || []);
+    }
+
     const doc = await ImageLibrary.create({
       publicId: cleanPublicId,
       url: finalLegacyUrl,
-      tags: normalizeTags(tags),
+      tags: finalTags,
       category: String(category || "").trim(),
       source,
       priority: Number(priority) || 0,
     });
 
-    // ✅ Backfill (legacy treated as single)
     let backfill = null;
     try {
       const { backfillMatchingArticlesFromLibraryImage } = require("../services/imageBackfill");
@@ -222,7 +246,6 @@ exports.resolvePublicId = async (req, res) => {
 exports.listImages = async (req, res) => {
   try {
     const { tag, category, source, q, limit = 50, page = 1 } = req.query || {};
-
     const filter = {};
 
     if (category) filter.category = String(category).trim();
@@ -246,7 +269,6 @@ exports.listImages = async (req, res) => {
       }
     }
 
-    // optional search by publicId or url
     if (q) {
       const s = String(q).trim();
       filter.$or = [
@@ -327,5 +349,174 @@ exports.deleteImage = async (req, res) => {
   } catch (err) {
     console.error("[ImageLibrary:deleteImage]", err);
     return res.status(500).json({ error: "Failed to delete image" });
+  }
+};
+
+exports.listDriveFiles = async (req, res) => {
+  try {
+    const folderId =
+      String(req.query.folderId || "").trim() ||
+      String(process.env.GOOGLE_DRIVE_NEWS_FOLDER_ID || "").trim();
+
+    if (!folderId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing folderId (and GOOGLE_DRIVE_NEWS_FOLDER_ID is not set).",
+      });
+    }
+
+    const files = await listFilesInFolder(folderId);
+
+    return res.json({
+      ok: true,
+      folderId,
+      count: Array.isArray(files) ? files.length : 0,
+      files: (files || []).map((f) => ({
+        id: f.id,
+        name: f.name,
+        mimeType: f.mimeType,
+        modifiedTime: f.modifiedTime,
+        thumbnailLink: f.thumbnailLink,
+        webViewLink: f.webViewLink,
+      })),
+    });
+  } catch (err) {
+    console.error("[ImageLibrary:listDriveFiles]", err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.response?.data?.error?.message || err?.message || "Failed to list Drive files",
+    });
+  }
+};
+
+exports.importDriveFiles = async (req, res) => {
+  try {
+    console.log("[DriveImport] HIT /drive/import body:", {
+      fileIdsCount: Array.isArray(req.body?.fileIds) ? req.body.fileIds.length : 0,
+      category: req.body?.category,
+      priority: req.body?.priority,
+      tagsLen: String(req.body?.tags || "").length,
+    });
+
+    const { fileIds, tags = "", category = "", priority = 0 } = req.body || {};
+
+    const ids = Array.isArray(fileIds)
+      ? fileIds.map((x) => String(x).trim()).filter(Boolean)
+      : [];
+
+    if (ids.length === 0) {
+      return res.status(400).json({ ok: false, error: "fileIds[] is required" });
+    }
+
+    const requestTagsNormalized = normalizeTags(tags);
+
+    const created = [];
+    const failed = [];
+
+    const runOne = async (fileId) => {
+      const t0 = Date.now();
+      let tDownload = 0;
+      let tUpload = 0;
+      let tDb = 0;
+
+      try {
+        const t1 = Date.now();
+        const buf = await downloadFileBuffer(fileId);
+        tDownload = Date.now() - t1;
+
+        if (!buf || !Buffer.isBuffer(buf) || buf.length === 0) {
+          throw new Error("Drive download returned empty/invalid buffer");
+        }
+
+        const t2 = Date.now();
+        const up = await uploadImageBuffer(buf, {
+          folder: process.env.CLOUDINARY_LIBRARY_FOLDER || "news-images/library",
+          overwrite: false,
+        });
+        tUpload = Date.now() - t2;
+
+        let finalTags = requestTagsNormalized;
+        if (!finalTags || finalTags.length === 0) {
+          const auto = await generateImageTagsFromUrl(up.url, { max: 10 });
+          finalTags = normalizeTags(auto?.tags || []);
+        }
+
+        const t3 = Date.now();
+        const doc = await ImageLibrary.create({
+          publicId: up.public_id,
+          url: up.url,
+          tags: finalTags,
+          category: String(category || "").trim(),
+          source: "drive",
+          priority: Number(priority) || 0,
+        });
+        tDb = Date.now() - t3;
+
+        created.push(doc);
+
+        console.log(
+          `[DriveImport] OK fileId=${fileId} total=${Date.now() - t0}ms download=${tDownload}ms upload=${tUpload}ms db=${tDb}ms publicId=${up.public_id}`
+        );
+      } catch (err) {
+        const status = err?.response?.status || null;
+        const reason =
+          err?.response?.data?.error?.message ||
+          err?.response?.data?.error ||
+          err?.message ||
+          "import_failed";
+
+        console.error(
+          "[DriveImport] FAIL fileId=",
+          fileId,
+          "status=",
+          status,
+          "reason=",
+          reason
+        );
+
+        failed.push({ fileId, status, error: reason });
+      }
+    };
+
+    const CONCURRENCY = 3;
+    const queue = [...ids];
+
+    const workers = new Array(CONCURRENCY).fill(0).map(async () => {
+      while (queue.length > 0) {
+        const fileId = queue.shift();
+        if (!fileId) continue;
+        // eslint-disable-next-line no-await-in-loop
+        await runOne(fileId);
+      }
+    });
+
+    await Promise.all(workers);
+
+    if (created.length === 0) {
+      const firstFail = failed?.[0]?.error ? ` First error: ${failed[0].error}` : "";
+      const statusCode =
+        failed.length > 0 && failed.every((x) => x?.status === 403) ? 403 :
+        failed.length > 0 && failed.every((x) => x?.status === 404) ? 404 :
+        500;
+
+      return res.status(statusCode).json({
+        ok: false,
+        error: `Failed to import Drive images.${firstFail}`,
+        failed,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      count: created.length,
+      images: created,
+      failed,
+    });
+  } catch (err) {
+    console.error("[ImageLibrary:importDriveFiles] fatal:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Failed to import Drive images",
+    });
   }
 };

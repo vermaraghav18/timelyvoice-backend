@@ -1,12 +1,5 @@
 // backend/src/services/imageStrategy.js
 // Image Strategy Orchestrator (IMAGE-LIBRARY ONLY)
-//
-// PURPOSE (your requirement):
-// - Created-by-AI (and all autopick) must ONLY use /admin/image-library
-// - If tags match -> pick best match
-// - Else -> pick ImageLibrary image tagged "default" (ONE canonical default)
-// - Only if ImageLibrary is empty -> use DEFAULT_PUBLIC_ID fallback (env)
-// - NEVER use Cloudinary tag-search picker (chooseHeroImage)
 
 "use strict";
 
@@ -31,19 +24,16 @@ const IMAGE_LIBRARY_CANDIDATE_LIMIT = parseInt(
   10
 );
 
-// ✅ Require at least N “strong” (non-generic) matches for tag-pick
-const IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES = parseInt(
-  process.env.IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES || "1",
-  10
+const IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES = Math.max(
+  3,
+  parseInt(process.env.IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES || "3", 10) || 3
 );
 
-// ✅ Confidence threshold: below this, do NOT pick by tags/keywords; go default.
 const IMAGE_LIBRARY_MIN_CONFIDENCE = parseInt(
   process.env.IMAGE_LIBRARY_MIN_CONFIDENCE || "110",
   10
 );
 
-// Placeholder hosts for junk URLs pasted in drafts
 const PLACEHOLDER_HOSTS = ["example.com", "cdn.example", "your-cdn.example"];
 
 function isPlaceholderUrl(url = "") {
@@ -57,12 +47,10 @@ function isPlaceholderUrl(url = "") {
       h.includes("cdn.example")
     );
   } catch (_) {
-    // if it is malformed, treat as NOT placeholder (leave it alone)
     return false;
   }
 }
 
-// 🔥 Default placeholder is NOT a real image
 function isDefaultPlaceholder(publicId, imageUrl) {
   return (
     (typeof publicId === "string" &&
@@ -72,21 +60,13 @@ function isDefaultPlaceholder(publicId, imageUrl) {
   );
 }
 
-// ------------------------------
-// Tag normalization
-// IMPORTANT: tags are IDENTIFIERS, not English words.
-// Do NOT stem/plural-fix (westindies must stay westindies)
-// ------------------------------
 function normalizeTag(raw = "") {
   const s = String(raw || "").trim().toLowerCase();
   if (!s) return "";
   const noHash = s.replace(/^#+/g, "");
-  // remove spaces/symbols but keep underscore/dash
-  const clean = noHash.replace(/[^a-z0-9_-]/g, "");
-  return clean;
+  return noHash.replace(/[^a-z0-9_-]/g, "");
 }
 
-// ✅ legacy name used across the file — now just normalizeTag
 function normStemTag(raw = "") {
   return normalizeTag(raw);
 }
@@ -119,7 +99,6 @@ function normalizeTagsInput(tags) {
 }
 
 function normalizeCategory(raw = "") {
-  // ✅ category should also be normalized same way
   return normalizeTag(raw);
 }
 
@@ -134,15 +113,10 @@ function normalizeArticleInput(a = {}) {
   };
 }
 
-// ------------------------------
-// Infer category bucket (for negative penalties) if category is messy.
-// Uses article.category + keywords in title/summary
-// ------------------------------
 function inferCategoryBucket(meta) {
   const cat = normalizeCategory(meta.category);
   const text = `${meta.title || ""} ${meta.summary || ""}`.toLowerCase();
 
-  // direct mapping by existing category string (best effort)
   if (cat.includes("politic")) return "politics";
   if (cat.includes("sport")) return "sports";
   if (cat.includes("finance") || cat.includes("business")) return "finance";
@@ -151,7 +125,6 @@ function inferCategoryBucket(meta) {
   if (cat.includes("world")) return "world";
   if (cat === "india") return "india";
 
-  // keyword-based
   for (const [bucket, words] of Object.entries(CATEGORY_KEYWORDS)) {
     for (const w of words) {
       if (text.includes(w)) {
@@ -164,21 +137,12 @@ function inferCategoryBucket(meta) {
   return "";
 }
 
-// ------------------------------
-// DEFAULT PICKER (ImageLibrary)
-// RULE: Image must have tag "default"
-// Preference order:
-// 1) category-specific default
-// 2) global default
-// 3) any default
-// ------------------------------
 async function pickDefaultFromImageLibrary({ category = "" } = {}) {
   const cleanCategoryRaw = String(category || "").trim();
   const cleanCategoryNorm = normalizeCategory(cleanCategoryRaw);
 
   let doc = null;
 
-  // 1) category-specific default
   if (cleanCategoryRaw) {
     doc = await ImageLibrary.findOne({
       category: cleanCategoryRaw,
@@ -197,7 +161,6 @@ async function pickDefaultFromImageLibrary({ category = "" } = {}) {
     }
   }
 
-  // 2) global default
   if (!doc) {
     doc = await ImageLibrary.findOne({
       category: "global",
@@ -207,7 +170,6 @@ async function pickDefaultFromImageLibrary({ category = "" } = {}) {
       .lean();
   }
 
-  // 3) any default
   if (!doc) {
     doc = await ImageLibrary.findOne({ tags: "default" })
       .sort({ priority: -1, createdAt: -1 })
@@ -222,23 +184,10 @@ async function pickDefaultFromImageLibrary({ category = "" } = {}) {
     why: {
       mode: "db-default",
       reason: 'No match found, used ImageLibrary tag "default"',
-      picked: {
-        publicId: doc.publicId,
-        url: doc.url,
-        tags: Array.isArray(doc.tags) ? doc.tags : [],
-        category: doc.category || "",
-        priority: Number(doc.priority) || 0,
-      },
     },
   };
 }
 
-// ------------------------------
-// Advanced scoring for candidates
-// ------------------------------
-// ✅ FIX INCLUDED HERE:
-// Keyword matches are NOT automatically “strong” anymore.
-// Generic keyword matches (like "canada") do NOT count towards strongMatchCount.
 function scoreCandidate({
   imgTagsNorm,
   imgCategoryNorm,
@@ -261,196 +210,182 @@ function scoreCandidate({
 
   const negativeList = bucket ? NEGATIVE_TAGS_BY_CATEGORY[bucket] || [] : [];
   let penalty = 0;
-  let penaltyHits = [];
 
   if (negativeList.length) {
     for (const bad of negativeList) {
       const badNorm = normalizeToken(bad);
       if (!badNorm) continue;
-      if (imgTagsNorm.includes(badNorm)) {
-        penalty += 60;
-        penaltyHits.push(badNorm);
-      }
+      if (imgTagsNorm.includes(badNorm)) penalty += 60;
     }
   }
 
   const score =
     strongTagMatches.length * 120 +
-    strongKeywordMatches.length * 90 +      // ✅ only strong keywords matter
+    strongKeywordMatches.length * 90 +
     genericTagMatches.length * 5 +
-    genericKeywordMatches.length * 2 +      // ✅ tiny bump only (optional)
+    genericKeywordMatches.length * 2 +
     (sameCategory ? 20 : 0) +
     (Number(imgPriority) || 0) -
     penalty;
 
-  // ✅ strongMatchCount ignores generic keywords (like "canada")
-const strongMatchCount = new Set([...strongTagMatches, ...strongKeywordMatches]).size;
-
+  const strongMatchCount = new Set([...strongTagMatches, ...strongKeywordMatches]).size;
 
   return {
     score,
+    strongMatchCount,
     sameCategory,
     penalty,
-    penaltyHits,
-    matchedTags,
     strongTagMatches,
     genericTagMatches,
     matchedKeywords,
     strongKeywordMatches,
     genericKeywordMatches,
-    strongMatchCount,
   };
 }
 
-// ------------------------------
-// DB-FIRST PICKER (ImageLibrary)
-// Priority: strong tags/keywords → null
-// NOTE: We DO NOT do category fallback here anymore.
-// If no confident match, caller will use DEFAULT image.
-// ------------------------------
-async function pickFromImageLibrary({ meta } = {}) {
-  const cleanTags = Array.isArray(meta?.tags) ? meta.tags.filter(Boolean) : [];
-  const categoryRaw = String(meta?.category || "").trim();
-  const categoryNorm = normalizeCategory(categoryRaw);
+/* ---------------------------------------------------------------- */
+/* PICK BEST IMAGE (single) */
+/* ---------------------------------------------------------------- */
 
-  // Keywords from title/summary (normalize like tags so we can compare)
-  const keywords = extractKeywords(meta?.title || "", meta?.summary || "", 40)
+async function pickFromImageLibrary({ meta } = {}) {
+  const cleanTags = meta.tags || [];
+  const categoryNorm = normalizeCategory(meta.category);
+
+  const keywords = extractKeywords(meta.title || "", meta.summary || "", 40)
     .map(normStemTag)
     .filter(Boolean);
 
-  // Use both tags and keywords to widen candidate discovery,
-  // but scoring is what decides.
   const discoverTokens = dedupe([...cleanTags, ...keywords]);
-
   const bucket = inferCategoryBucket(meta);
 
-  // 1) TAG/KEYWORD MATCH (best)
-  if (discoverTokens.length) {
-    const candidates = await ImageLibrary.find({
-      tags: { $in: discoverTokens },
-    })
-      .sort({ priority: -1, createdAt: -1 })
-      .limit(IMAGE_LIBRARY_CANDIDATE_LIMIT)
-      .lean();
+  if (!discoverTokens.length) return null;
 
-    if (candidates.length) {
-      let best = null;
+  const candidates = await ImageLibrary.find({
+    tags: { $in: discoverTokens },
+  })
+    .sort({ priority: -1, createdAt: -1 })
+    .limit(IMAGE_LIBRARY_CANDIDATE_LIMIT)
+    .lean();
 
-      for (const img of candidates) {
-        const imgTagsRaw = Array.isArray(img.tags) ? img.tags : [];
-        const imgTagsNorm = imgTagsRaw.map(normStemTag).filter(Boolean);
+  if (!candidates.length) return null;
 
-        const imgCatNorm = normalizeCategory(img.category || "");
-        const s = scoreCandidate({
-          imgTagsNorm,
-          imgCategoryNorm: imgCatNorm,
-          imgPriority: Number(img.priority) || 0,
-          cleanTags,
-          keywordTags: keywords,
-          articleCategoryNorm: categoryNorm,
-          bucket,
-        });
+  const scored = candidates.map((img) => {
+    const imgTagsNorm = (img.tags || []).map(normStemTag).filter(Boolean);
+    const imgCatNorm = normalizeCategory(img.category || "");
 
-        const row = {
-          publicId: img.publicId,
-          url: img.url,
-          category: img.category || "",
-          tags: imgTagsRaw,
-          priority: Number(img.priority) || 0,
-          ...s,
-        };
+    const s = scoreCandidate({
+      imgTagsNorm,
+      imgCategoryNorm: imgCatNorm,
+      imgPriority: img.priority,
+      cleanTags,
+      keywordTags: keywords,
+      articleCategoryNorm: categoryNorm,
+      bucket,
+    });
 
-        if (!best || row.score > best.score) best = row;
-      }
+    return {
+      publicId: img.publicId,
+      url: img.url,
+      createdAt: img.createdAt,
+      priority: img.priority,
+      ...s,
+    };
+  });
 
-      // ✅ HARD RULE 1: Require minimum strong matches
-      if (best && best.strongMatchCount >= IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES) {
-        // ✅ HARD RULE 2: Confidence threshold
-        if (best.score >= IMAGE_LIBRARY_MIN_CONFIDENCE) {
-          return {
-            publicId: best.publicId,
-            url: best.url,
-            why: {
-              mode: "db-advanced-match",
-              reason: "Picked by strong tags + title keywords + negative penalties",
-              usedTags: cleanTags,
-              usedKeywords: keywords,
-              inferredBucket: bucket || "",
-              picked: best.publicId,
-              score: best.score,
-              strongMatchCount: best.strongMatchCount,
-              sameCategory: best.sameCategory,
-              penalty: best.penalty,
-              penaltyHits: best.penaltyHits,
-              strongTagMatches: best.strongTagMatches,
-              genericTagMatches: best.genericTagMatches,
-              keywordMatches: best.matchedKeywords,
-              strongKeywordMatches: best.strongKeywordMatches,
-              genericKeywordMatches: best.genericKeywordMatches,
-            },
-          };
-        }
+  const eligible = scored
+    .filter((r) => r.strongMatchCount >= IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES)
+    .filter((r) => r.score >= IMAGE_LIBRARY_MIN_CONFIDENCE)
+    .sort((a, b) => b.score - a.score);
 
-        // Not confident -> return no-pick, caller will default
-        return {
-          publicId: null,
-          why: {
-            mode: "db-advanced-low-confidence",
-            reason: "Had some matches but confidence too low; using default image",
-            bestCandidate: {
-              publicId: best.publicId,
-              score: best.score,
-              strongMatchCount: best.strongMatchCount,
-              penalty: best.penalty,
-              penaltyHits: best.penaltyHits,
-              strongTagMatches: best.strongTagMatches,
-              strongKeywordMatches: best.strongKeywordMatches,
-              keywordMatches: best.matchedKeywords,
-              genericTagMatches: best.genericTagMatches,
-              genericKeywordMatches: best.genericKeywordMatches,
-            },
-            minConfidence: IMAGE_LIBRARY_MIN_CONFIDENCE,
-          },
-        };
-      }
+  if (!eligible.length) return null;
 
-      // Not enough strong matches -> return no-pick, caller will default
-      return {
-        publicId: null,
-        why: {
-          mode: "db-advanced-insufficient-strong",
-          reason: "Not enough strong matches; using default image",
-          requiredStrong: IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES,
-          usedTags: cleanTags,
-          usedKeywords: keywords,
-          inferredBucket: bucket || "",
-          bestCandidate: best
-            ? {
-                publicId: best.publicId,
-                score: best.score,
-                strongMatchCount: best.strongMatchCount,
-                strongTagMatches: best.strongTagMatches,
-                strongKeywordMatches: best.strongKeywordMatches,
-                keywordMatches: best.matchedKeywords,
-                genericTagMatches: best.genericTagMatches,
-                genericKeywordMatches: best.genericKeywordMatches,
-                penalty: best.penalty,
-                penaltyHits: best.penaltyHits,
-              }
-            : null,
-        },
-      };
-    }
-  }
+  const best = eligible[0];
 
-  // No candidates -> caller will default
-  return null;
+  return {
+    publicId: best.publicId,
+    url: best.url,
+    why: {
+      mode: "db-advanced-match",
+      picked: best.publicId,
+      score: best.score,
+      strongMatchCount: best.strongMatchCount,
+    },
+  };
 }
 
-/**
- * Main orchestrator.
- */
-async function decideAndAttach(article = {}, _opts = {}) {
+/* ---------------------------------------------------------------- */
+/* NEW: MULTI-CANDIDATE (FOR ARROWS) */
+/* ---------------------------------------------------------------- */
+
+async function getImageCandidatesForArticle(meta = {}, { limit = 24 } = {}) {
+  const clean = normalizeArticleInput(meta);
+  const cleanTags = clean.tags || [];
+  const categoryNorm = normalizeCategory(clean.category);
+
+  const keywords = extractKeywords(clean.title || "", clean.summary || "", 40)
+    .map(normStemTag)
+    .filter(Boolean);
+
+  const discoverTokens = dedupe([...cleanTags, ...keywords]);
+  const bucket = inferCategoryBucket(clean);
+
+  if (!discoverTokens.length) return { candidates: [], why: { mode: "no-tokens" } };
+
+  const docs = await ImageLibrary.find({
+    tags: { $in: discoverTokens },
+  })
+    .sort({ priority: -1, createdAt: -1 })
+    .limit(IMAGE_LIBRARY_CANDIDATE_LIMIT)
+    .lean();
+
+  if (!docs.length) return { candidates: [], why: { mode: "no-db-candidates" } };
+
+  const scored = docs.map((img) => {
+    const imgTagsNorm = (img.tags || []).map(normStemTag).filter(Boolean);
+    const imgCatNorm = normalizeCategory(img.category || "");
+
+    const s = scoreCandidate({
+      imgTagsNorm,
+      imgCategoryNorm: imgCatNorm,
+      imgPriority: img.priority,
+      cleanTags,
+      keywordTags: keywords,
+      articleCategoryNorm: categoryNorm,
+      bucket,
+    });
+
+    return {
+      publicId: img.publicId,
+      url: img.url,
+      createdAt: img.createdAt,
+      priority: img.priority,
+      ...s,
+    };
+  });
+
+  const eligible = scored
+    .filter((r) => r.strongMatchCount >= IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES)
+    .filter((r) => r.score >= IMAGE_LIBRARY_MIN_CONFIDENCE)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    })
+    .slice(0, limit);
+
+  return {
+    candidates: eligible,
+    why: {
+      mode: "db-candidates",
+      eligibleCount: eligible.length,
+    },
+  };
+}
+
+/* ---------------------------------------------------------------- */
+/* MAIN ORCHESTRATOR */
+/* ---------------------------------------------------------------- */
+
+async function decideAndAttach(article = {}) {
   assert(article, "article is required");
   const meta = normalizeArticleInput(article);
 
@@ -459,122 +394,39 @@ async function decideAndAttach(article = {}, _opts = {}) {
     article.imageUrl = null;
   }
 
-  // Keep existing image if already set (non-default)
   if (article.imagePublicId && article.imagePublicId !== DEFAULT_PUBLIC_ID) {
-    if (!article.autoImageDebug) {
-      article.autoImageDebug = {
-        mode: "kept-existing-public-id",
-        picked: article.imagePublicId,
-        reason: "Existing imagePublicId was already set",
-      };
-    }
     return "kept-existing-public-id";
   }
 
-  // Keep existing URL if not placeholder
   if (article.imageUrl && !isPlaceholderUrl(article.imageUrl)) {
-    if (!article.autoImageDebug) {
-      article.autoImageDebug = {
-        mode: "kept-existing-url",
-        picked: article.imageUrl,
-        reason: "Existing imageUrl was already set",
-      };
-    }
     return "kept-existing-url";
   }
 
-  let picked = null;
+  const picked = await pickFromImageLibrary({ meta });
 
-  try {
-    picked = await pickFromImageLibrary({ meta });
-  } catch (err) {
-    console.error("[imageStrategy] pickFromImageLibrary error:", err);
-    picked = null;
-  }
-
-  // If picker returned "no-pick but has why", store why
-  if (picked && !picked.publicId && picked.why) {
-    article.autoImageDebug = picked.why;
-  }
-
-  // Attach picked image
   if (picked?.publicId) {
     article.imagePublicId = picked.publicId;
-    const safeUrl =
-      typeof picked.url === "string" ? picked.url.replace(/\s+/g, "") : "";
-    article.imageUrl = safeUrl || cloudinary.url(picked.publicId, { secure: true });
-
-    article.autoImageDebug = picked.why || {
-      mode: "db-advanced-match",
-      picked: picked.publicId,
-      reason: "Picked from ImageLibrary",
-    };
-
+    article.imageUrl = picked.url || cloudinary.url(picked.publicId, { secure: true });
     article.autoImagePicked = true;
     article.autoImagePickedAt = new Date();
-
-    if (!article.imageAlt) {
-      article.imageAlt = meta.imageAlt || meta.title || "News image";
-    }
-
     return "attached-db-image";
   }
 
-  // Default from ImageLibrary ("default" tag)
-  let dbDefault = null;
-
-  try {
-    dbDefault = await pickDefaultFromImageLibrary({ category: meta.category });
-  } catch (err) {
-    console.error("[imageStrategy] pickDefaultFromImageLibrary error:", err);
-    dbDefault = null;
-  }
+  const dbDefault = await pickDefaultFromImageLibrary({ category: meta.category });
 
   if (dbDefault?.publicId) {
     article.imagePublicId = dbDefault.publicId;
-    const safeUrl =
-      typeof dbDefault.url === "string" ? dbDefault.url.replace(/\s+/g, "") : "";
-    article.imageUrl = safeUrl || cloudinary.url(dbDefault.publicId, { secure: true });
-
-    const prev = article.autoImageDebug;
-    article.autoImageDebug = {
-      ...(prev ? { prev } : {}),
-      ...(dbDefault.why || {}),
-    };
-
-    article.autoImagePicked = true;
-    article.autoImagePickedAt = new Date();
-
-    if (!article.imageAlt) {
-      article.imageAlt = meta.imageAlt || meta.title || "News image";
-    }
-
+    article.imageUrl =
+      dbDefault.url || cloudinary.url(dbDefault.publicId, { secure: true });
     return "attached-db-default-image";
   }
 
-  // Hard fallback (only if ImageLibrary empty/unavailable)
-  if (!article.imagePublicId && DEFAULT_PUBLIC_ID) {
-    article.imagePublicId = DEFAULT_PUBLIC_ID;
-    article.imageUrl = cloudinary.url(DEFAULT_PUBLIC_ID, { secure: true });
-
-    article.autoImageDebug = {
-      mode: "fallback-default",
-      picked: DEFAULT_PUBLIC_ID,
-      reason: "ImageLibrary empty/unavailable; used hard default",
-    };
-
-    article.autoImagePicked = false;
-    article.autoImagePickedAt = null;
-
-    if (!article.imageAlt) {
-      article.imageAlt = meta.title || "News image";
-    }
-    return "attached-default-image";
-  }
-
-  return "no-change";
+  article.imagePublicId = DEFAULT_PUBLIC_ID;
+  article.imageUrl = cloudinary.url(DEFAULT_PUBLIC_ID, { secure: true });
+  return "attached-default-image";
 }
 
 module.exports = {
   decideAndAttach,
+  getImageCandidatesForArticle,
 };

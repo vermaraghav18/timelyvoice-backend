@@ -10,6 +10,8 @@ const {
   listImages,
   updateImage,
   deleteImage,
+  listDriveFiles,
+  importDriveFiles,
 } = require("../controllers/admin.imageLibrary.controller");
 
 
@@ -39,6 +41,10 @@ router.post(
   createImage
 );
 
+// ✅ Google Drive: list + import
+router.get("/drive/files", listDriveFiles);
+router.post("/drive/import", importDriveFiles);
+
 
 // GET: resolve publicId -> url (must be BEFORE "/:id")
 router.get("/resolve", resolvePublicId);
@@ -53,4 +59,9 @@ router.patch("/:id", updateImage);
 // DELETE: remove from DB; optional Cloudinary delete via ?deleteFromCloudinary=true
 router.delete("/:id", deleteImage);
 
+// ✅ Google Drive: list + import
+router.get("/drive/files", listDriveFiles);
+router.post("/drive/import", importDriveFiles);
+
 module.exports = router;
+

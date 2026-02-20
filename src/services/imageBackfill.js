@@ -1,4 +1,20 @@
+// -----------------------------------------------------------------------------
 // backend/src/services/imageBackfill.js
+// Backfill: When an ImageLibrary image is edited/added, try to replace DEFAULT
+// images on recent DRAFT AI articles — BUT ONLY if strong tag overlap is enough.
+// -----------------------------------------------------------------------------
+//
+// ✅ FIX APPLIED (your requirement):
+// - Minimum strong matches should be 3 by default.
+// - If overlap < 3 -> DO NOT backfill; article stays on default image.
+// - Still configurable via env IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES
+//   (but default is now 3 instead of 1)
+//
+// NOTE:
+// - This file does NOT pick images for new articles.
+// - New article picking is in imageStrategy.js
+// -----------------------------------------------------------------------------
+
 "use strict";
 
 const Article = require("../models/Article");
@@ -11,15 +27,13 @@ const DEFAULT_PUBLIC_ID =
   process.env.CLOUDINARY_DEFAULT_IMAGE_PUBLIC_ID ||
   "news-images/defaults/fallback-hero";
 
-// ✅ This is the IMPORTANT one you set in Render.
-// We now actually use it here (previously it was ignored).
+// ✅ IMPORTANT: minimum strong matches default is now 3 (was 1)
 const REQUIRED_STRONG_MATCHES = Math.max(
-  1,
-  Number(process.env.IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES || 1)
+  3,
+  Number(process.env.IMAGE_LIBRARY_REQUIRED_STRONG_MATCHES || 3)
 );
 
 // ✅ Tags that are too broad should NOT count as “strong” matches.
-// (This is what caused “canada” to wrongly pick a cricket image.)
 const GENERIC_TAGS = new Set(
   [
     // very generic
@@ -166,13 +180,13 @@ function strongOverlap(articleTags = [], imageTags = []) {
 }
 
 /**
- * Backfill logic (FIXED):
+ * Backfill logic:
  * - Only update articles that are still using DEFAULT / defaults/* OR have no image
  * - Only update drafts (safe)
  * - Only update AI-created articles by default (safe)
  * - Apply if:
  *    - strong tag overlap >= REQUIRED_STRONG_MATCHES
- *      (strong = NOT generic; so "canada" alone won't count)
+ *      (strong = NOT generic)
  *    - AND category matches (if library image has category and not global)
  */
 async function backfillMatchingArticlesFromLibraryImage(imageDoc, opts = {}) {
@@ -223,7 +237,7 @@ async function backfillMatchingArticlesFromLibraryImage(imageDoc, opts = {}) {
 
     const artTags = Array.isArray(a.tags) ? a.tags : [];
 
-    // ✅ If the library image is basically "default" (no real tags),
+    // If the library image is basically "default" (no real tags),
     // we allow it to fill default-image articles without tag matching.
     // Otherwise, require strong tag overlap >= REQUIRED_STRONG_MATCHES.
     let strongMatchCount = 0;
@@ -234,6 +248,7 @@ async function backfillMatchingArticlesFromLibraryImage(imageDoc, opts = {}) {
       strongMatchCount = res.strongMatchCount;
       matchedStrongTags = res.matchedStrongTags;
 
+      // ✅ HARD BLOCK: if not enough strong matches, DO NOT backfill
       if (strongMatchCount < REQUIRED_STRONG_MATCHES) continue;
     }
 
@@ -257,7 +272,6 @@ async function backfillMatchingArticlesFromLibraryImage(imageDoc, opts = {}) {
             imageLibraryId: String(imageDoc._id),
             picked: imageDoc.publicId,
 
-            // ✅ show the REAL matched tags (not “all image tags”)
             matchedTags: matchedStrongTags.length
               ? matchedStrongTags
               : imgTagsNoDefault.length
@@ -267,7 +281,6 @@ async function backfillMatchingArticlesFromLibraryImage(imageDoc, opts = {}) {
             matchCount: strongMatchCount,
             requiredStrongMatches: REQUIRED_STRONG_MATCHES,
 
-            // helpful extra info for troubleshooting
             imageTags: imgTagsNoDefault.length ? imgTagsNoDefault : ["default"],
             articleTags: Array.isArray(artTags) ? artTags : [],
 

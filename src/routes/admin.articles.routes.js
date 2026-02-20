@@ -18,8 +18,12 @@ const Category = require("../models/Category");
 const { decideAndAttach } = require("../services/imageStrategy");
 const { buildImageVariants } = require("../services/imageVariants");
 
-// 👇 NEW: AI Image service (OpenRouter / Gemini)
 const { generateAiHeroForArticle } = require("../services/aiImage.service");
+
+// NEW: multi-candidate image picker (DB-based, uses ImageLibrary scoring)
+const { getImageCandidatesForArticle } = require("../services/imageStrategy");
+
+
 
 // Controller for create/import/preview
 const ctrl = require("../controllers/admin.articles.controller");
@@ -1271,7 +1275,42 @@ router.post("/:id/publish", async (req, res) => {
   }
 });
 
+// IMAGE CANDIDATES — GET /api/admin/articles/:id/image-candidates?limit=12
+// Returns multiple ImageLibrary matches so the admin can cycle through them.
+router.get("/:id/image-candidates", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 12)));
+
+    const article = await Article.findById(id).lean();
+    if (!article) {
+      return res.status(404).json({ ok: false, error: "not_found" });
+    }
+
+    const meta = {
+      title: article.title || "",
+      summary: article.summary || "",
+      category: article.categorySlug || article.category || "",
+      tags: article.tags || [],
+      slug: article.slug || "",
+    };
+
+    const result = await getImageCandidatesForArticle(meta, { limit });
+
+
+    return res.json({
+      ok: true,
+      candidates: result?.candidates || [],
+      why: result?.why || null,
+    });
+  } catch (err) {
+    console.error("[admin.articles] /:id/image-candidates error", err);
+    return res.status(500).json({ ok: false, error: err.message || "failed" });
+  }
+});
+
 // AI IMAGE — POST /api/admin/articles/:id/ai-image
+
 router.post("/:id/ai-image", async (req, res) => {
   try {
     if (process.env.AI_IMAGE_ENABLED === "false") {

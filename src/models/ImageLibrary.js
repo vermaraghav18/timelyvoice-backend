@@ -12,7 +12,7 @@ const ImageLibrarySchema = new mongoose.Schema(
     category: { type: String, default: "" }, // optional: World/India/Business
     source: {
       type: String,
-      enum: ["manual", "ai", "google"],
+      enum: ["manual", "ai", "google", "drive"],
       default: "manual",
       index: true,
     },

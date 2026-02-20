@@ -9,7 +9,7 @@ const STOP = new Set([
 ]);
 
 // ------------------------------
-// ✅ NEW: Canonical tag variants
+// ✅ Canonical tag variants
 // Goal: AI should not output both "politics" and "political" etc.
 // We standardize to ONE preferred tag.
 // Keep this list small and extend only when needed.
@@ -65,6 +65,83 @@ function normTag(s) {
   // ✅ Apply canonicalization AFTER normalization
   // Example: "political" -> "politics"
   return canonicalizeTag(norm);
+}
+
+/**
+ * ✅ NEW: Expand multi-word entities into robust variants:
+ * "Donald Trump" -> ["donald", "trump", "donaldtrump"]
+ * "New York" -> ["new", "york", "newyork"]
+ *
+ * We return normalized tags (ImageLibrary style).
+ */
+function expandPhraseToTags(phrase) {
+  const p = String(phrase || "").trim();
+  if (!p) return [];
+
+  const words = p
+    .split(/\s+/g)
+    .map((w) => String(w || "").trim())
+    .filter(Boolean);
+
+  if (words.length === 0) return [];
+
+  const out = [];
+  if (words.length === 1) {
+    const t = normTag(words[0]);
+    if (t) out.push(t);
+    return out;
+  }
+
+  // each word
+  for (const w of words) {
+    const t = normTag(w);
+    if (t) out.push(t);
+  }
+
+  // joined: donaldtrump
+  const joined = normTag(words.join(""));
+  if (joined) out.push(joined);
+
+  return Array.from(new Set(out));
+}
+
+/**
+ * ✅ NEW: Detect Proper Name phrases from original (non-lowercased) text.
+ * We extract sequences like:
+ * - "Donald Trump"
+ * - "Marco Rubio"
+ * - "United Nations"
+ * - "Bharatiya Janata Party"
+ *
+ * Then we expand them into tags: first/last/joined.
+ */
+function extractNamePhrases(text, { maxPhrases = 6 } = {}) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (!s) return [];
+
+  // Conservative regex:
+  // - 2 to 4 words
+  // - Each word starts with capital letter, allows internal letters/dots/apostrophes/hyphens
+  // Examples: "U.S." won't match perfectly; that's ok (countries handled elsewhere).
+  const re = /\b([A-Z][a-zA-Z.'-]{1,})(\s+[A-Z][a-zA-Z.'-]{1,}){1,3}\b/g;
+
+  const phrases = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const phrase = String(m[0] || "").trim();
+
+    // small safety filters
+    const low = phrase.toLowerCase();
+    if (STOP.has(low)) continue;
+
+    // avoid "Latest News" type phrases
+    if (/^(Latest|Breaking|Top|Live)\b/.test(phrase)) continue;
+
+    phrases.push(phrase);
+    if (phrases.length >= maxPhrases) break;
+  }
+
+  return phrases;
 }
 
 // Detect some sports + formats
@@ -162,16 +239,24 @@ function buildArticleTags({ rawTags, title, summary, body, seedTitle, min = 6, m
     }
   }
 
-  const allText = `${title || ""} ${summary || ""} ${seedTitle || ""} ${body || ""}`;
+  const allTextLower = `${title || ""} ${summary || ""} ${seedTitle || ""} ${body || ""}`.toLowerCase();
+  const allTextOriginal = `${title || ""} ${summary || ""} ${seedTitle || ""} ${body || ""}`.trim();
+
+  // ✅ 1.5) NEW: Proper name phrases -> add split + joined
+  // Example: "Donald Trump" -> donald, trump, donaldtrump
+  const phrases = extractNamePhrases(allTextOriginal, { maxPhrases: 6 });
+  for (const p of phrases) {
+    for (const t of expandPhraseToTags(p)) out.push(t);
+  }
 
   // 2) add sports + cup tokens
-  for (const t of detectSportsTokens(allText)) {
+  for (const t of detectSportsTokens(allTextLower)) {
     const nt = normTag(t);
     if (nt) out.push(nt);
   }
 
   // 3) add countries
-  for (const t of detectCountries(allText)) {
+  for (const t of detectCountries(allTextLower)) {
     const nt = normTag(t);
     if (nt) out.push(nt);
   }
