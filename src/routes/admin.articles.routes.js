@@ -804,6 +804,9 @@ router.patch("/:id", async (req, res) => {
   "imageAlt",
   "ogImage",
   "thumbImage",
+   // ✅ store debug payload (why this image)
+  "autoImageDebug",
+
 
   // ✅ NEW: publisher/source image fields
   "sourceImageUrl",
@@ -1018,20 +1021,26 @@ router.patch("/:id", async (req, res) => {
         current.imageUrl.trim() &&
         !isDefaultPlaceholder("", current.imageUrl));
 
-    // If admin manually overrides image in this PATCH => lock as manual
-    if (manualOverrideInPatch) {
-      merged.autoImagePicked = false;
-      merged.autoImagePickedAt = null;
+   if (manualOverrideInPatch) {
+  merged.autoImagePicked = false;
+  merged.autoImagePickedAt = null;
 
-      merged._autoImageDebug = {
-        mode: "manual",
-        updatedAt: new Date().toISOString(),
-        imagePublicId: merged.imagePublicId || null,
-        imageUrl: merged.imageUrl || null,
-      };
-      merged.autoImageDebug = null;
-    }
+  const clientDebug =
+    patch.autoImageDebug && typeof patch.autoImageDebug === "object"
+      ? patch.autoImageDebug
+      : null;
 
+  // ✅ Persistable debug (stored in Mongo)
+  patch.autoImageDebug = {
+    ...(clientDebug || {}),
+    mode: clientDebug?.mode || "manual",
+    updatedAt: new Date().toISOString(),
+    imagePublicId: merged.imagePublicId || null,
+    imageUrl: merged.imageUrl || null,
+  };
+
+  merged.autoImageDebug = patch.autoImageDebug;
+}
 
     // ✅ If admin manually sets imagePublicId, force URLs to match it
     // (do not apply this when only imageUrl was patched)

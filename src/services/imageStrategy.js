@@ -331,14 +331,43 @@ async function getImageCandidatesForArticle(meta = {}, { limit = 24 } = {}) {
 
   if (!discoverTokens.length) return { candidates: [], why: { mode: "no-tokens" } };
 
-  const docs = await ImageLibrary.find({
-    tags: { $in: discoverTokens },
-  })
+  // ✅ Two-pass fetch:
+// 1) Prefer non-generic (strong) tokens first (e.g. "supremecourt")
+// 2) Fallback to broader tokens (e.g. "supreme", "court") only if needed
+const strongTokens = discoverTokens.filter((t) => t && !isGenericTag(t));
+const broadTokens = discoverTokens;
+
+// Pass 1: strong tokens (more specific)
+const docsStrong = strongTokens.length
+  ? await ImageLibrary.find({ tags: { $in: strongTokens } })
+      .sort({ priority: -1, createdAt: -1 })
+      .limit(IMAGE_LIBRARY_CANDIDATE_LIMIT)
+      .lean()
+  : [];
+
+// Pass 2: broad tokens (only if strong results are not enough)
+let docsBroad = [];
+if (docsStrong.length < IMAGE_LIBRARY_CANDIDATE_LIMIT) {
+  docsBroad = await ImageLibrary.find({ tags: { $in: broadTokens } })
     .sort({ priority: -1, createdAt: -1 })
     .limit(IMAGE_LIBRARY_CANDIDATE_LIMIT)
     .lean();
+}
 
-  if (!docs.length) return { candidates: [], why: { mode: "no-db-candidates" } };
+// Merge unique by publicId
+const seen = new Set();
+const docs = [];
+for (const d of [...docsStrong, ...docsBroad]) {
+  if (!d?.publicId) continue;
+  if (seen.has(d.publicId)) continue;
+  seen.add(d.publicId);
+  docs.push(d);
+  if (docs.length >= IMAGE_LIBRARY_CANDIDATE_LIMIT) break;
+}
+
+if (!docs.length) {
+  return { candidates: [], why: { mode: "no-db-candidates" } };
+}
 
   const scored = docs.map((img) => {
     const imgTagsNorm = (img.tags || []).map(normStemTag).filter(Boolean);
