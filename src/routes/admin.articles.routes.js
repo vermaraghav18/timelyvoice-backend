@@ -385,10 +385,9 @@ router.post("/:id/repick-image", async (req, res) => {
   thumbImage: article.thumbImage || null,
   imageAlt: article.imageAlt || null,
 
-  // ✅ IMPORTANT: update ops must write to the real DB field (aliases don't apply here)
-  _autoImageDebug: article.autoImageDebug || article._autoImageDebug || null,
-  autoImageDebug: null, // keep clean (optional, but avoids confusion)
-
+  // ✅ Store to the real field so list/detail always has it
+autoImageDebug: article.autoImageDebug || article._autoImageDebug || null,
+_autoImageDebug: null, // optional: keep legacy clean
   autoImagePicked: !!article.autoImagePicked,
   autoImagePickedAt: article.autoImagePickedAt || new Date(),
 };
@@ -619,7 +618,15 @@ router.get("/drafts", async (req, res) => {
         categories: Array.isArray(a.categories)
           ? a.categories.map(toCatText)
           : [],
-        autoImageDebug: a.autoImageDebug || a._autoImageDebug || null,
+        autoImageDebug:
+  a.autoImageDebug ||
+  a._autoImageDebug ||
+  {
+    mode: "unknown",
+    updatedAt: a.updatedAt || a.createdAt || new Date().toISOString(),
+    note:
+      "No stored reasoning found (older article). Re-pick or change image once to generate reasoning.",
+  },
       };
     });
 
@@ -743,7 +750,15 @@ router.get("/", async (req, res) => {
         categories: Array.isArray(a.categories)
           ? a.categories.map(toCatText)
           : [],
-        autoImageDebug: a.autoImageDebug || a._autoImageDebug || null,
+        autoImageDebug:
+  a.autoImageDebug ||
+  a._autoImageDebug ||
+  {
+    mode: "unknown",
+    updatedAt: a.updatedAt || a.createdAt || new Date().toISOString(),
+    note:
+      "No stored reasoning found (older article). Re-pick or change image once to generate reasoning.",
+  },
       };
     });
 
@@ -779,7 +794,15 @@ router.get("/:id", async (req, res) => {
     a.categories = Array.isArray(a.categories)
       ? a.categories.map(toCatText)
       : [];
-    a.autoImageDebug = a.autoImageDebug || a._autoImageDebug || null;
+    a.autoImageDebug =
+  a.autoImageDebug ||
+  a._autoImageDebug ||
+  {
+    mode: "unknown",
+    updatedAt: a.updatedAt || a.createdAt || new Date().toISOString(),
+    note:
+      "No stored reasoning found (older article). Re-pick or change image once to generate reasoning.",
+  };
 
     res.json(a);
   } catch (err) {
@@ -1189,7 +1212,15 @@ router.patch("/:id", async (req, res) => {
 
     a.category = toCatText(a.category);
     a.categories = Array.isArray(a.categories) ? a.categories.map(toCatText) : [];
-    a.autoImageDebug = a.autoImageDebug || a._autoImageDebug || null;
+    a.autoImageDebug =
+  a.autoImageDebug ||
+  a._autoImageDebug ||
+  {
+    mode: "unknown",
+    updatedAt: a.updatedAt || a.createdAt || new Date().toISOString(),
+    note:
+      "No stored reasoning found (older article). Re-pick or change image once to generate reasoning.",
+  };
 
     res.json(a);
   } catch (err) {
@@ -1268,7 +1299,15 @@ router.post("/:id/publish", async (req, res) => {
     a.categories = Array.isArray(a.categories)
       ? a.categories.map(toCatText)
       : [];
-    a.autoImageDebug = a.autoImageDebug || a._autoImageDebug || null;
+   a.autoImageDebug =
+  a.autoImageDebug ||
+  a._autoImageDebug ||
+  {
+    mode: "unknown",
+    updatedAt: a.updatedAt || a.createdAt || new Date().toISOString(),
+    note:
+      "No stored reasoning found (older article). Re-pick or change image once to generate reasoning.",
+  };
 
     res.json(a);
 
